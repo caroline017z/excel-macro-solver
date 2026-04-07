@@ -80,7 +80,7 @@ def main() -> None:
         "--timeout",
         type=int,
         default=600,
-        help="COM subprocess timeout in seconds (default: 600)",
+        help="Solver macro timeout threshold in seconds (default: 600)",
     )
     parser.add_argument(
         "--batch-id",

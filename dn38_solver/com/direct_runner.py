@@ -23,6 +23,7 @@ from dn38_solver.types import CellAddress, SolveTask
 log = logging.getLogger(__name__)
 
 STATUS_FILE = Path(__file__).resolve().parent.parent.parent / "solver_status.json"
+SOLVER_RESULTS_SHEET = "__SolverResults"
 
 
 def _write_status(data: dict) -> None:
@@ -128,6 +129,12 @@ def run_direct(
 
         solve_time = time.time() - t0
         log.info("  Macro '%s' completed in %.1fs", macro_used, solve_time)
+        if timeout_sec > 0 and solve_time > timeout_sec:
+            result["error"] = (
+                f"Macro execution exceeded timeout_sec={timeout_sec} "
+                f"(actual={solve_time:.1f}s)"
+            )
+            return result
 
         if macro_used is None:
             result["error"] = f"No macro found. Tried: {macro_names}"
@@ -153,6 +160,7 @@ def run_direct(
         })
         t0 = time.time()
         project_results = []
+        solver_results, heartbeat = _read_solver_results_map(wb)
 
         for task_dict in tasks:
             # Handle both SolveTask objects and dicts
@@ -193,12 +201,20 @@ def run_direct(
                 key = f"{sheet}!{addr}"
                 solved[key] = _read_cell(wb, sheet, addr)
 
+            # Prefer per-project DSCR captured during solve loop to avoid
+            # last-project F129 bleed in multi-project runs.
+            dscr_key = "PT Returns!F129"
+            meta = solver_results.get(int(offset))
+            if meta and "dscr" in meta:
+                solved[dscr_key] = meta["dscr"]
+
             project_results.append({
                 "project_name": name,
                 "status": "converged",
                 "solved_values": solved,
                 "iterations_used": 0,
                 "duration_sec": 0,
+                "meta": meta or {},
             })
 
         read_time = time.time() - t0
@@ -233,6 +249,7 @@ def run_direct(
             "warmup_time_sec": round(warmup_time, 2),
             "solve_time_sec": round(solve_time, 2),
             "read_time_sec": round(read_time, 2),
+            "solver_heartbeat": heartbeat,
         }
 
         # Write completion status for Streamlit tracker
@@ -258,6 +275,7 @@ def run_direct(
             "open_time_sec": round(open_time, 2),
             "macro_time_sec": round(solve_time, 2),
             "read_time_sec": round(read_time, 2),
+            "solver_heartbeat": heartbeat,
             "error": None,
         })
 
@@ -308,3 +326,64 @@ def _set_f2(wb: object, idx_cell: object, offset: int) -> None:
         wb.Sheets(idx_cell.sheet).Range(idx_cell.address).Value = offset
     else:
         wb.Sheets(idx_cell["sheet"]).Range(idx_cell["address"]).Value = offset
+
+
+def _read_solver_results_map(
+    wb: object,
+) -> tuple[dict[int, dict[str, float | str | None]], str | None]:
+    """Read per-project solve telemetry captured by SolveHeadless VBA."""
+    out: dict[int, dict[str, float | str | None]] = {}
+    try:
+        ws = wb.Sheets(SOLVER_RESULTS_SHEET)
+    except Exception:
+        return out, None
+
+    heartbeat = _to_safe(ws.Range("N1").Value)
+    if not isinstance(heartbeat, str):
+        heartbeat = None
+
+    row = 2
+    while True:
+        offset_val = ws.Range(f"A{row}").Value
+        if offset_val in (None, ""):
+            break
+        try:
+            offset = int(offset_val)
+        except (ValueError, TypeError):
+            row += 1
+            continue
+        out[offset] = {
+            "project_name": _to_safe(ws.Range(f"B{row}").Value),
+            "dscr": _to_float(ws.Range(f"C{row}").Value),
+            "npp": _to_float(ws.Range(f"D{row}").Value),
+            "dev_fee": _to_float(ws.Range(f"E{row}").Value),
+            "equity_pct": _to_float(ws.Range(f"F{row}").Value),
+            "irr_gap": _to_float(ws.Range(f"G{row}").Value),
+            "appr_gap": _to_float(ws.Range(f"H{row}").Value),
+            "converged_flag": _to_safe(ws.Range(f"I{row}").Value),
+            "calc_tier": _to_safe(ws.Range(f"J{row}").Value),
+            "gs_retry_limit": _to_safe(ws.Range(f"K{row}").Value),
+            "mode": _to_safe(ws.Range(f"L{row}").Value),
+            "solve_seconds": _to_float(ws.Range(f"M{row}").Value),
+            "heartbeat": _to_safe(ws.Range(f"N{row}").Value),
+        }
+        row += 1
+    return out, heartbeat
+
+
+def _to_float(v: object) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_safe(v: object) -> str | float | None:
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return str(v)

@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "openpyxl>=3.1.0",
     "msgspec>=0.18.0",
-    "pywin32>=306",
+    "pywin32>=306; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
