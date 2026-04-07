@@ -1,0 +1,32 @@
+[project]
+name = "dn38-solver"
+version = "1.0.0"
+description = "38DN Hybrid Shadow Solver for solar pricing models"
+requires-python = ">=3.10"
+dependencies = [
+    "openpyxl>=3.1.0",
+    "msgspec>=0.18.0",
+    "pywin32>=306",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+dn38-solver = "dn38_solver.cli:main"
+
+[tool.mypy]
+strict = true
+warn_unreachable = true
+python_version = "3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
