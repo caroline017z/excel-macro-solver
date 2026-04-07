@@ -18,7 +18,6 @@ from dn38_solver.types import (
     SolveStatus,
 )
 from dn38_solver.config import (
-    LABEL_TO_ROW,
     OUTPUT_ROWS,
 )
 from dn38_solver.convert import safe_float
@@ -45,7 +44,11 @@ def _parse_project_result(
 
     eq_val = safe_float(sv.get("PT Returns!C128"))
     uses_val = safe_float(sv.get("PT Returns!C130"))
-    eq_pct = eq_val / uses_val if eq_val and uses_val and uses_val != 0 else None
+    eq_pct = (
+        eq_val / uses_val
+        if eq_val is not None and uses_val is not None and uses_val != 0
+        else None
+    )
 
     return ProjectResult(
         name=project.name,
@@ -218,10 +221,10 @@ def solve_all(
              "Project", "NPP $/W", "Dev Fee", "FMV", "DSCR", "Status")
     log.info("  %s %s %s %s %s %s", "-"*28, "-"*10, "-"*10, "-"*10, "-"*8, "-"*12)
     for r in project_results:
-        npp = f"${r.npp_per_w:.3f}" if r.npp_per_w else "\u2014"
-        dev = f"${r.dev_fee_per_w:.3f}" if r.dev_fee_per_w else "\u2014"
-        fmv = f"${r.fmv_per_w:.3f}" if r.fmv_per_w else "\u2014"
-        dscr = f"{r.dscr_multiple:.2f}x" if r.dscr_multiple else "\u2014"
+        npp = f"${r.npp_per_w:.3f}" if r.npp_per_w is not None else "\u2014"
+        dev = f"${r.dev_fee_per_w:.3f}" if r.dev_fee_per_w is not None else "\u2014"
+        fmv = f"${r.fmv_per_w:.3f}" if r.fmv_per_w is not None else "\u2014"
+        dscr = f"{r.dscr_multiple:.2f}x" if r.dscr_multiple is not None else "\u2014"
         stat = "OK" if r.converged else "CHECK"
         log.info("  %-28s %10s %10s %10s %8s %12s", r.name, npp, dev, fmv, dscr, stat)
 

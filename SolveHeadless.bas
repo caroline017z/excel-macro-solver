@@ -1,22 +1,28 @@
 Attribute VB_Name = "modSolveHeadless"
 ' ==============================================================================
-'  HEADLESS CONVERGENCE SOLVER v4b — for Python COM automation
+'  HEADLESS CONVERGENCE SOLVER v5 — for Python COM automation
 '
 '  Performance optimizations:
 '    1. No MsgBox / StatusBar / user dialogs
 '    2. Leaves Calculation in xlCalculationManual on exit
-'    3. Application.Calculate instead of 13 individual sheet calculates
+'    3. Deterministic recalc ladder:
+'         - Tier 1: Application.Calculate
+'         - Tier 2: Application.Calculate + Application.Calculate
+'         - Tier 3: Application.CalculateFull
 '    4. Non-core sheets disabled via EnableCalculation = False
-'    5. Batched GoalSeeks: NPP + Dev Fee solved before single recalc
+'    5. Sequential GoalSeeks with recalc after each operation
 '    6. Multi-threaded calculation enabled for parallel formula evaluation
-'    7. MaxIterations=200, MAX_GS_RETRY=3 for tighter iteration control
+'    7. Adaptive warm/cold GoalSeek settings per project
 ' ==============================================================================
 
 Option Explicit
 
 ' --- Configuration ---
 Private Const MAX_ITER          As Integer = 8
-Private Const MAX_GS_RETRY      As Integer = 6
+Private Const MAX_GS_RETRY_WARM As Integer = 3
+Private Const MAX_GS_RETRY_COLD As Integer = 6
+Private Const GS_MAXITER_WARM   As Integer = 200
+Private Const GS_MAXITER_COLD   As Integer = 1000
 Private Const EQUITY_FINAL_TOL  As Double = 0.005
 Private Const IRR_TOLERANCE     As Double = 0.0003
 Private Const APPR_TOLERANCE    As Double = 0.0003
@@ -27,6 +33,7 @@ Private Const COL_SCAN_LIMIT    As Integer = 60
 ' --- Sheet names ---
 Private Const SHT_PI  As String = "Project Inputs"
 Private Const SHT_PT  As String = "PT Returns"
+Private Const SHT_SOLVER_RESULTS As String = "__SolverResults"
 
 ' --- Cell addresses ---
 Private Const PT_HOLDCO_ONOFF   As String = "C134"
@@ -48,30 +55,77 @@ Private Const PI_ROW_DEV_FEE    As Long = 32
 Private Const PI_FIRST_PROJ_COL As Integer = 8
 Private Const PI_BASE_COL       As Integer = 7
 
+' --- Recalc ladder state ---
+Private mCalcTier As Integer
+
+
+Private Function EnsureSolverResultsSheetHL() As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(SHT_SOLVER_RESULTS)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = SHT_SOLVER_RESULTS
+    End If
+
+    On Error Resume Next
+    ws.Visible = xlSheetVeryHidden
+    On Error GoTo 0
+
+    Set EnsureSolverResultsSheetHL = ws
+End Function
+
+Private Sub ResetSolverResultsHL(ByVal wsRes As Worksheet)
+    wsRes.Cells.ClearContents
+    wsRes.Range("A1").Value = "Project Offset"
+    wsRes.Range("B1").Value = "Project Name"
+    wsRes.Range("C1").Value = "DSCR"
+    wsRes.Range("D1").Value = "NPP"
+    wsRes.Range("E1").Value = "Dev Fee"
+    wsRes.Range("F1").Value = "Equity Pct"
+    wsRes.Range("G1").Value = "IRR Gap"
+    wsRes.Range("H1").Value = "Appraisal Gap"
+    wsRes.Range("I1").Value = "Converged"
+    wsRes.Range("J1").Value = "Calc Tier"
+    wsRes.Range("K1").Value = "GS Retry Limit"
+    wsRes.Range("L1").Value = "Mode"
+    wsRes.Range("M1").Value = "Solve Seconds"
+    wsRes.Range("N1").Value = "Heartbeat UTC"
+End Sub
+
+Private Sub WriteHeartbeatHL(ByVal wsRes As Worksheet, ByVal heartbeatText As String)
+    wsRes.Range("N1").Value = heartbeatText
+End Sub
+
 
 ' ==============================================================================
 '  INTERNAL HELPERS
 ' ==============================================================================
 Private Sub CalcModelCoreHL()
-    ' Full sheet-level recalc in dependency order.
-    ' Individual Sheets("X").Calculate forces ALL formulas on each sheet
-    ' to recalculate — essential for GoalSeek convergence with seed values.
-    ' Non-core sheets are disabled via EnableCalculation=False.
-    ' DoEvents after each sheet keeps COM RPC channel alive during long solves.
-    Sheets("Project Inputs").Calculate
-    Sheets("Rate Curves").Calculate
-    Sheets("Ops Sandbox").Calculate
-    Sheets("Global").Calculate
-    Sheets("Operations").Calculate
-    Sheets("Capex").Calculate
-    Sheets("Safe Harbor").Calculate
-    Sheets("CL").Calculate
-    Sheets("Perm Debt").Calculate
-    Sheets("Tax Equity").Calculate
-    Sheets("Appraisal").Calculate
-    Sheets("NPP Calc").Calculate
-    Sheets("PT Returns").Calculate
-    DoEvents  ' Yield to COM message pump — prevents RPC timeout
+    ' Deterministic recalc ladder:
+    '   Tier 1 = fastest
+    '   Tier 2 = deeper dependency propagation
+    '   Tier 3 = correctness guardrail for cold-start edge cases
+    Select Case mCalcTier
+        Case 1
+            Application.Calculate
+        Case 2
+            Application.Calculate
+            Application.Calculate
+        Case Else
+            Application.CalculateFull
+    End Select
+    DoEvents  ' Yield to COM message pump during long solve loops
+End Sub
+
+Private Sub ResetCalcTierHL()
+    mCalcTier = 1
+End Sub
+
+Private Sub EscalateCalcTierHL()
+    If mCalcTier < 3 Then mCalcTier = mCalcTier + 1
 End Sub
 
 Private Sub CalcOutputSheetsHL()
@@ -124,7 +178,14 @@ End Sub
 
 Private Sub SetGoalSeekPrecisionHL()
     Application.MaxChange = 0.00001
-    Application.MaxIterations = 1000
+End Sub
+
+Private Sub SetGoalSeekModeHL(ByVal bColdMode As Boolean)
+    If bColdMode Then
+        Application.MaxIterations = GS_MAXITER_COLD
+    Else
+        Application.MaxIterations = GS_MAXITER_WARM
+    End If
 End Sub
 
 Private Sub RestoreGoalSeekDefaultsHL()
@@ -138,6 +199,7 @@ End Sub
 ' ==============================================================================
 Public Sub SwitchProjectAndRecalc(ByVal projOffset As Integer)
     ThisWorkbook.Sheets(SHT_PI).Range(PI_PROJ_INDEX).Value = projOffset
+    ResetCalcTierHL
     CalcModelCoreHL
 End Sub
 
@@ -150,9 +212,12 @@ Public Sub SolveHeadless()
     ' --- Worksheet references ---
     Dim wsPI As Worksheet
     Dim wsPT As Worksheet
+    Dim wsRes As Worksheet
     On Error GoTo ErrHandler
     Set wsPI = ThisWorkbook.Sheets(SHT_PI)
     Set wsPT = ThisWorkbook.Sheets(SHT_PT)
+    Set wsRes = EnsureSolverResultsSheetHL()
+    ResetSolverResultsHL wsRes
 
     ' --- Save original F2 for restore ---
     Dim lngOriginalF2 As Long
@@ -181,6 +246,7 @@ Public Sub SolveHeadless()
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
     SetGoalSeekPrecisionHL
+    ResetCalcTierHL
     DisableNonCoreSheets
 
     On Error Resume Next
@@ -193,13 +259,16 @@ Public Sub SolveHeadless()
     Dim projOffset  As Integer
     Dim iIter       As Integer
     Dim iInner      As Integer
+    Dim iGSRetry    As Integer
     Dim bConverged  As Boolean
     Dim bGSok       As Boolean
+    Dim bColdMode   As Boolean
     Dim dEquityPct  As Double
     Dim dPrevEqPct  As Double
     Dim dIRRGap     As Double
     Dim dApprGap    As Double
     Dim dTotalUses  As Double
+    Dim dSolveStart As Double
 
     Dim rHoldCo     As Range
     Dim rEquity     As Range
@@ -218,6 +287,8 @@ Public Sub SolveHeadless()
 
         colIdx = arrCols(i)
         projOffset = colIdx - PI_BASE_COL
+        dSolveStart = Timer
+        WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & arrNames(i)
 
         ' Route OFFSET formulas to this project
         wsPI.Range(PI_PROJ_INDEX).Value = projOffset
@@ -237,6 +308,10 @@ Public Sub SolveHeadless()
         Set rDevFee = wsPI.Cells(PI_ROW_DEV_FEE, colIdx)
 
         bConverged = False
+        bColdMode = False
+        iGSRetry = MAX_GS_RETRY_WARM
+        SetGoalSeekModeHL False
+        ResetCalcTierHL
         dPrevEqPct = -999
 
         For iIter = 1 To MAX_ITER
@@ -258,7 +333,7 @@ Public Sub SolveHeadless()
             ' Steps 4-5: Sequential NPP / Appraisal solve
             ' Sequential (not batched) ensures each GoalSeek sees fresh recalc
             ' values — critical for cold-start solves with seed values far from optimal.
-            For iInner = 1 To MAX_GS_RETRY
+            For iInner = 1 To iGSRetry
                 bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
                 CalcModelCoreHL
 
@@ -268,6 +343,8 @@ Public Sub SolveHeadless()
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
                 dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
                 If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+                EscalateCalcTierHL
+                WriteHeartbeatHL wsRes, "RETRY|" & CStr(Now) & "|Project=" & arrNames(i) & "|Inner=" & CStr(iInner)
             Next iInner
 
             ' Step 6: Convergence check
@@ -285,7 +362,31 @@ Public Sub SolveHeadless()
             If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then Exit For
             dPrevEqPct = dEquityPct
 
+            ' Escalate this project from warm to cold mode only when needed.
+            If Not bColdMode And iIter >= 1 Then
+                bColdMode = True
+                iGSRetry = MAX_GS_RETRY_COLD
+                SetGoalSeekModeHL True
+                EscalateCalcTierHL
+            End If
+
         Next iIter
+
+        wsRes.Cells(i + 1, 1).Value = projOffset
+        wsRes.Cells(i + 1, 2).Value = arrNames(i)
+        wsRes.Cells(i + 1, 3).Value = rDSCR.Value
+        wsRes.Cells(i + 1, 4).Value = rNPP.Value
+        wsRes.Cells(i + 1, 5).Value = rDevFee.Value
+        wsRes.Cells(i + 1, 6).Value = dEquityPct
+        wsRes.Cells(i + 1, 7).Value = dIRRGap
+        wsRes.Cells(i + 1, 8).Value = dApprGap
+        wsRes.Cells(i + 1, 9).Value = bConverged
+        wsRes.Cells(i + 1, 10).Value = mCalcTier
+        wsRes.Cells(i + 1, 11).Value = iGSRetry
+        wsRes.Cells(i + 1, 12).Value = IIf(bColdMode, "cold", "warm")
+        wsRes.Cells(i + 1, 13).Value = Round(Timer - dSolveStart, 4)
+        wsRes.Cells(i + 1, 14).Value = CStr(Now)
+        WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & arrNames(i)
 
     Next i
 
@@ -298,6 +399,7 @@ Public Sub SolveHeadless()
     RestoreGoalSeekDefaultsHL
     Application.ScreenUpdating = True
     Application.EnableEvents = True
+    WriteHeartbeatHL wsRes, "COMPLETE|" & CStr(Now)
     Exit Sub
 
 ErrHandler:
@@ -308,5 +410,6 @@ ErrHandler:
     RestoreGoalSeekDefaultsHL
     Application.ScreenUpdating = True
     Application.EnableEvents = True
+    If Not wsRes Is Nothing Then WriteHeartbeatHL wsRes, "ERROR|" & CStr(Now)
     On Error GoTo 0
 End Sub
