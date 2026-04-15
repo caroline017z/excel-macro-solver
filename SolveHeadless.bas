@@ -115,19 +115,41 @@ End Sub
 ' ==============================================================================
 Private Sub CalcModelCoreHL()
     ' Deterministic recalc ladder:
-    '   Tier 1 = fastest
-    '   Tier 2 = deeper dependency propagation
-    '   Tier 3 = correctness guardrail for cold-start edge cases
+    '   Tier 1 = per-sheet calc in dependency order (fastest correct path)
+    '   Tier 2 = tier 1 twice, for deeper propagation
+    '   Tier 3 = CalculateFull guardrail for cold-start edge cases
+    '
+    ' Per-sheet Sheets("X").Calculate is required because Application.Calculate
+    ' under xlCalculationManual + multi-threaded calc does not reliably mark
+    ' cross-sheet OFFSET-via-F2 dependencies dirty. In particular, the Appraisal
+    ' sheet's formulas don't recalc after rDevFee is written, so rApprLive
+    ' returns a stale value and the Dev Fee GoalSeek sees zero local slope.
     Select Case mCalcTier
         Case 1
-            Application.Calculate
+            CalcCoreSheetsHL
         Case 2
-            Application.Calculate
-            Application.Calculate
+            CalcCoreSheetsHL
+            CalcCoreSheetsHL
         Case Else
             Application.CalculateFull
     End Select
     DoEvents  ' Yield to COM message pump during long solve loops
+End Sub
+
+Private Sub CalcCoreSheetsHL()
+    Sheets("Project Inputs").Calculate
+    Sheets("Rate Curves").Calculate
+    Sheets("Ops Sandbox").Calculate
+    Sheets("Global").Calculate
+    Sheets("Operations").Calculate
+    Sheets("Capex").Calculate
+    Sheets("Safe Harbor").Calculate
+    Sheets("CL").Calculate
+    Sheets("Perm Debt").Calculate
+    Sheets("Tax Equity").Calculate
+    Sheets("Appraisal").Calculate
+    Sheets("NPP Calc").Calculate
+    Sheets("PT Returns").Calculate
 End Sub
 
 Private Sub ResetCalcTierHL()
