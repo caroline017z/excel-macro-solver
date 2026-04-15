@@ -29,6 +29,12 @@ DSCR_MIN = 0.5
 DSCR_MAX = 5.0
 COL_SCAN_LIMIT = 60
 
+# Sanity bounds — GoalSeek is unconstrained Newton-style and can diverge to
+# absurd values when the local slope is small. If a solve lands outside these
+# bounds, snap back to the seed so the next retry starts from a sane point.
+NPP_MIN, NPP_MAX, NPP_SEED = -0.20, 0.80, 0.20
+DEV_FEE_MIN, DEV_FEE_MAX, DEV_FEE_SEED = 0.05, 0.50, 0.20
+
 PI_FIRST_PROJ_COL = 8
 PI_BASE_COL = 7
 PI_ROW_TOGGLE = 7
@@ -124,10 +130,16 @@ def scan_active_projects(wsPI):
     return projects
 
 
-def solve_one_project(excel, wb, wsPI, wsPT, col_idx):
+def solve_one_project(excel, wb, wsPI, wsPT, col_idx, per_project_timeout=None):
     """Solve a single project -- replicates SolveHeadless per-project logic.
-    Returns (converged: bool, iterations: int, equity_pct: float).
+    Returns (converged: bool, iterations: int, equity_pct: float, timed_out: bool).
+    per_project_timeout: soft timeout in seconds; checked between iterations and
+    GoalSeek retries. Cannot interrupt a GoalSeek mid-call.
     """
+    proj_start = time.time()
+    def _over_budget():
+        return per_project_timeout is not None and (time.time() - proj_start) > per_project_timeout
+
     proj_offset = col_idx - PI_BASE_COL
 
     # Route OFFSET formulas to this project
@@ -152,9 +164,22 @@ def solve_one_project(excel, wb, wsPI, wsPT, col_idx):
     prev_eq_pct = -999.0
     converged = False
     iters_used = 0
+    timed_out = False
+    equity_pct = 0.0
+
+    # Pre-seed if prior project left wild values in this column
+    npp_start = safe_float(rNPP.Value)
+    if npp_start is None or npp_start < NPP_MIN or npp_start > NPP_MAX:
+        rNPP.Value = NPP_SEED
+    dev_start = safe_float(rDevFee.Value)
+    if dev_start is None or dev_start < DEV_FEE_MIN or dev_start > DEV_FEE_MAX:
+        rDevFee.Value = DEV_FEE_SEED
 
     for iIter in range(1, MAX_ITER + 1):
         iters_used = iIter
+        if _over_budget():
+            timed_out = True
+            break
 
         # Step 1: HoldCo OFF + recalc
         rHoldCo.Value = 0
@@ -175,16 +200,27 @@ def solve_one_project(excel, wb, wsPI, wsPT, col_idx):
 
         # Steps 4-5: Sequential IRR + Appraisal GoalSeek with retries
         for _ in range(MAX_GS_RETRY):
+            if _over_budget():
+                timed_out = True
+                break
             rIRRLive.GoalSeek(Goal=rIRRTgt.Value, ChangingCell=rNPP)
+            npp_val = safe_float(rNPP.Value)
+            if npp_val is None or npp_val < NPP_MIN or npp_val > NPP_MAX:
+                rNPP.Value = NPP_SEED
             calc_model_core(wb)
 
             rApprLive.GoalSeek(Goal=rWACCTgt.Value, ChangingCell=rDevFee)
+            dev_val = safe_float(rDevFee.Value)
+            if dev_val is None or dev_val < DEV_FEE_MIN or dev_val > DEV_FEE_MAX:
+                rDevFee.Value = DEV_FEE_SEED
             calc_model_core(wb)
 
             irr_gap = abs((safe_float(rIRRLive.Value) or 0) - (safe_float(rIRRTgt.Value) or 0))
             appr_gap = abs((safe_float(rApprLive.Value) or 0) - (safe_float(rWACCTgt.Value) or 0))
             if irr_gap <= IRR_TOLERANCE and appr_gap <= APPR_TOLERANCE:
                 break
+        if timed_out:
+            break
 
         # Step 6: Convergence check
         total_uses = safe_float(rTotalUses.Value) or 0
@@ -198,7 +234,7 @@ def solve_one_project(excel, wb, wsPI, wsPT, col_idx):
             break
         prev_eq_pct = equity_pct
 
-    return converged, iters_used, equity_pct
+    return converged, iters_used, equity_pct, timed_out
 
 
 def extract_project_results(wsPI, col_idx):
@@ -214,8 +250,10 @@ def main():
     parser.add_argument("workbook", help="Path to .xlsm workbook")
     parser.add_argument("--dry-run", action="store_true",
                         help="List projects without solving")
-    parser.add_argument("--timeout", type=int, default=900,
-                        help="Max seconds total (default: 900)")
+    parser.add_argument("--timeout", type=int, default=5400,
+                        help="Max seconds total (default: 5400)")
+    parser.add_argument("--per-project-timeout", type=int, default=300,
+                        help="Soft timeout per project in seconds; skip to next on exceed (default: 300)")
     args = parser.parse_args()
 
     workbook_path = Path(args.workbook)
@@ -292,11 +330,19 @@ def main():
                 print(f"\n  TIMEOUT after {elapsed:.0f}s -- stopping at project {i}/{len(projects)}")
                 break
 
-            converged, iters, eq_pct = solve_one_project(excel, wb, wsPI, wsPT, col)
+            converged, iters, eq_pct, timed_out = solve_one_project(
+                excel, wb, wsPI, wsPT, col,
+                per_project_timeout=args.per_project_timeout,
+            )
             outputs = extract_project_results(wsPI, col)
             proj_time = time.time() - proj_start
 
-            status = "CONVERGED" if converged else "DONE"
+            if timed_out:
+                status = "TIMEOUT"
+            elif converged:
+                status = "CONVERGED"
+            else:
+                status = "DONE"
             npp = outputs.get("NPP ($/W)")
             dev = outputs.get("Dev Fee ($/W)")
             npp_str = f"${npp:.3f}" if npp is not None else "---"

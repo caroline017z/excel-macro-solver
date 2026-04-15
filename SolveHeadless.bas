@@ -30,6 +30,16 @@ Private Const DSCR_MIN          As Double = 0.5
 Private Const DSCR_MAX          As Double = 5#
 Private Const COL_SCAN_LIMIT    As Integer = 60
 
+' Sanity bounds for NPP / Dev Fee — GoalSeek is unconstrained Newton-style
+' and can diverge to absurd values (e.g. $12/W) when local slope is small.
+' Out-of-range solves are snapped to the seed for the next retry.
+Private Const NPP_MIN           As Double = -0.2
+Private Const NPP_MAX           As Double = 0.8
+Private Const NPP_SEED          As Double = 0.2
+Private Const DEV_FEE_MIN       As Double = 0.05
+Private Const DEV_FEE_MAX       As Double = 0.5
+Private Const DEV_FEE_SEED      As Double = 0.2
+
 ' --- Sheet names ---
 Private Const SHT_PI  As String = "Project Inputs"
 Private Const SHT_PT  As String = "PT Returns"
@@ -177,7 +187,10 @@ Private Sub EnableAllSheets()
 End Sub
 
 Private Sub SetGoalSeekPrecisionHL()
-    Application.MaxChange = 0.00001
+    ' Inner GoalSeek tolerance. Was 0.00001 (100x tighter than Excel default),
+    ' which forced ~3-5x more inner iterations than necessary given outer
+    ' convergence tolerances of IRR_TOLERANCE / APPR_TOLERANCE = 0.0003.
+    Application.MaxChange = 0.0001
 End Sub
 
 Private Sub SetGoalSeekModeHL(ByVal bColdMode As Boolean)
@@ -202,6 +215,196 @@ Public Sub SwitchProjectAndRecalc(ByVal projOffset As Integer)
     ResetCalcTierHL
     CalcModelCoreHL
 End Sub
+
+
+' ==============================================================================
+'  PUBLIC: Chunked entry points for Python-driven progress reporting
+'
+'  Python calls: InitSolveEnvHL -> (SolveOneProjectByColHL per project) -> FinalizeSolveEnvHL
+'  Between calls, Python reads the __SolverResults sheet row for status.
+'  This keeps the fast in-process solve while restoring per-project progress.
+' ==============================================================================
+
+Public Sub InitSolveEnvHL()
+    Dim wsRes As Worksheet
+    Set wsRes = EnsureSolverResultsSheetHL()
+    ResetSolverResultsHL wsRes
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    SetGoalSeekPrecisionHL
+    ResetCalcTierHL
+    DisableNonCoreSheets
+
+    On Error Resume Next
+    Application.MultiThreadedCalculation.Enabled = True
+    On Error GoTo 0
+
+    WriteHeartbeatHL wsRes, "INIT|" & CStr(Now)
+End Sub
+
+Public Sub FinalizeSolveEnvHL(ByVal lngOriginalF2 As Long)
+    Dim wsPI As Worksheet
+    Dim wsRes As Worksheet
+    Set wsPI = ThisWorkbook.Sheets(SHT_PI)
+    Set wsRes = EnsureSolverResultsSheetHL()
+
+    wsPI.Range(PI_PROJ_INDEX).Value = lngOriginalF2
+    ResetCalcTierHL
+    CalcModelCoreHL
+    EnableAllSheets
+    CalcOutputSheetsHL
+
+    RestoreGoalSeekDefaultsHL
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+
+    WriteHeartbeatHL wsRes, "COMPLETE|" & CStr(Now)
+End Sub
+
+' Solve a single project. Writes results to __SolverResults row `resultsRow`.
+' Returns 1 if converged, 0 otherwise (as a Long, since Python COM sees Long cleanly).
+Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
+                                        ByVal projName As String, _
+                                        ByVal resultsRow As Integer) As Long
+    Dim wsPI As Worksheet
+    Dim wsPT As Worksheet
+    Dim wsRes As Worksheet
+    Set wsPI = ThisWorkbook.Sheets(SHT_PI)
+    Set wsPT = ThisWorkbook.Sheets(SHT_PT)
+    Set wsRes = EnsureSolverResultsSheetHL()
+
+    Dim projOffset As Integer
+    projOffset = colIdx - PI_BASE_COL
+
+    Dim dSolveStart As Double
+    dSolveStart = Timer
+    WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName
+
+    ' Route OFFSET formulas to this project
+    wsPI.Range(PI_PROJ_INDEX).Value = projOffset
+    ResetCalcTierHL
+    CalcModelCoreHL
+
+    Dim rHoldCo     As Range
+    Dim rEquity     As Range
+    Dim rMinEqTgt   As Range
+    Dim rDSCR       As Range
+    Dim rTotalUses  As Range
+    Dim rIRRLive    As Range
+    Dim rIRRTgt     As Range
+    Dim rNPP        As Range
+    Dim rApprLive   As Range
+    Dim rWACCTgt    As Range
+    Dim rDevFee     As Range
+
+    Set rHoldCo = wsPT.Range(PT_HOLDCO_ONOFF)
+    Set rEquity = wsPT.Range(PT_EQUITY)
+    Set rMinEqTgt = wsPT.Range(PT_MIN_EQ_TARGET)
+    Set rDSCR = wsPT.Range(PT_DSCR_MULTIPLE)
+    Set rTotalUses = wsPT.Range(PT_TOTAL_USES)
+    Set rIRRLive = wsPI.Range(PI_IRR_LIVE)
+    Set rIRRTgt = wsPI.Range(PI_IRR_TARGET)
+    Set rNPP = wsPI.Cells(PI_ROW_NPP, colIdx)
+    Set rApprLive = wsPI.Range(PI_APPR_LIVE)
+    Set rWACCTgt = wsPI.Range(PI_WACC_TARGET)
+    Set rDevFee = wsPI.Cells(PI_ROW_DEV_FEE, colIdx)
+
+    ' Pre-seed if prior project left wild values in this column
+    If rNPP.Value = "" Or rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then
+        rNPP.Value = NPP_SEED
+    End If
+    If rDevFee.Value = "" Or rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then
+        rDevFee.Value = DEV_FEE_SEED
+    End If
+
+    Dim bConverged  As Boolean
+    Dim bColdMode   As Boolean
+    Dim iGSRetry    As Integer
+    Dim iIter       As Integer
+    Dim iInner      As Integer
+    Dim bGSok       As Boolean
+    Dim dEquityPct  As Double
+    Dim dPrevEqPct  As Double
+    Dim dIRRGap     As Double
+    Dim dApprGap    As Double
+    Dim dTotalUses  As Double
+
+    bConverged = False
+    bColdMode = False
+    iGSRetry = MAX_GS_RETRY_WARM
+    SetGoalSeekModeHL False
+    ResetCalcTierHL
+    dPrevEqPct = -999
+
+    For iIter = 1 To MAX_ITER
+        rHoldCo.Value = 0
+        CalcModelCoreHL
+
+        bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
+        If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
+        If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
+        CalcModelCoreHL
+
+        rHoldCo.Value = 1
+        CalcModelCoreHL
+
+        For iInner = 1 To iGSRetry
+            bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
+            If rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then rNPP.Value = NPP_SEED
+            CalcModelCoreHL
+
+            bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
+            If rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then rDevFee.Value = DEV_FEE_SEED
+            CalcModelCoreHL
+
+            dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+            dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+            If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+            EscalateCalcTierHL
+        Next iInner
+
+        dTotalUses = rTotalUses.Value
+        If dTotalUses <> 0 Then
+            dEquityPct = rEquity.Value / dTotalUses
+        Else
+            dEquityPct = 0
+        End If
+
+        If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL Then
+            bConverged = True
+            Exit For
+        End If
+        If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then Exit For
+        dPrevEqPct = dEquityPct
+
+        If Not bColdMode Then
+            bColdMode = True
+            iGSRetry = MAX_GS_RETRY_COLD
+            SetGoalSeekModeHL True
+            EscalateCalcTierHL
+        End If
+    Next iIter
+
+    wsRes.Cells(resultsRow, 1).Value = projOffset
+    wsRes.Cells(resultsRow, 2).Value = projName
+    wsRes.Cells(resultsRow, 3).Value = rDSCR.Value
+    wsRes.Cells(resultsRow, 4).Value = rNPP.Value
+    wsRes.Cells(resultsRow, 5).Value = rDevFee.Value
+    wsRes.Cells(resultsRow, 6).Value = dEquityPct
+    wsRes.Cells(resultsRow, 7).Value = dIRRGap
+    wsRes.Cells(resultsRow, 8).Value = dApprGap
+    wsRes.Cells(resultsRow, 9).Value = bConverged
+    wsRes.Cells(resultsRow, 10).Value = mCalcTier
+    wsRes.Cells(resultsRow, 11).Value = iGSRetry
+    wsRes.Cells(resultsRow, 12).Value = IIf(bColdMode, "cold", "warm")
+    wsRes.Cells(resultsRow, 13).Value = Round(Timer - dSolveStart, 4)
+    wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+    WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & projName
+
+    SolveOneProjectByColHL = IIf(bConverged, 1, 0)
+End Function
 
 
 ' ==============================================================================
@@ -314,6 +517,14 @@ Public Sub SolveHeadless()
         ResetCalcTierHL
         dPrevEqPct = -999
 
+        ' Pre-seed if prior project left wild values in this column
+        If rNPP.Value = "" Or rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then
+            rNPP.Value = NPP_SEED
+        End If
+        If rDevFee.Value = "" Or rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then
+            rDevFee.Value = DEV_FEE_SEED
+        End If
+
         For iIter = 1 To MAX_ITER
 
             ' Step 1: HoldCo OFF + recalc
@@ -335,9 +546,11 @@ Public Sub SolveHeadless()
             ' values — critical for cold-start solves with seed values far from optimal.
             For iInner = 1 To iGSRetry
                 bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
+                If rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then rNPP.Value = NPP_SEED
                 CalcModelCoreHL
 
                 bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
+                If rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then rDevFee.Value = DEV_FEE_SEED
                 CalcModelCoreHL
 
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
