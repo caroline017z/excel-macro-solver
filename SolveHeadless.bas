@@ -26,8 +26,9 @@ Private Const GS_MAXITER_COLD   As Integer = 1000
 Private Const EQUITY_FINAL_TOL  As Double = 0.005
 Private Const IRR_TOLERANCE     As Double = 0.0003
 Private Const APPR_TOLERANCE    As Double = 0.0003
-Private Const DSCR_MIN          As Double = 0.5
-Private Const DSCR_MAX          As Double = 5#
+Private Const DSCR_MIN          As Double = 0.25
+Private Const DSCR_MAX          As Double = 3#
+Private Const PROJECT_TIMEOUT_SECONDS As Double = 600
 Private Const COL_SCAN_LIMIT    As Integer = 60
 
 ' Sanity bounds for NPP / Dev Fee — GoalSeek is unconstrained Newton-style
@@ -209,18 +210,14 @@ Private Sub EnableAllSheets()
 End Sub
 
 Private Sub SetGoalSeekPrecisionHL()
-    ' Inner GoalSeek tolerance. Was 0.00001 (100x tighter than Excel default),
-    ' which forced ~3-5x more inner iterations than necessary given outer
-    ' convergence tolerances of IRR_TOLERANCE / APPR_TOLERANCE = 0.0003.
-    Application.MaxChange = 0.0001
+    ' Match working SolveMinEquityWithHoldCo precision. Looser settings cause
+    ' Appraisal GoalSeek to exit before Dev Fee has actually converged.
+    Application.MaxChange = 0.00001
+    Application.MaxIterations = GS_MAXITER_COLD
 End Sub
 
 Private Sub SetGoalSeekModeHL(ByVal bColdMode As Boolean)
-    If bColdMode Then
-        Application.MaxIterations = GS_MAXITER_COLD
-    Else
-        Application.MaxIterations = GS_MAXITER_WARM
-    End If
+    Application.MaxIterations = GS_MAXITER_COLD
 End Sub
 
 Private Sub RestoreGoalSeekDefaultsHL()
@@ -333,13 +330,11 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     Set rWACCTgt = wsPI.Range(PI_WACC_TARGET)
     Set rDevFee = wsPI.Cells(PI_ROW_DEV_FEE, colIdx)
 
-    ' Pre-seed if prior project left wild values in this column
-    If rNPP.Value = "" Or rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then
-        rNPP.Value = NPP_SEED
-    End If
-    If rDevFee.Value = "" Or rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then
-        rDevFee.Value = DEV_FEE_SEED
-    End If
+    ' Pre-seed only if cell is blank. Do NOT clamp by bounds --
+    ' SolveMinEquityWithHoldCo trusts GoalSeek, and clamping legitimate
+    ' answers to the seed prevents Appraisal from ever converging.
+    If rNPP.Value = "" Then rNPP.Value = NPP_SEED
+    If rDevFee.Value = "" Then rDevFee.Value = DEV_FEE_SEED
 
     Dim bConverged  As Boolean
     Dim bColdMode   As Boolean
@@ -355,12 +350,13 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
     bConverged = False
     bColdMode = False
-    iGSRetry = MAX_GS_RETRY_WARM
-    SetGoalSeekModeHL False
+    iGSRetry = MAX_GS_RETRY_COLD
+    SetGoalSeekModeHL True
     ResetCalcTierHL
     dPrevEqPct = -999
 
     For iIter = 1 To MAX_ITER
+        If Timer - dSolveStart > PROJECT_TIMEOUT_SECONDS Then Exit For
         rHoldCo.Value = 0
         CalcModelCoreHL
 
@@ -374,11 +370,9 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
         For iInner = 1 To iGSRetry
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
-            If rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then rNPP.Value = NPP_SEED
             CalcModelCoreHL
 
             bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
-            If rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then rDevFee.Value = DEV_FEE_SEED
             CalcModelCoreHL
 
             dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)

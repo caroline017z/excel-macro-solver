@@ -131,7 +131,8 @@ def main():
     try:
         pythoncom.CoInitialize()
         excel = win32com.client.DispatchEx("Excel.Application")
-        excel.Visible = False
+        excel.Visible = True
+        excel.WindowState = -4140  # xlMinimized -- visible but out of the way
         excel.DisplayAlerts = False
         excel.ScreenUpdating = False
         excel.EnableEvents = False
@@ -212,6 +213,13 @@ def main():
                     "name": name, "col": col, "converged": converged_int == 1,
                     "time": proj_time, "npp": npp, "dev_fee": dev, "dscr": dscr,
                 })
+
+                solved_name = workbook_path.stem + "_SOLVED" + workbook_path.suffix
+                solved_path = workbook_path.parent / solved_name
+                try:
+                    wb.SaveCopyAs(str(solved_path))
+                except Exception as save_exc:
+                    print(f"    (incremental save failed: {save_exc})")
         finally:
             # Always try to finalize even on error so workbook state is restored
             try:

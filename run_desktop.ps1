@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
-$wb   = "$env:USERPROFILE\OneDrive - 38 Degrees North\Desktop\38DN-IL_US Solar_PricingModel_Test - Copy.xlsm"
+$wb   = "$env:USERPROFILE\Box\2. Deal Flow\Novel Energy Solutions\Pricing Model\38DN-IL_Novel Energy Solutions_lease financing_PricingModel_100% Commercial_2026.04.15.xlsm"
 
 if (-not (Test-Path $wb)) {
     Write-Host "Workbook not found at: $wb" -ForegroundColor Red
@@ -9,5 +9,5 @@ if (-not (Test-Path $wb)) {
 }
 
 Set-Location $repo
-python solve_via_macro.py $wb --timeout 5400
+python -u solve_via_macro.py $wb --timeout 5400
 Read-Host "Done. Press Enter to close"
