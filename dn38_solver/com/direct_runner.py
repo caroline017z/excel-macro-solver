@@ -17,7 +17,9 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
+from dn38_solver.convert import safe_float, safe_str_or_float, safe_value
 from dn38_solver.types import CellAddress, SolveTask
 
 log = logging.getLogger(__name__)
@@ -25,13 +27,101 @@ log = logging.getLogger(__name__)
 STATUS_FILE = Path(__file__).resolve().parent.parent.parent / "solver_status.json"
 SOLVER_RESULTS_SHEET = "__SolverResults"
 
+# Upper bound on rows to read from __SolverResults in one bulk Range.Value call.
+# 60 active projects + slack for header growth; one COM round-trip beats N+1.
+_RESULTS_BULK_ROWS = 200
 
-def _write_status(data: dict) -> None:
-    """Write solver status to JSON for the Streamlit tracker."""
-    try:
-        STATUS_FILE.write_text(json.dumps(data, default=str))
-    except OSError:
-        pass
+
+class _NormCell(NamedTuple):
+    sheet: str
+    address: str  # may contain "{col}" template placeholder
+
+
+class _NormTask(NamedTuple):
+    col: str
+    offset: int
+    name: str
+    idx_cell: CellAddress | dict
+    read_cells: tuple[_NormCell, ...]
+
+
+def _norm_cell(c: object) -> _NormCell:
+    if hasattr(c, "address"):
+        return _NormCell(sheet=c.sheet, address=c.address)
+    return _NormCell(sheet=c["sheet"], address=c["address"])
+
+
+def _norm_task(t: object) -> _NormTask:
+    if hasattr(t, "project_col_letter"):
+        cells = tuple(_norm_cell(c) for c in t.read_cells)
+        return _NormTask(
+            col=t.project_col_letter,
+            offset=int(t.project_offset),
+            name=t.project_name,
+            idx_cell=t.project_index_cell,
+            read_cells=cells,
+        )
+    cells = tuple(_norm_cell(c) for c in t.get("read_cells", []))
+    return _NormTask(
+        col=t["project_col_letter"],
+        offset=int(t["project_offset"]),
+        name=t["project_name"],
+        idx_cell=t["project_index_cell"],
+        read_cells=cells,
+    )
+
+
+class _StatusWriter:
+    """Buffered solver-status writer.
+
+    Holds the immutable run-level fields (workbook, project list, start time)
+    so each phase update only constructs a small delta dict before writing.
+    Output is still JSON to STATUS_FILE for the Streamlit tracker.
+    """
+
+    __slots__ = ("_base", "_start", "_path")
+
+    def __init__(
+        self,
+        *,
+        workbook_path: str,
+        proj_names: list[str],
+        start: float,
+        path: Path = STATUS_FILE,
+    ) -> None:
+        self._base = {
+            "workbook": workbook_path,
+            "total_projects": len(proj_names),
+            "_proj_names": proj_names,
+        }
+        self._start = start
+        self._path = path
+
+    def update(
+        self,
+        phase: str,
+        *,
+        per_project_status: str | None = None,
+        projects: list[dict] | None = None,
+        **extras: object,
+    ) -> None:
+        if projects is None and per_project_status is not None:
+            projects = [
+                {"name": n, "status": per_project_status}
+                for n in self._base["_proj_names"]
+            ]
+        payload = {
+            "phase": phase,
+            "workbook": self._base["workbook"],
+            "total_projects": self._base["total_projects"],
+            "projects": projects or [],
+            "elapsed_sec": time.time() - self._start,
+        }
+        payload.update(extras)
+        try:
+            self._path.write_text(json.dumps(payload, default=str))
+        except OSError:
+            pass
 
 
 def run_direct(
@@ -70,18 +160,16 @@ def run_direct(
         excel.ScreenUpdating = False
         excel.EnableEvents = False
 
-        # Build project list for status tracking
-        proj_names = [
-            (t.project_name if hasattr(t, "project_name") else t.get("project_name", "?"))
-            for t in tasks
-        ]
-        _write_status({
-            "phase": "opening",
-            "workbook": workbook_path,
-            "total_projects": len(tasks),
-            "projects": [{"name": n, "status": "pending"} for n in proj_names],
-            "elapsed_sec": time.time() - start,
-        })
+        # Normalize task payloads once so the per-project loop is branch-free.
+        norm_tasks = [_norm_task(t) for t in tasks]
+        proj_names = [nt.name for nt in norm_tasks]
+
+        status = _StatusWriter(
+            workbook_path=workbook_path,
+            proj_names=proj_names,
+            start=start,
+        )
+        status.update("opening", per_project_status="pending")
 
         log.info("  Opening workbook via COM...")
         wb = excel.Workbooks.Open(
@@ -104,14 +192,11 @@ def run_direct(
         macro_error = None
 
         log.info("  Running macro...")
-        _write_status({
-            "phase": "solving",
-            "workbook": workbook_path,
-            "total_projects": len(tasks),
-            "projects": [{"name": n, "status": "solving"} for n in proj_names],
-            "elapsed_sec": time.time() - start,
-            "macro_used": "SolveHeadless",
-        })
+        status.update(
+            "solving",
+            per_project_status="solving",
+            macro_used="SolveHeadless",
+        )
 
         t0 = time.time()
         for macro_name in macro_names:
@@ -149,79 +234,68 @@ def run_direct(
         has_switch = macro_used == "SolveHeadless"
 
         log.info("  Reading results for %d project(s)...", len(tasks))
-        _write_status({
-            "phase": "reading",
-            "workbook": workbook_path,
-            "total_projects": len(tasks),
-            "projects": [{"name": n, "status": "reading"} for n in proj_names],
-            "elapsed_sec": time.time() - start,
-            "macro_used": macro_used,
-            "macro_time_sec": solve_time,
-        })
+        status.update(
+            "reading",
+            per_project_status="reading",
+            macro_used=macro_used,
+            macro_time_sec=solve_time,
+        )
         t0 = time.time()
         project_results = []
         solver_results, heartbeat = _read_solver_results_map(wb)
 
-        for task_dict in tasks:
-            # Handle both SolveTask objects and dicts
-            if hasattr(task_dict, "project_col_letter"):
-                col = task_dict.project_col_letter
-                offset = task_dict.project_offset
-                name = task_dict.project_name
-                read_cells = task_dict.read_cells
-                idx_cell = task_dict.project_index_cell
-            else:
-                col = task_dict["project_col_letter"]
-                offset = task_dict["project_offset"]
-                name = task_dict["project_name"]
-                read_cells = task_dict.get("read_cells", [])
-                idx_cell = task_dict["project_index_cell"]
-
+        for nt in norm_tasks:
             # Switch F2 with targeted recalc
             if has_switch:
                 try:
                     excel.Application.Run(
                         f"'{wb.Name}'!SwitchProjectAndRecalc",
-                        int(offset),
+                        nt.offset,
                     )
                 except Exception:
-                    _set_f2(wb, idx_cell, offset)
+                    _set_f2(wb, nt.idx_cell, nt.offset)
             else:
-                _set_f2(wb, idx_cell, offset)
+                _set_f2(wb, nt.idx_cell, nt.offset)
 
             # Read cells
             solved: dict[str, float | str | None] = {}
-            for cell in read_cells:
-                if hasattr(cell, "address"):
-                    addr = cell.address.replace("{col}", col)
-                    sheet = cell.sheet
-                else:
-                    addr = cell["address"].replace("{col}", col)
-                    sheet = cell["sheet"]
-                key = f"{sheet}!{addr}"
-                solved[key] = _read_cell(wb, sheet, addr)
+            npp = dev_fee = fmv = None
+            for cell in nt.read_cells:
+                addr = cell.address.replace("{col}", nt.col)
+                key = f"{cell.sheet}!{addr}"
+                val = _read_cell(wb, cell.sheet, addr)
+                solved[key] = val
+                # Capture summary scalars at read time so we don't re-scan
+                # solved_values later for the tracker payload.
+                if addr.endswith("38"):
+                    npp = safe_float(val)
+                elif addr.endswith("32"):
+                    dev_fee = safe_float(val)
+                elif addr.endswith("33"):
+                    fmv = safe_float(val)
 
             # Prefer per-project DSCR captured during solve loop to avoid
             # last-project F129 bleed in multi-project runs.
             dscr_key = "PT Returns!F129"
-            meta = solver_results.get(int(offset))
+            meta = solver_results.get(nt.offset)
             if meta and "dscr" in meta:
                 solved[dscr_key] = meta["dscr"]
 
             project_results.append({
-                "project_name": name,
+                "project_name": nt.name,
                 "status": "converged",
                 "solved_values": solved,
                 "iterations_used": 0,
                 "duration_sec": 0,
                 "meta": meta or {},
+                "_summary": {"npp": npp, "dev_fee": dev_fee, "fmv": fmv},
             })
 
         read_time = time.time() - t0
         log.info("  Read %d project(s) in %.1fs", len(tasks), read_time)
 
         # Restore original F2
-        if tasks and has_switch:
+        if norm_tasks and has_switch:
             with contextlib.suppress(Exception):
                 excel.Application.Run(
                     f"'{wb.Name}'!SwitchProjectAndRecalc",
@@ -238,6 +312,21 @@ def run_direct(
             saved_to = str(solved_path)
 
         total = time.time() - start
+
+        # Build tracker payload from pre-computed per-project summaries.
+        tracker_projects = [
+            {
+                "name": pr["project_name"],
+                "status": "converged",
+                **pr["_summary"],
+            }
+            for pr in project_results
+        ]
+        # _summary was a transport-only field for the tracker — drop it from
+        # the returned project_results so downstream consumers see a clean shape.
+        for pr in project_results:
+            pr.pop("_summary", None)
+
         result = {
             "status": "converged",
             "project_results": project_results,
@@ -252,32 +341,17 @@ def run_direct(
             "solver_heartbeat": heartbeat,
         }
 
-        # Write completion status for Streamlit tracker
-        from dn38_solver.convert import safe_float
-        tracker_projects = []
-        for pr in project_results:
-            sv = pr.get("solved_values", {})
-            tracker_projects.append({
-                "name": pr.get("project_name", "?"),
-                "status": "converged",
-                "npp": safe_float(sv.get(next((k for k in sv if k.endswith("38")), ""), None)),
-                "dev_fee": safe_float(sv.get(next((k for k in sv if k.endswith("32")), ""), None)),
-                "fmv": safe_float(sv.get(next((k for k in sv if k.endswith("33")), ""), None)),
-            })
-        _write_status({
-            "phase": "complete",
-            "workbook": workbook_path,
-            "total_projects": len(tasks),
-            "projects": tracker_projects,
-            "elapsed_sec": total,
-            "total_time_sec": total,
-            "macro_used": macro_used,
-            "open_time_sec": round(open_time, 2),
-            "macro_time_sec": round(solve_time, 2),
-            "read_time_sec": round(read_time, 2),
-            "solver_heartbeat": heartbeat,
-            "error": None,
-        })
+        status.update(
+            "complete",
+            projects=tracker_projects,
+            total_time_sec=total,
+            macro_used=macro_used,
+            open_time_sec=round(open_time, 2),
+            macro_time_sec=round(solve_time, 2),
+            read_time_sec=round(read_time, 2),
+            solver_heartbeat=heartbeat,
+            error=None,
+        )
 
     except Exception as exc:
         result = {
@@ -311,13 +385,7 @@ def run_direct(
 
 
 def _read_cell(wb: object, sheet: str, address: str) -> float | str | None:
-    v = wb.Sheets(sheet).Range(address).Value
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return str(v)
+    return safe_value(wb.Sheets(sheet).Range(address).Value)
 
 
 def _set_f2(wb: object, idx_cell: object, offset: int) -> None:
@@ -331,59 +399,57 @@ def _set_f2(wb: object, idx_cell: object, offset: int) -> None:
 def _read_solver_results_map(
     wb: object,
 ) -> tuple[dict[int, dict[str, float | str | None]], str | None]:
-    """Read per-project solve telemetry captured by SolveHeadless VBA."""
+    """Read per-project solve telemetry captured by SolveHeadless VBA.
+
+    One bulk Range.Value read covering A2:N{2 + _RESULTS_BULK_ROWS - 1} replaces
+    the prior per-cell while loop (~14 COM round-trips per project, ~840 for a
+    60-project portfolio). The block is sparse-tolerant: rows whose A column is
+    blank are treated as end-of-data.
+    """
     out: dict[int, dict[str, float | str | None]] = {}
     try:
         ws = wb.Sheets(SOLVER_RESULTS_SHEET)
     except Exception:
         return out, None
 
-    heartbeat = _to_safe(ws.Range("N1").Value)
+    heartbeat = safe_str_or_float(ws.Range("N1").Value)
     if not isinstance(heartbeat, str):
         heartbeat = None
 
-    row = 2
-    while True:
-        offset_val = ws.Range(f"A{row}").Value
-        if offset_val in (None, ""):
+    last_row = 1 + _RESULTS_BULK_ROWS
+    try:
+        block = ws.Range(f"A2:N{last_row}").Value
+    except Exception:
+        return out, heartbeat
+    if block is None:
+        return out, heartbeat
+
+    # Single-row Range.Value comes back as a flat tuple; multi-row as
+    # tuple-of-tuples. Normalize to the latter.
+    if block and not isinstance(block[0], tuple):
+        block = (block,)
+
+    for row_vals in block:
+        offset_raw = row_vals[0]
+        if offset_raw is None or offset_raw == "":
             break
         try:
-            offset = int(offset_val)
+            offset = int(offset_raw)
         except (ValueError, TypeError):
-            row += 1
             continue
         out[offset] = {
-            "project_name": _to_safe(ws.Range(f"B{row}").Value),
-            "dscr": _to_float(ws.Range(f"C{row}").Value),
-            "npp": _to_float(ws.Range(f"D{row}").Value),
-            "dev_fee": _to_float(ws.Range(f"E{row}").Value),
-            "equity_pct": _to_float(ws.Range(f"F{row}").Value),
-            "irr_gap": _to_float(ws.Range(f"G{row}").Value),
-            "appr_gap": _to_float(ws.Range(f"H{row}").Value),
-            "converged_flag": _to_safe(ws.Range(f"I{row}").Value),
-            "calc_tier": _to_safe(ws.Range(f"J{row}").Value),
-            "gs_retry_limit": _to_safe(ws.Range(f"K{row}").Value),
-            "mode": _to_safe(ws.Range(f"L{row}").Value),
-            "solve_seconds": _to_float(ws.Range(f"M{row}").Value),
-            "heartbeat": _to_safe(ws.Range(f"N{row}").Value),
+            "project_name": safe_str_or_float(row_vals[1]),
+            "dscr": safe_float(row_vals[2]),
+            "npp": safe_float(row_vals[3]),
+            "dev_fee": safe_float(row_vals[4]),
+            "equity_pct": safe_float(row_vals[5]),
+            "irr_gap": safe_float(row_vals[6]),
+            "appr_gap": safe_float(row_vals[7]),
+            "converged_flag": safe_str_or_float(row_vals[8]),
+            "calc_tier": safe_str_or_float(row_vals[9]),
+            "gs_retry_limit": safe_str_or_float(row_vals[10]),
+            "mode": safe_str_or_float(row_vals[11]),
+            "solve_seconds": safe_float(row_vals[12]),
+            "heartbeat": safe_str_or_float(row_vals[13]),
         }
-        row += 1
     return out, heartbeat
-
-
-def _to_float(v: object) -> float | None:
-    if v in (None, ""):
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
-
-
-def _to_safe(v: object) -> str | float | None:
-    if v in (None, ""):
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return str(v)

@@ -22,15 +22,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from dn38_solver.convert import safe_value
+
 
 def _read_cell(wb: object, sheet: str, address: str) -> float | str | None:
-    v = wb.Sheets(sheet).Range(address).Value
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return str(v)
+    return safe_value(wb.Sheets(sheet).Range(address).Value)
 
 
 def worker_main() -> None:

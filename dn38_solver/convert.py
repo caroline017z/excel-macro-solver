@@ -36,6 +36,18 @@ def safe_value(v: object) -> float | str | None:
     return str(v)
 
 
+def safe_str_or_float(v: object) -> float | str | None:
+    """Like safe_value, but also collapses empty strings to None.
+
+    For COM telemetry reads where blank cells surface as "" rather than None.
+    """
+    if v is None or v == "":
+        return None
+    with contextlib.suppress(ValueError, TypeError):
+        return float(v)
+    return str(v)
+
+
 def col_letter(col_num: int) -> str:
     """1-based column number to Excel letter(s). Delegates to openpyxl."""
     return _openpyxl_col_letter(col_num)
