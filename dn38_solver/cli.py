@@ -88,6 +88,15 @@ def main() -> None:
         help="Custom batch ID for grouping runs",
     )
     parser.add_argument(
+        "--strict-validation",
+        action="store_true",
+        help=(
+            "Treat formula errors (#REF!, #DIV/0!, etc.) in the input "
+            "workbook or the saved _SOLVED.xlsx as a run failure. Default "
+            "is to log them as warnings and proceed."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -111,6 +120,7 @@ def main() -> None:
         batch_id=args.batch_id,
         dry_run=args.dry_run,
         timeout_sec=args.timeout,
+        strict_validation=args.strict_validation,
     )
 
     # Exit code: 0 if converged, 1 if not

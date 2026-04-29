@@ -138,14 +138,20 @@ def generate_summary_xlsx(record: RunRecord) -> io.BytesIO:
     ws.row_dimensions[4].height = 24
 
     # --- Data rows (one per project) ---
+    # Gap columns are written as live formulas (=ABS(...)) referencing the
+    # adjacent input cells, per 38DN convention "every output formula-linked":
+    #   IRR Gap (col I) = ABS(Live IRR H - Target IRR G)
+    #   Appraisal Gap (col L) = ABS(Appraisal IRR J - WACC Target K)
+    # When either input is missing, the formula is omitted so the cell stays
+    # visually blank instead of computing 0 from blanks.
     for row_idx, proj in enumerate(record.projects, 5):
         irr_gap = (
-            abs((proj.live_irr or 0) - (proj.target_irr or 0))
+            f"=ABS(H{row_idx}-G{row_idx})"
             if proj.live_irr is not None and proj.target_irr is not None
             else None
         )
         appr_gap = (
-            abs((proj.appraisal_live or 0) - (proj.wacc_target or 0))
+            f"=ABS(J{row_idx}-K{row_idx})"
             if proj.appraisal_live is not None and proj.wacc_target is not None
             else None
         )

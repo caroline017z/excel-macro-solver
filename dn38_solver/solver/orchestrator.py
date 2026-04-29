@@ -22,6 +22,10 @@ from dn38_solver.config import (
 )
 from dn38_solver.convert import safe_float
 from dn38_solver.shadow.reader import WorkbookReader
+from dn38_solver.shadow.validation import (
+    format_validation_report,
+    scan_workbook_errors,
+)
 from dn38_solver.com.direct_runner import run_direct
 from dn38_solver.solver.sequence import build_solve_task
 from dn38_solver.storage.database import get_connection, now_iso, save_run
@@ -75,13 +79,20 @@ def solve_all(
     batch_id: str | None = None,
     dry_run: bool = False,
     timeout_sec: int = 600,
+    strict_validation: bool = False,
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
-    1. Shadow read (openpyxl) — extract projects, read current values
-    2. Build SolveTasks for all projects
-    3. Send ALL tasks to ONE COM subprocess (single Excel session)
-    4. Parse results, persist to SQLite
+    1. Pre-flight validation (openpyxl error scan) — fail-fast on broken input
+    2. Shadow read (openpyxl) — extract projects, read current values
+    3. Build SolveTasks for all projects
+    4. Send ALL tasks to ONE COM subprocess (single Excel session)
+    5. Parse results, persist to SQLite
+
+    Args:
+        strict_validation: when True, pre-flight or post-export formula
+            errors abort the run with status=ERROR. When False (default),
+            errors are logged as warnings but the solve proceeds.
     """
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:8]
@@ -94,6 +105,27 @@ def solve_all(
     log.info("  Mode: %s", "DRY RUN" if dry_run else "LIVE")
     log.info("  Batch: %s", batch_id)
     log.info("=" * 60)
+
+    # Phase 0: Pre-flight formula-error scan on the input workbook.
+    # Cheap (~1s on the IL pricing model) and catches a class of broken
+    # inputs before we pay the COM startup + multi-minute solve cost.
+    log.info("[Phase 0] Pre-flight formula-error scan...")
+    pre_validation = scan_workbook_errors(workbook_path)
+    log.info("  %s", format_validation_report(pre_validation, "Input"))
+    if not pre_validation.ok and strict_validation:
+        return RunRecord(
+            workbook_name=workbook_path.name,
+            run_timestamp=now_iso(),
+            batch_id=batch_id,
+            solver_mode="hybrid_shadow",
+            projects=(),
+            total_duration_sec=time.time() - start,
+            status=SolveStatus.ERROR.value,
+            error=(
+                f"Pre-flight validation failed: {pre_validation.total_errors} "
+                f"formula error(s) in input workbook"
+            ),
+        )
 
     # Phase 1: Shadow pre-read
     log.info("[Phase 1] Reading workbook with openpyxl...")
@@ -191,8 +223,31 @@ def solve_all(
             error=batch_result.get("error"),
         )
 
+    # Post-export gate: scan the saved _SOLVED.xlsx for formula errors.
+    post_validation = batch_result.get("validation")
+    if post_validation is not None:
+        log.info("  %s", format_validation_report(post_validation, "Solved"))
+
     all_converged = all(pr.converged for pr in project_results)
+    post_failed = (
+        strict_validation
+        and post_validation is not None
+        and not post_validation.ok
+    )
     total_time = time.time() - start
+
+    if post_failed:
+        status_value = SolveStatus.ERROR.value
+        error_msg = (
+            f"Post-export validation failed: "
+            f"{post_validation.total_errors} formula error(s) in saved workbook"
+        )
+    elif all_converged:
+        status_value = SolveStatus.CONVERGED.value
+        error_msg = None
+    else:
+        status_value = SolveStatus.NOT_CONVERGED.value
+        error_msg = None
 
     record = RunRecord(
         workbook_name=workbook_path.name,
@@ -201,7 +256,8 @@ def solve_all(
         solver_mode="hybrid_shadow",
         projects=tuple(project_results),
         total_duration_sec=round(total_time, 2),
-        status=SolveStatus.CONVERGED.value if all_converged else SolveStatus.NOT_CONVERGED.value,
+        status=status_value,
+        error=error_msg,
     )
 
     # Persist

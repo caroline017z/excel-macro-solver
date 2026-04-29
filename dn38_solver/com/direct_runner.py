@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from dn38_solver.convert import safe_float, safe_str_or_float, safe_value
+from dn38_solver.shadow.validation import scan_workbook_errors
 from dn38_solver.types import CellAddress, SolveTask
 
 log = logging.getLogger(__name__)
@@ -311,6 +312,14 @@ def run_direct(
             wb.SaveAs(str(solved_path))
             saved_to = str(solved_path)
 
+        # Post-export formula-error gate: scan the just-saved file for
+        # cached Excel error tokens (#REF! / #DIV/0! / #VALUE! / etc.).
+        # Pure-Python via openpyxl — no LibreOffice dependency.
+        validation = None
+        if saved_to is not None:
+            with contextlib.suppress(Exception):
+                validation = scan_workbook_errors(saved_to)
+
         total = time.time() - start
 
         # Build tracker payload from pre-computed per-project summaries.
@@ -339,6 +348,7 @@ def run_direct(
             "solve_time_sec": round(solve_time, 2),
             "read_time_sec": round(read_time, 2),
             "solver_heartbeat": heartbeat,
+            "validation": validation,
         }
 
         status.update(
