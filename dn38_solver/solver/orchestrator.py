@@ -28,7 +28,13 @@ from dn38_solver.shadow.validation import (
 )
 from dn38_solver.com.direct_runner import run_direct
 from dn38_solver.solver.sequence import build_solve_task
-from dn38_solver.storage.database import get_connection, now_iso, save_run
+from dn38_solver.storage.database import (
+    clear_project_checkpoints,
+    get_connection,
+    now_iso,
+    save_project_checkpoint,
+    save_run,
+)
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +187,46 @@ def solve_all(
     # Phase 2: Build tasks for ALL projects
     tasks = [build_solve_task(p, str(workbook_path)) for p in projects]
 
+    # Open the DB up front so chunked checkpoints can be written as
+    # projects converge, not only at the end of the run. The same
+    # connection is reused for the final save_run write.
+    conn = get_connection()
+
+    # Build a project-by-name lookup so the checkpoint callback can
+    # recover the col / col_letter for the ProjectResult struct from
+    # whatever _NormTask is passed in.
+    project_lookup = {p.name: p for p in projects}
+
+    def _checkpoint(nt: object, meta: dict) -> None:
+        """Persist a partial ProjectResult after each per-project solve.
+
+        Wired through run_direct -> _run_chunked. Only called when the
+        chunked path is in use (use_chunked=True). Reads only the
+        scalars __SolverResults captured in-VBA; richer fields (target/
+        live IRR, FMV, NPP $) are left None and will be filled in by
+        the post-solve cell read at end of run.
+        """
+        proj = project_lookup.get(getattr(nt, "name", None))
+        if proj is None:
+            return
+        converged_flag = meta.get("converged_flag")
+        partial = ProjectResult(
+            name=proj.name,
+            col=proj.col,
+            col_letter=proj.col_letter,
+            npp_per_w=safe_float(meta.get("npp")),
+            dev_fee_per_w=safe_float(meta.get("dev_fee")),
+            dscr_multiple=safe_float(meta.get("dscr")),
+            equity_pct=safe_float(meta.get("equity_pct")),
+            converged=bool(converged_flag) if converged_flag is not None else False,
+        )
+        save_project_checkpoint(
+            conn,
+            batch_id=batch_id,
+            workbook_name=workbook_path.name,
+            project=partial,
+        )
+
     # Phase 3: Run VBA macro via direct COM (no subprocess)
     log.info("[Phase 2] Running VBA macro via direct COM (%d projects)...", len(projects))
     batch_result = run_direct(
@@ -189,6 +235,7 @@ def solve_all(
         original_f2=int(original_f2) if original_f2 else 1,
         timeout_sec=timeout_sec,
         use_chunked=use_chunked,
+        checkpoint_callback=_checkpoint if use_chunked else None,
     )
 
     # Phase 4: Parse results
@@ -236,6 +283,7 @@ def solve_all(
     # Handle batch-level errors
     if batch_result.get("status") == "error" and not project_results:
         log.error("COM worker error: %s", batch_result.get("error"))
+        conn.close()
         return RunRecord(
             workbook_name=workbook_path.name,
             run_timestamp=now_iso(),
@@ -284,9 +332,16 @@ def solve_all(
         error=error_msg,
     )
 
-    # Persist
-    conn = get_connection()
+    # Persist (uses the connection opened earlier so chunked checkpoints
+    # already written under the same batch_id stay alongside the final
+    # RunRecord).
     row_id = save_run(conn, record)
+    if use_chunked and record.status == SolveStatus.CONVERGED.value:
+        # Run finished cleanly — drop the per-project checkpoint rows
+        # so the audit trail only retains incidents worth keeping.
+        cleared = clear_project_checkpoints(conn, batch_id)
+        if cleared:
+            log.debug("  Cleared %d per-project checkpoint(s) on clean run", cleared)
     conn.close()
 
     # Summary

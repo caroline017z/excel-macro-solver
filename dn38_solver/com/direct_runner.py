@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from dn38_solver.config import BASE_COL
 from dn38_solver.convert import safe_float, safe_str_or_float, safe_value
@@ -133,6 +133,7 @@ def run_direct(
     original_f2: int = 1,
     timeout_sec: int = 600,
     use_chunked: bool = False,
+    checkpoint_callback: Callable[[object, dict], None] | None = None,
 ) -> dict:
     """Open Excel, run SolveHeadless, read results, close. All in-process.
 
@@ -143,6 +144,13 @@ def run_direct(
     Excel's ~900s RPC timeout — the win on cold portfolios that today
     crash before completion. Per-project progress is also surfaced live
     via the status JSON between calls.
+
+    `checkpoint_callback`, if provided and `use_chunked` is True, fires
+    after each successful per-project SolveOneProjectByColHL with
+    `(_NormTask, dict-of-__SolverResults-row)`. Use it to persist
+    partial results so a mid-portfolio crash leaves an audit trail.
+    Exceptions raised inside the callback are caught and logged so a
+    persistence failure cannot stall the solve.
     """
     import pythoncom
     import win32com.client
@@ -213,6 +221,7 @@ def run_direct(
         if use_chunked:
             macro_used, macro_error = _run_chunked(
                 excel, wb, norm_tasks, original_f2, status,
+                checkpoint_callback=checkpoint_callback,
             )
         else:
             macro_used, macro_error = _run_single_shot(excel, wb)
@@ -425,6 +434,8 @@ def _run_chunked(
     norm_tasks: list[_NormTask],
     original_f2: int,
     status: _StatusWriter,
+    *,
+    checkpoint_callback: Callable[[object, dict], None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Chunked macro path: Init + per-project SolveOneProjectByColHL + Finalize.
 
@@ -432,6 +443,11 @@ def _run_chunked(
     cold-start solve cannot push a single COM call past Excel's ~900s
     RPC timeout. Status is updated between projects so the dashboard
     can show live "N of M" progress.
+
+    When `checkpoint_callback` is supplied, the helper reads that
+    project's row from __SolverResults right after it lands and fires
+    the callback with the parsed dict. Callback exceptions are caught
+    and logged but do not stop the solve.
     """
     macro_used = "SolveHeadless"  # The chunked entry points live in this module
     try:
@@ -468,6 +484,18 @@ def _run_chunked(
             )
             break
 
+        if checkpoint_callback is not None:
+            try:
+                meta = _read_one_solver_result_row(wb, results_row)
+                checkpoint_callback(nt, meta)
+            except Exception as cb_exc:
+                # Persistence failure must never stall the solve. Log and
+                # carry on; the project's data is still in the workbook.
+                log.warning(
+                    "  Checkpoint callback failed for %s: %s",
+                    nt.name, cb_exc,
+                )
+
     # Finalize is best-effort — it restores F2 and re-enables non-core
     # sheets, so we always try to call it even after a per-project error.
     try:
@@ -480,6 +508,46 @@ def _run_chunked(
             chunked_error = f"FinalizeSolveEnvHL failed: {e}"
 
     return macro_used, chunked_error
+
+
+def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
+    """Read a single row from __SolverResults in one COM round-trip.
+
+    Mirrors the bulk read schema (cols A–R) but for a single project,
+    used by the chunked checkpoint hook so each callback fires with the
+    same shape the post-solve bulk read produces.
+    """
+    try:
+        ws = wb.Sheets(SOLVER_RESULTS_SHEET)
+        row_vals = ws.Range(f"A{results_row}:R{results_row}").Value
+    except Exception:
+        return {}
+    if row_vals is None:
+        return {}
+    # Single-row Range.Value comes back as ((v1, v2, ...),) — flatten.
+    if row_vals and isinstance(row_vals[0], tuple):
+        row_vals = row_vals[0]
+    if len(row_vals) < 14:
+        return {}
+    return {
+        "project_name": safe_str_or_float(row_vals[1]),
+        "dscr": safe_float(row_vals[2]),
+        "npp": safe_float(row_vals[3]),
+        "dev_fee": safe_float(row_vals[4]),
+        "equity_pct": safe_float(row_vals[5]),
+        "irr_gap": safe_float(row_vals[6]),
+        "appr_gap": safe_float(row_vals[7]),
+        "converged_flag": safe_str_or_float(row_vals[8]),
+        "calc_tier": safe_str_or_float(row_vals[9]),
+        "gs_retry_limit": safe_str_or_float(row_vals[10]),
+        "mode": safe_str_or_float(row_vals[11]),
+        "solve_seconds": safe_float(row_vals[12]),
+        "heartbeat": safe_str_or_float(row_vals[13]),
+        "calc_secs_dscr": safe_float(row_vals[14]) if len(row_vals) > 14 else None,
+        "calc_secs_npp": safe_float(row_vals[15]) if len(row_vals) > 15 else None,
+        "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
+        "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
+    }
 
 
 def _read_cell(wb: object, sheet: str, address: str) -> float | str | None:

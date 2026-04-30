@@ -18,7 +18,7 @@ from dn38_solver.types import ProjectResult, RunRecord
 
 log = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _CREATE_RUNS = """\
 CREATE TABLE IF NOT EXISTS solver_runs (
@@ -32,6 +32,25 @@ CREATE TABLE IF NOT EXISTS solver_runs (
     error            TEXT,
     projects_json    TEXT NOT NULL
 )
+"""
+
+_CREATE_CHECKPOINTS = """\
+CREATE TABLE IF NOT EXISTS solver_project_checkpoints (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      TEXT NOT NULL,
+    workbook_name TEXT NOT NULL,
+    project_name  TEXT NOT NULL,
+    project_col   INTEGER NOT NULL,
+    converged     INTEGER NOT NULL,
+    project_json  TEXT NOT NULL,
+    saved_at      TEXT NOT NULL,
+    UNIQUE(batch_id, project_name)
+)
+"""
+
+_CREATE_CHECKPOINTS_INDEX = """\
+CREATE INDEX IF NOT EXISTS ix_checkpoints_batch
+    ON solver_project_checkpoints(batch_id)
 """
 
 _CREATE_META = """\
@@ -48,9 +67,11 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(_CREATE_RUNS)
+    conn.execute(_CREATE_CHECKPOINTS)
+    conn.execute(_CREATE_CHECKPOINTS_INDEX)
     conn.execute(_CREATE_META)
     conn.execute(
-        "INSERT OR IGNORE INTO _meta (key, value) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
         ("schema_version", str(_SCHEMA_VERSION)),
     )
     conn.commit()
@@ -145,6 +166,85 @@ def get_latest_run(
             "SELECT * FROM solver_runs ORDER BY run_timestamp DESC LIMIT 1",
         ).fetchone()
     return _row_to_record(row) if row else None
+
+
+def save_project_checkpoint(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    workbook_name: str,
+    project: ProjectResult,
+) -> None:
+    """Persist a single project's result mid-run.
+
+    Intended for the chunked solve path: as each project converges via
+    SolveOneProjectByColHL, the orchestrator persists what it knows so a
+    later Excel crash leaves an audit trail. UPSERT on (batch_id,
+    project_name) so re-running the same project (e.g. on retry) over-
+    writes rather than duplicating.
+    """
+    project_json = msgspec.json.encode(project).decode("utf-8")
+    conn.execute(
+        """\
+        INSERT INTO solver_project_checkpoints
+            (batch_id, workbook_name, project_name, project_col,
+             converged, project_json, saved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(batch_id, project_name) DO UPDATE SET
+            workbook_name = excluded.workbook_name,
+            project_col   = excluded.project_col,
+            converged     = excluded.converged,
+            project_json  = excluded.project_json,
+            saved_at      = excluded.saved_at
+        """,
+        (
+            batch_id,
+            workbook_name,
+            project.name,
+            project.col,
+            1 if project.converged else 0,
+            project_json,
+            now_iso(),
+        ),
+    )
+    conn.commit()
+
+
+def get_checkpointed_projects(
+    conn: sqlite3.Connection,
+    batch_id: str,
+) -> tuple[ProjectResult, ...]:
+    """Fetch every project checkpoint recorded under `batch_id`.
+
+    Use to inspect what landed before a crash. Returned in the order
+    they were originally saved (saved_at ASC).
+    """
+    rows = conn.execute(
+        """\
+        SELECT project_json
+        FROM solver_project_checkpoints
+        WHERE batch_id = ?
+        ORDER BY saved_at ASC
+        """,
+        (batch_id,),
+    ).fetchall()
+    return tuple(
+        msgspec.json.decode(row["project_json"].encode("utf-8"), type=ProjectResult)
+        for row in rows
+    )
+
+
+def clear_project_checkpoints(
+    conn: sqlite3.Connection,
+    batch_id: str,
+) -> int:
+    """Drop checkpoints for a batch. Returns the number of rows removed."""
+    cursor = conn.execute(
+        "DELETE FROM solver_project_checkpoints WHERE batch_id = ?",
+        (batch_id,),
+    )
+    conn.commit()
+    return cursor.rowcount or 0
 
 
 def now_iso() -> str:

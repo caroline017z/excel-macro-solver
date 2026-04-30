@@ -15,7 +15,11 @@ from pathlib import Path
 
 from dn38_solver.config import DEFAULT_WORKBOOK, OUTPUT_ROWS
 from dn38_solver.solver.orchestrator import solve_all
-from dn38_solver.storage.database import get_connection, get_runs
+from dn38_solver.storage.database import (
+    get_checkpointed_projects,
+    get_connection,
+    get_runs,
+)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -25,6 +29,38 @@ def _setup_logging(verbose: bool) -> None:
         format="%(message)s",
         stream=sys.stdout,
     )
+
+
+def _show_checkpoints(batch_id: str) -> None:
+    """Print every per-project checkpoint stored under `batch_id`.
+
+    Use after a chunked solve has crashed mid-portfolio to see which
+    projects landed before the failure. Successful runs clear their
+    checkpoints automatically, so a non-empty result implies an
+    incomplete run worth investigating.
+    """
+    conn = get_connection()
+    try:
+        projects = get_checkpointed_projects(conn, batch_id)
+    finally:
+        conn.close()
+
+    if not projects:
+        print(f"No checkpoints for batch_id={batch_id}.")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"  Checkpoints for batch_id={batch_id}  ({len(projects)} project(s))")
+    print(f"{'='*80}")
+    print(f"  {'Project':<32} {'Col':>4} {'NPP':>10} {'DevFee':>10} {'DSCR':>9} {'Eq%':>7} {'Conv':>6}")
+    print(f"  {'-'*32} {'-'*4} {'-'*10} {'-'*10} {'-'*9} {'-'*7} {'-'*6}")
+    for p in projects:
+        npp = f"${p.npp_per_w:.3f}" if p.npp_per_w is not None else "—"
+        dev = f"${p.dev_fee_per_w:.3f}" if p.dev_fee_per_w is not None else "—"
+        dscr = f"{p.dscr_multiple:.3f}x" if p.dscr_multiple is not None else "—"
+        eq = f"{p.equity_pct*100:.2f}%" if p.equity_pct is not None else "—"
+        conv = "OK" if p.converged else "CHECK"
+        print(f"  {p.name[:32]:<32} {p.col:>4} {npp:>10} {dev:>10} {dscr:>9} {eq:>7} {conv:>6}")
 
 
 def _show_history(limit: int = 20) -> None:
@@ -77,6 +113,17 @@ def main() -> None:
         help="Show recent solver run history",
     )
     parser.add_argument(
+        "--show-checkpoints",
+        metavar="BATCH_ID",
+        default=None,
+        help=(
+            "Print per-project checkpoints stored under BATCH_ID. "
+            "Used to inspect what landed before a chunked-solve crash. "
+            "Successful runs clear their own checkpoints, so a "
+            "non-empty result indicates an incomplete prior run."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=600,
@@ -119,6 +166,10 @@ def main() -> None:
 
     if args.history:
         _show_history()
+        return
+
+    if args.show_checkpoints:
+        _show_checkpoints(args.show_checkpoints)
         return
 
     workbook_path = Path(args.workbook) if args.workbook else DEFAULT_WORKBOOK
