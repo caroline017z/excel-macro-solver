@@ -69,6 +69,28 @@ Private Const PI_BASE_COL       As Integer = 7
 ' --- Recalc ladder state ---
 Private mCalcTier As Integer
 
+' --- Phase-specific recalc scopes ---
+' Each major step of the solve loop touches only a subset of the model.
+' Tier 1 dispatches to a phase-specific scope; tiers 2/3 fall back to wider
+' coverage so the deterministic recalc ladder still terminates correctly.
+'
+' Set USE_TIGHT_*_SCOPE = False to revert that phase to the full 13-sheet
+' recalc and rule it out as a cause if convergence regresses.
+Private Const PHASE_FULL As Integer = 0
+Private Const PHASE_DSCR As Integer = 1
+Private Const PHASE_NPP  As Integer = 2
+Private Const PHASE_APPR As Integer = 3
+
+Private Const USE_TIGHT_DSCR_SCOPE As Boolean = True
+Private Const USE_TIGHT_NPP_SCOPE  As Boolean = False
+Private Const USE_TIGHT_APPR_SCOPE As Boolean = True
+
+' --- Per-project phase timing telemetry (seconds, accumulated per project) ---
+Private mCalcSecsDSCR As Double
+Private mCalcSecsNPP  As Double
+Private mCalcSecsAppr As Double
+Private mCalcSecsFull As Double
+
 
 Private Function EnsureSolverResultsSheetHL() As Worksheet
     Dim ws As Worksheet
@@ -104,6 +126,10 @@ Private Sub ResetSolverResultsHL(ByVal wsRes As Worksheet)
     wsRes.Range("L1").Value = "Mode"
     wsRes.Range("M1").Value = "Solve Seconds"
     wsRes.Range("N1").Value = "Heartbeat UTC"
+    wsRes.Range("O1").Value = "Calc Secs DSCR"
+    wsRes.Range("P1").Value = "Calc Secs NPP"
+    wsRes.Range("Q1").Value = "Calc Secs Appr"
+    wsRes.Range("R1").Value = "Calc Secs Full"
 End Sub
 
 Private Sub WriteHeartbeatHL(ByVal wsRes As Worksheet, ByVal heartbeatText As String)
@@ -115,29 +141,75 @@ End Sub
 '  INTERNAL HELPERS
 ' ==============================================================================
 Private Sub CalcModelCoreHL()
-    ' Deterministic recalc ladder:
-    '   Tier 1 = per-sheet calc in dependency order (fastest correct path)
+    ' Backwards-compatible alias for the original full-scope recalc.
+    ' Use CalcForPhase(PHASE_*) for phase-aware call sites; this entry
+    ' point preserves identical behaviour for setup / restore / fallback.
+    CalcForPhase PHASE_FULL
+End Sub
+
+Private Sub CalcForPhase(ByVal phase As Integer)
+    ' Deterministic recalc ladder, dispatched by solve-loop phase:
+    '   Tier 1 = phase-specific subset of sheets (fastest correct path)
     '   Tier 2 = tier 1 twice, for deeper propagation
     '   Tier 3 = CalculateFull guardrail for cold-start edge cases
     '
     ' Per-sheet Sheets("X").Calculate is required because Application.Calculate
     ' under xlCalculationManual + multi-threaded calc does not reliably mark
-    ' cross-sheet OFFSET-via-F2 dependencies dirty. In particular, the Appraisal
-    ' sheet's formulas don't recalc after rDevFee is written, so rApprLive
-    ' returns a stale value and the Dev Fee GoalSeek sees zero local slope.
+    ' cross-sheet OFFSET-via-F2 dependencies dirty.
+    '
+    ' Phase scopes are chosen conservatively. DSCR change ripples through the
+    ' capital stack (Tax Equity, Perm Debt, CL) into PT Returns; NPP change
+    ' affects almost everything (full scope by default); Appraisal change is
+    ' local to the Appraisal sheet's Dev-Fee-driven valuation.
+    Dim t0 As Double
+    t0 = Timer
+
     Select Case mCalcTier
         Case 1
-            CalcCoreSheetsHL
+            CalcPhaseScope phase
         Case 2
-            CalcCoreSheetsHL
-            CalcCoreSheetsHL
+            CalcPhaseScope phase
+            CalcPhaseScope phase
         Case Else
             Application.CalculateFull
     End Select
+
+    ' Phase telemetry — accumulate per-project so we can size the speedup
+    ' from real portfolio runs and shrink scopes further if data supports it.
+    Dim dElapsed As Double
+    dElapsed = Timer - t0
+    Select Case phase
+        Case PHASE_DSCR
+            mCalcSecsDSCR = mCalcSecsDSCR + dElapsed
+        Case PHASE_NPP
+            mCalcSecsNPP = mCalcSecsNPP + dElapsed
+        Case PHASE_APPR
+            mCalcSecsAppr = mCalcSecsAppr + dElapsed
+        Case Else
+            mCalcSecsFull = mCalcSecsFull + dElapsed
+    End Select
+
     DoEvents  ' Yield to COM message pump during long solve loops
 End Sub
 
-Private Sub CalcCoreSheetsHL()
+Private Sub CalcPhaseScope(ByVal phase As Integer)
+    ' Run the per-sheet recalc set appropriate for `phase`. The full-scope
+    ' fallback (CalcSheetsAll) is taken whenever phase is unknown or the
+    ' tight-scope toggle for that phase is disabled inside the helper.
+    Select Case phase
+        Case PHASE_DSCR
+            CalcSheetsForDSCR
+        Case PHASE_NPP
+            CalcSheetsForNPP
+        Case PHASE_APPR
+            CalcSheetsForAppraisal
+        Case Else
+            CalcSheetsAll
+    End Select
+End Sub
+
+Private Sub CalcSheetsAll()
+    ' Full 13-sheet recalc — original CalcCoreSheetsHL, unchanged.
     Sheets("Project Inputs").Calculate
     Sheets("Rate Curves").Calculate
     Sheets("Ops Sandbox").Calculate
@@ -151,6 +223,63 @@ Private Sub CalcCoreSheetsHL()
     Sheets("Appraisal").Calculate
     Sheets("NPP Calc").Calculate
     Sheets("PT Returns").Calculate
+End Sub
+
+Private Sub CalcSheetsForDSCR()
+    ' DSCR GoalSeek changes PT Returns!F129. Rate Curves / Ops Sandbox /
+    ' Global / Capex / Safe Harbor are upstream of cap-structure inputs and
+    ' do not depend on DSCR. Project Inputs reads from PT Returns but doesn't
+    ' feed back into the DSCR-dependent chain within a single GoalSeek step.
+    If Not USE_TIGHT_DSCR_SCOPE Then
+        CalcSheetsAll
+        Exit Sub
+    End If
+    Sheets("Operations").Calculate
+    Sheets("CL").Calculate
+    Sheets("Perm Debt").Calculate
+    Sheets("Tax Equity").Calculate
+    Sheets("PT Returns").Calculate
+End Sub
+
+Private Sub CalcSheetsForNPP()
+    ' NPP cell change on Project Inputs ripples through nearly the whole
+    ' downstream chain (appraised value, capital stack, returns). Default
+    ' to full scope; flipping USE_TIGHT_NPP_SCOPE = True drops only the
+    ' upstream-only sheets (Rate Curves, Ops Sandbox, Global, Capex, Safe
+    ' Harbor) once that's been validated against a known portfolio.
+    If Not USE_TIGHT_NPP_SCOPE Then
+        CalcSheetsAll
+        Exit Sub
+    End If
+    Sheets("Project Inputs").Calculate
+    Sheets("Operations").Calculate
+    Sheets("CL").Calculate
+    Sheets("Perm Debt").Calculate
+    Sheets("Tax Equity").Calculate
+    Sheets("Appraisal").Calculate
+    Sheets("NPP Calc").Calculate
+    Sheets("PT Returns").Calculate
+End Sub
+
+Private Sub CalcSheetsForAppraisal()
+    ' Dev Fee change on Project Inputs feeds the Appraisal sheet's valuation,
+    ' which feeds back to Project Inputs!F31 (rApprLive). The Appraisal IRR
+    ' is a pre-tax valuation construct and does not require PT Returns to
+    ' reconverge between GoalSeek attempts within a single inner loop.
+    If Not USE_TIGHT_APPR_SCOPE Then
+        CalcSheetsAll
+        Exit Sub
+    End If
+    Sheets("Project Inputs").Calculate
+    Sheets("Appraisal").Calculate
+    Sheets("NPP Calc").Calculate
+End Sub
+
+Private Sub ResetPhaseTelemetryHL()
+    mCalcSecsDSCR = 0
+    mCalcSecsNPP = 0
+    mCalcSecsAppr = 0
+    mCalcSecsFull = 0
 End Sub
 
 Private Sub ResetCalcTierHL()
@@ -304,7 +433,8 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' Route OFFSET formulas to this project
     wsPI.Range(PI_PROJ_INDEX).Value = projOffset
     ResetCalcTierHL
-    CalcModelCoreHL
+    ResetPhaseTelemetryHL
+    CalcForPhase PHASE_FULL
 
     Dim rHoldCo     As Range
     Dim rEquity     As Range
@@ -358,22 +488,22 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     For iIter = 1 To MAX_ITER
         If Timer - dSolveStart > PROJECT_TIMEOUT_SECONDS Then Exit For
         rHoldCo.Value = 0
-        CalcModelCoreHL
+        CalcForPhase PHASE_FULL
 
         bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
         If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
         If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
-        CalcModelCoreHL
+        CalcForPhase PHASE_DSCR
 
         rHoldCo.Value = 1
-        CalcModelCoreHL
+        CalcForPhase PHASE_FULL
 
         For iInner = 1 To iGSRetry
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
-            CalcModelCoreHL
+            CalcForPhase PHASE_NPP
 
             bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
-            CalcModelCoreHL
+            CalcForPhase PHASE_APPR
 
             dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
             dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
@@ -417,6 +547,10 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     wsRes.Cells(resultsRow, 12).Value = IIf(bColdMode, "cold", "warm")
     wsRes.Cells(resultsRow, 13).Value = Round(Timer - dSolveStart, 4)
     wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+    wsRes.Cells(resultsRow, 15).Value = Round(mCalcSecsDSCR, 4)
+    wsRes.Cells(resultsRow, 16).Value = Round(mCalcSecsNPP, 4)
+    wsRes.Cells(resultsRow, 17).Value = Round(mCalcSecsAppr, 4)
+    wsRes.Cells(resultsRow, 18).Value = Round(mCalcSecsFull, 4)
     WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & projName
 
     SolveOneProjectByColHL = IIf(bConverged, 1, 0)
@@ -511,7 +645,8 @@ Public Sub SolveHeadless()
 
         ' Route OFFSET formulas to this project
         wsPI.Range(PI_PROJ_INDEX).Value = projOffset
-        CalcModelCoreHL
+        ResetPhaseTelemetryHL
+        CalcForPhase PHASE_FULL
 
         ' Set up ranges for this project
         Set rHoldCo = wsPT.Range(PT_HOLDCO_ONOFF)
@@ -545,17 +680,17 @@ Public Sub SolveHeadless()
 
             ' Step 1: HoldCo OFF + recalc
             rHoldCo.Value = 0
-            CalcModelCoreHL
+            CalcForPhase PHASE_FULL
 
             ' Step 2: GoalSeek Min Equity = 10% (changes DSCR Multiple)
             bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
             If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
             If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
-            CalcModelCoreHL
+            CalcForPhase PHASE_DSCR
 
             ' Step 3: HoldCo ON + recalc
             rHoldCo.Value = 1
-            CalcModelCoreHL
+            CalcForPhase PHASE_FULL
 
             ' Steps 4-5: Sequential NPP / Appraisal solve
             ' Sequential (not batched) ensures each GoalSeek sees fresh recalc
@@ -563,11 +698,11 @@ Public Sub SolveHeadless()
             For iInner = 1 To iGSRetry
                 bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
                 If rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then rNPP.Value = NPP_SEED
-                CalcModelCoreHL
+                CalcForPhase PHASE_NPP
 
                 bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
                 If rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then rDevFee.Value = DEV_FEE_SEED
-                CalcModelCoreHL
+                CalcForPhase PHASE_APPR
 
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
                 dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
@@ -615,6 +750,10 @@ Public Sub SolveHeadless()
         wsRes.Cells(i + 1, 12).Value = IIf(bColdMode, "cold", "warm")
         wsRes.Cells(i + 1, 13).Value = Round(Timer - dSolveStart, 4)
         wsRes.Cells(i + 1, 14).Value = CStr(Now)
+        wsRes.Cells(i + 1, 15).Value = Round(mCalcSecsDSCR, 4)
+        wsRes.Cells(i + 1, 16).Value = Round(mCalcSecsNPP, 4)
+        wsRes.Cells(i + 1, 17).Value = Round(mCalcSecsAppr, 4)
+        wsRes.Cells(i + 1, 18).Value = Round(mCalcSecsFull, 4)
         WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & arrNames(i)
 
     Next i

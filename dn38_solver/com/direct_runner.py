@@ -411,10 +411,16 @@ def _read_solver_results_map(
 ) -> tuple[dict[int, dict[str, float | str | None]], str | None]:
     """Read per-project solve telemetry captured by SolveHeadless VBA.
 
-    One bulk Range.Value read covering A2:N{2 + _RESULTS_BULK_ROWS - 1} replaces
-    the prior per-cell while loop (~14 COM round-trips per project, ~840 for a
+    One bulk Range.Value read covering A2:R{2 + _RESULTS_BULK_ROWS - 1} replaces
+    the prior per-cell while loop (~18 COM round-trips per project, ~1080 for a
     60-project portfolio). The block is sparse-tolerant: rows whose A column is
     blank are treated as end-of-data.
+
+    Columns A–N are the original schema (offset, name, DSCR, NPP, Dev Fee,
+    equity_pct, gaps, converged, calc tier, retry limit, mode, solve_seconds,
+    heartbeat). Columns O–R carry per-phase calc-time telemetry written by
+    CalcForPhase: cumulative seconds spent recalculating in the DSCR / NPP /
+    Appraisal / Full scopes for that project.
     """
     out: dict[int, dict[str, float | str | None]] = {}
     try:
@@ -428,7 +434,7 @@ def _read_solver_results_map(
 
     last_row = 1 + _RESULTS_BULK_ROWS
     try:
-        block = ws.Range(f"A2:N{last_row}").Value
+        block = ws.Range(f"A2:R{last_row}").Value
     except Exception:
         return out, heartbeat
     if block is None:
@@ -447,6 +453,9 @@ def _read_solver_results_map(
             offset = int(offset_raw)
         except (ValueError, TypeError):
             continue
+        # Older workbook builds without the phase-telemetry columns return
+        # short rows (or None in O–R); use safe_float so a missing value
+        # surfaces as None rather than raising.
         out[offset] = {
             "project_name": safe_str_or_float(row_vals[1]),
             "dscr": safe_float(row_vals[2]),
@@ -461,5 +470,9 @@ def _read_solver_results_map(
             "mode": safe_str_or_float(row_vals[11]),
             "solve_seconds": safe_float(row_vals[12]),
             "heartbeat": safe_str_or_float(row_vals[13]),
+            "calc_secs_dscr": safe_float(row_vals[14]) if len(row_vals) > 14 else None,
+            "calc_secs_npp": safe_float(row_vals[15]) if len(row_vals) > 15 else None,
+            "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
+            "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
         }
     return out, heartbeat

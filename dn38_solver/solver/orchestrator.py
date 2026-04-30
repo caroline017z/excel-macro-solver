@@ -209,6 +209,21 @@ def solve_all(
                  pr.npp_per_w or 0, pr.dev_fee_per_w or 0,
                  pr.fmv_per_w or 0, pr.dscr_multiple or 0)
 
+        meta = raw.get("meta") or {}
+        phase_secs = (
+            meta.get("calc_secs_dscr"),
+            meta.get("calc_secs_npp"),
+            meta.get("calc_secs_appr"),
+            meta.get("calc_secs_full"),
+        )
+        if any(v is not None for v in phase_secs):
+            dscr_s, npp_s, appr_s, full_s = (v or 0.0 for v in phase_secs)
+            log.info(
+                "    calc_secs: DSCR=%.1f  NPP=%.1f  Appr=%.1f  Full=%.1f  (total=%.1f)",
+                dscr_s, npp_s, appr_s, full_s,
+                dscr_s + npp_s + appr_s + full_s,
+            )
+
     # Handle batch-level errors
     if batch_result.get("status") == "error" and not project_results:
         log.error("COM worker error: %s", batch_result.get("error"))

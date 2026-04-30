@@ -21,6 +21,9 @@ vba_source/
 .DS_Store
 Thumbs.db
 
+# Benchmark scratch (cold-perf experiments, never committed)
+benchmark/
+
 # IDE
 .vscode/
 .idea/
