@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+from dn38_solver.config import BASE_COL
 from dn38_solver.convert import safe_float, safe_str_or_float, safe_value
 from dn38_solver.shadow.validation import scan_workbook_errors
 from dn38_solver.types import CellAddress, SolveTask
@@ -131,8 +132,18 @@ def run_direct(
     *,
     original_f2: int = 1,
     timeout_sec: int = 600,
+    use_chunked: bool = False,
 ) -> dict:
-    """Open Excel, run SolveHeadless, read results, close. All in-process."""
+    """Open Excel, run SolveHeadless, read results, close. All in-process.
+
+    When `use_chunked` is True, the macro runs through the
+    InitSolveEnvHL / SolveOneProjectByColHL / FinalizeSolveEnvHL entry
+    points instead of the single-shot SolveHeadless. Each project becomes
+    its own COM Application.Run call so no single invocation can exceed
+    Excel's ~900s RPC timeout — the win on cold portfolios that today
+    crash before completion. Per-project progress is also surfaced live
+    via the status JSON between calls.
+    """
     import pythoncom
     import win32com.client
 
@@ -184,34 +195,27 @@ def run_direct(
         warmup_time = 0.0
 
         # --- Run the VBA macro ---
-        macro_names = [
-            "SolveHeadless",
-            "SolveMinEquityWithHoldCo",
-        ]
+        macro_used: str | None = None
+        macro_error: str | None = None
 
-        macro_used = None
-        macro_error = None
-
-        log.info("  Running macro...")
+        log.info(
+            "  Running macro (%s)...",
+            "chunked: per-project" if use_chunked else "single-shot SolveHeadless",
+        )
         status.update(
             "solving",
             per_project_status="solving",
             macro_used="SolveHeadless",
+            chunked=use_chunked,
         )
 
         t0 = time.time()
-        for macro_name in macro_names:
-            try:
-                excel.Application.Run(f"'{wb.Name}'!{macro_name}")
-                macro_used = macro_name
-                break
-            except Exception as e:
-                err_str = str(e).lower()
-                if "macro may not be available" in err_str or "cannot run" in err_str:
-                    continue
-                macro_error = str(e)
-                macro_used = macro_name
-                break
+        if use_chunked:
+            macro_used, macro_error = _run_chunked(
+                excel, wb, norm_tasks, original_f2, status,
+            )
+        else:
+            macro_used, macro_error = _run_single_shot(excel, wb)
 
         solve_time = time.time() - t0
         log.info("  Macro '%s' completed in %.1fs", macro_used, solve_time)
@@ -223,7 +227,7 @@ def run_direct(
             return result
 
         if macro_used is None:
-            result["error"] = f"No macro found. Tried: {macro_names}"
+            result["error"] = "No solver macro found in workbook"
             return result
         if macro_error:
             result["error"] = f"Macro {macro_used} failed: {macro_error}"
@@ -392,6 +396,90 @@ def run_direct(
             pythoncom.CoUninitialize()
 
     return result
+
+
+def _run_single_shot(
+    excel: object,
+    wb: object,
+) -> tuple[str | None, str | None]:
+    """Legacy single-invocation macro path. Tries SolveHeadless first;
+    falls back to the original SolveMinEquityWithHoldCo if the headless
+    wrapper isn't present in the workbook (older models).
+    """
+    macro_names = ("SolveHeadless", "SolveMinEquityWithHoldCo")
+    for macro_name in macro_names:
+        try:
+            excel.Application.Run(f"'{wb.Name}'!{macro_name}")
+            return macro_name, None
+        except Exception as e:
+            err_str = str(e).lower()
+            if "macro may not be available" in err_str or "cannot run" in err_str:
+                continue
+            return macro_name, str(e)
+    return None, None
+
+
+def _run_chunked(
+    excel: object,
+    wb: object,
+    norm_tasks: list[_NormTask],
+    original_f2: int,
+    status: _StatusWriter,
+) -> tuple[str | None, str | None]:
+    """Chunked macro path: Init + per-project SolveOneProjectByColHL + Finalize.
+
+    Each project becomes its own COM Application.Run call so a long
+    cold-start solve cannot push a single COM call past Excel's ~900s
+    RPC timeout. Status is updated between projects so the dashboard
+    can show live "N of M" progress.
+    """
+    macro_used = "SolveHeadless"  # The chunked entry points live in this module
+    try:
+        excel.Application.Run(f"'{wb.Name}'!InitSolveEnvHL")
+    except Exception as e:
+        return macro_used, f"InitSolveEnvHL failed: {e}"
+
+    n = len(norm_tasks)
+    chunked_error: str | None = None
+    for idx, nt in enumerate(norm_tasks):
+        col_idx = nt.offset + BASE_COL
+        results_row = idx + 2  # row 1 holds headers
+        log.info("  [%d/%d] Solving %s (col %d)...", idx + 1, n, nt.name, col_idx)
+        status.update(
+            "solving",
+            per_project_status="solving",
+            current_index=idx + 1,
+            current_total=n,
+            current_project=nt.name,
+            macro_used=macro_used,
+            chunked=True,
+        )
+        try:
+            excel.Application.Run(
+                f"'{wb.Name}'!SolveOneProjectByColHL",
+                int(col_idx),
+                str(nt.name),
+                int(results_row),
+            )
+        except Exception as e:
+            chunked_error = (
+                f"SolveOneProjectByColHL failed at "
+                f"{nt.name} (col {col_idx}, row {results_row}): {e}"
+            )
+            break
+
+    # Finalize is best-effort — it restores F2 and re-enables non-core
+    # sheets, so we always try to call it even after a per-project error.
+    try:
+        excel.Application.Run(
+            f"'{wb.Name}'!FinalizeSolveEnvHL",
+            int(original_f2),
+        )
+    except Exception as e:
+        if chunked_error is None:
+            chunked_error = f"FinalizeSolveEnvHL failed: {e}"
+
+    return macro_used, chunked_error
 
 
 def _read_cell(wb: object, sheet: str, address: str) -> float | str | None:

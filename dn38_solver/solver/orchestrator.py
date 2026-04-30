@@ -80,6 +80,7 @@ def solve_all(
     dry_run: bool = False,
     timeout_sec: int = 600,
     strict_validation: bool = False,
+    use_chunked: bool = False,
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
@@ -93,6 +94,13 @@ def solve_all(
         strict_validation: when True, pre-flight or post-export formula
             errors abort the run with status=ERROR. When False (default),
             errors are logged as warnings but the solve proceeds.
+        use_chunked: when True, run the macro through the per-project
+            chunked entry points (InitSolveEnvHL / SolveOneProjectByColHL /
+            FinalizeSolveEnvHL) instead of single-shot SolveHeadless. Each
+            project is its own COM Application.Run call so no single
+            invocation can exceed the ~900s COM RPC timeout — the win on
+            cold portfolios that today crash before completion. Adds live
+            per-project progress to the status JSON.
     """
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:8]
@@ -180,6 +188,7 @@ def solve_all(
         tasks=tasks,
         original_f2=int(original_f2) if original_f2 else 1,
         timeout_sec=timeout_sec,
+        use_chunked=use_chunked,
     )
 
     # Phase 4: Parse results

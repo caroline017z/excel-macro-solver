@@ -97,6 +97,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--chunked",
+        action="store_true",
+        help=(
+            "Run the macro through per-project entry points (Init / "
+            "SolveOneProjectByColHL / Finalize) instead of single-shot "
+            "SolveHeadless. Each project is its own COM call so total "
+            "macro time can exceed Excel's ~900s RPC timeout. "
+            "Recommended for portfolios with 10+ projects or any cold "
+            "portfolio."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -121,6 +133,7 @@ def main() -> None:
         dry_run=args.dry_run,
         timeout_sec=args.timeout,
         strict_validation=args.strict_validation,
+        use_chunked=args.chunked,
     )
 
     # Exit code: 0 if converged, 1 if not
