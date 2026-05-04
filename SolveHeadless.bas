@@ -18,7 +18,14 @@ Attribute VB_Name = "modSolveHeadless"
 Option Explicit
 
 ' --- Configuration ---
-Private Const MAX_ITER          As Integer = 8
+' Outer-loop budget: most projects converge in 1-3 iters or never. Iterating
+' past MAX_ITER_SOFT with no equity progress is wasted recalcs, so we exit
+' early once equity has settled. MAX_ITER_HARD is the cap for projects that
+' are still moving meaningfully and just need a few more passes.
+Private Const MAX_ITER_SOFT     As Integer = 4
+Private Const MAX_ITER_HARD     As Integer = 8
+Private Const SOFT_CAP_PROGRESS_TOL As Double = 0.001   ' 0.1pp equity move
+Private Const MAX_ITER          As Integer = 8          ' = MAX_ITER_HARD; loop bound
 Private Const MAX_GS_RETRY_WARM As Integer = 3
 Private Const MAX_GS_RETRY_COLD As Integer = 6
 Private Const GS_MAXITER_WARM   As Integer = 200
@@ -379,7 +386,11 @@ Private Sub SetGoalSeekPrecisionHL()
 End Sub
 
 Private Sub SetGoalSeekModeHL(ByVal bColdMode As Boolean)
-    Application.MaxIterations = GS_MAXITER_COLD
+    If bColdMode Then
+        Application.MaxIterations = GS_MAXITER_COLD
+    Else
+        Application.MaxIterations = GS_MAXITER_WARM
+    End If
 End Sub
 
 Private Sub RestoreGoalSeekDefaultsHL()
@@ -594,6 +605,17 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then
             iActualIters = iIter
             Exit For
+        End If
+
+        ' Soft-cap exit: once we've burned MAX_ITER_SOFT iterations and the
+        ' last equity move was below 0.1pp, the project has settled --
+        ' further passes won't tighten it. The hard cap (MAX_ITER) still
+        ' applies to projects that are still making real progress.
+        If iIter >= MAX_ITER_SOFT Then
+            If Abs(dEquityPct - dPrevEqPct) < SOFT_CAP_PROGRESS_TOL Then
+                iActualIters = iIter
+                Exit For
+            End If
         End If
         dPrevEqPct = dEquityPct
 
@@ -844,6 +866,17 @@ Public Sub SolveHeadless()
             If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then
                 iActualIters = iIter
                 Exit For
+            End If
+
+            ' Soft-cap exit: once we've burned MAX_ITER_SOFT iterations and
+            ' the last equity move was below 0.1pp, the project has settled
+            ' -- further passes won't tighten it. The hard cap (MAX_ITER)
+            ' still applies to projects still making real progress.
+            If iIter >= MAX_ITER_SOFT Then
+                If Abs(dEquityPct - dPrevEqPct) < SOFT_CAP_PROGRESS_TOL Then
+                    iActualIters = iIter
+                    Exit For
+                End If
             End If
             dPrevEqPct = dEquityPct
 

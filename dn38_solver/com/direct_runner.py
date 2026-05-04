@@ -139,6 +139,7 @@ def run_direct(
     timeout_sec: int = 600,
     use_chunked: bool = False,
     checkpoint_callback: Callable[[object, dict], None] | None = None,
+    save_solved: bool = True,
 ) -> dict:
     """Open Excel, run SolveHeadless, read results, close. All in-process.
 
@@ -156,6 +157,10 @@ def run_direct(
     partial results so a mid-portfolio crash leaves an audit trail.
     Exceptions raised inside the callback are caught and logged so a
     persistence failure cannot stall the solve.
+
+    When `save_solved` is False, the `<workbook>_SOLVED.xlsm` SaveAs at
+    end of run is skipped. Useful for fast iteration on Box-mounted
+    workbooks where the save is a nontrivial fixed cost.
     """
     import pythoncom
     import win32com.client
@@ -228,12 +233,12 @@ def run_direct(
 
         t0 = time.time()
         if use_chunked:
-            macro_used, macro_error = _run_chunked(
+            macro_used, has_switch, macro_error = _run_chunked(
                 excel, wb, norm_tasks, original_f2, status,
                 checkpoint_callback=checkpoint_callback,
             )
         else:
-            macro_used, macro_error = _run_single_shot(excel, wb)
+            macro_used, has_switch, macro_error = _run_single_shot(excel, wb)
 
         solve_time = time.time() - t0
         log.info("  Macro '%s' completed in %.1fs", macro_used, solve_time)
@@ -260,9 +265,9 @@ def run_direct(
 
         # --- Read results per project ---
         # SolveHeadless leaves calc in MANUAL mode.
-        # Use SwitchProjectAndRecalc for targeted 13-sheet recalc.
-        has_switch = macro_used == "SolveHeadless"
-
+        # has_switch indicates whether SwitchProjectAndRecalc lives
+        # alongside the macro that ran; the runner helpers report it
+        # rather than inferring from a name string.
         log.info("  Reading results for %d project(s)...", len(tasks))
         status.update(
             "reading",
@@ -355,14 +360,17 @@ def run_direct(
                     int(original_f2),
                 )
 
-        # Save solved workbook
+        # Save solved workbook (opt-out via save_solved=False for fast
+        # iteration runs; the post-export validation gate only runs when
+        # there's actually a saved file to scan).
         saved_to = None
-        wb_path = Path(workbook_path)
-        solved_name = wb_path.stem + "_SOLVED" + wb_path.suffix
-        solved_path = wb_path.parent / solved_name
-        with contextlib.suppress(Exception):
-            wb.SaveAs(str(solved_path))
-            saved_to = str(solved_path)
+        if save_solved:
+            wb_path = Path(workbook_path)
+            solved_name = wb_path.stem + "_SOLVED" + wb_path.suffix
+            solved_path = wb_path.parent / solved_name
+            with contextlib.suppress(Exception):
+                wb.SaveAs(str(solved_path))
+                saved_to = str(solved_path)
 
         # Post-export formula-error gate: scan the just-saved file for
         # cached Excel error tokens (#REF! / #DIV/0! / #VALUE! / etc.).
@@ -439,13 +447,17 @@ def run_direct(
         }
 
     finally:
-        if excel is not None:
-            with contextlib.suppress(Exception):
-                excel.Calculation = -4105  # xlCalculationAutomatic
+        # Close the workbook before flipping calc back to automatic. If the
+        # close hangs (file lock, OneDrive sync), the prior order would
+        # leave Excel evaluating volatile formulas while the file was
+        # still open — making a slow hang slower. Each step is suppressed
+        # so a single failure doesn't block the rest of the cleanup.
         if wb is not None:
             with contextlib.suppress(Exception):
                 wb.Close(SaveChanges=False)
         if excel is not None:
+            with contextlib.suppress(Exception):
+                excel.Calculation = -4105  # xlCalculationAutomatic
             with contextlib.suppress(Exception):
                 excel.ScreenUpdating = True
             with contextlib.suppress(Exception):
@@ -468,22 +480,27 @@ def run_direct(
 def _run_single_shot(
     excel: object,
     wb: object,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, bool, str | None]:
     """Legacy single-invocation macro path. Tries SolveHeadless first;
     falls back to the original SolveMinEquityWithHoldCo if the headless
     wrapper isn't present in the workbook (older models).
+
+    Returns (macro_used, has_switch, error). has_switch is True when the
+    SwitchProjectAndRecalc helper lives alongside the macro that ran --
+    only the SolveHeadless module ships it, so the legacy fallback path
+    reports False and the post-solve read uses the F2-direct fallback.
     """
     macro_names = ("SolveHeadless", "SolveMinEquityWithHoldCo")
     for macro_name in macro_names:
         try:
             excel.Application.Run(f"'{wb.Name}'!{macro_name}")
-            return macro_name, None
+            return macro_name, macro_name == "SolveHeadless", None
         except Exception as e:
             err_str = str(e).lower()
             if "macro may not be available" in err_str or "cannot run" in err_str:
                 continue
-            return macro_name, str(e)
-    return None, None
+            return macro_name, macro_name == "SolveHeadless", str(e)
+    return None, False, None
 
 
 def _run_chunked(
@@ -494,7 +511,7 @@ def _run_chunked(
     status: _StatusWriter,
     *,
     checkpoint_callback: Callable[[object, dict], None] | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, bool, str | None]:
     """Chunked macro path: Init + per-project SolveOneProjectByColHL + Finalize.
 
     Each project becomes its own COM Application.Run call so a long
@@ -506,12 +523,17 @@ def _run_chunked(
     project's row from __SolverResults right after it lands and fires
     the callback with the parsed dict. Callback exceptions are caught
     and logged but do not stop the solve.
+
+    Returns (macro_used, has_switch, error). has_switch is always True
+    here since the chunked entry points only live in the SolveHeadless
+    module, alongside SwitchProjectAndRecalc.
     """
     macro_used = "SolveHeadless"  # The chunked entry points live in this module
+    has_switch = True
     try:
         excel.Application.Run(f"'{wb.Name}'!InitSolveEnvHL")
     except Exception as e:
-        return macro_used, f"InitSolveEnvHL failed: {e}"
+        return macro_used, has_switch, f"InitSolveEnvHL failed: {e}"
 
     n = len(norm_tasks)
     chunked_error: str | None = None
@@ -567,7 +589,7 @@ def _run_chunked(
         if chunked_error is None:
             chunked_error = f"FinalizeSolveEnvHL failed: {e}"
 
-    return macro_used, chunked_error
+    return macro_used, has_switch, chunked_error
 
 
 def _read_one_solver_result_row(wb: object, results_row: int) -> dict:

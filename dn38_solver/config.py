@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dn38_solver.types import CellAddress, GoalSeekOp
+from dn38_solver.types import CellAddress
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -96,50 +96,14 @@ CELL_APPRAISAL_LIVE = CellAddress(sheet="Project Inputs", address="F31")
 CELL_WACC_TARGET = CellAddress(sheet="Project Inputs", address="F30")
 
 # ---------------------------------------------------------------------------
-# Solver constants (exact match from VBA SolveMinEquityWithHoldCo)
+# Solver constants
+#
+# Convergence thresholds (MAX_ITER, EQUITY_FINAL_TOL, IRR_TOLERANCE,
+# APPR_TOLERANCE, GS_MAXITER_*, etc.) live in SolveHeadless.bas as Private
+# Const. The macro reads them directly; Python no longer mirrors them
+# because no live module passes them across the COM boundary. Edit the
+# .bas file when these need to move.
 # ---------------------------------------------------------------------------
-
-MAX_ITERATIONS: int = 8
-MAX_GS_RETRIES: int = 6
-EQUITY_TOLERANCE: float = 0.005     # +/- 0.5pp = 5% of 10% target
-IRR_TOLERANCE: float = 0.0003       # 0.03%
-APPRAISAL_TOLERANCE: float = 0.0003 # 0.03%
-DSCR_BOUNDS: tuple[float, float] = (0.5, 5.0)
-NPP_BOUNDS: tuple[float, float] = (-2.0, 5.0)
-DEV_FEE_BOUNDS: tuple[float, float] = (0.0, 10.0)
-
-# GoalSeek precision (mirrors VBA SetGoalSeekPrecision)
-GS_MAX_CHANGE: float = 0.00001
-GS_MAX_ITERATIONS: int = 1000
-
-# ---------------------------------------------------------------------------
-# GoalSeek operation templates
-# Per-project cells use "{col}" placeholder, replaced at runtime
-# ---------------------------------------------------------------------------
-
-GOALSEEK_PHASE1: tuple[GoalSeekOp, ...] = (
-    GoalSeekOp(
-        target_sheet="PT Returns", target_cell="C128",
-        goal_sheet="PT Returns", goal_cell="F128",
-        changing_sheet="PT Returns", changing_cell="F129",
-        lower_bound=DSCR_BOUNDS[0], upper_bound=DSCR_BOUNDS[1],
-    ),
-)
-
-GOALSEEK_PHASE2_TEMPLATES: tuple[GoalSeekOp, ...] = (
-    GoalSeekOp(
-        target_sheet="Project Inputs", target_cell="F37",
-        goal_sheet="Project Inputs", goal_cell="F36",
-        changing_sheet="Project Inputs", changing_cell="{col}38",
-        lower_bound=NPP_BOUNDS[0], upper_bound=NPP_BOUNDS[1],
-    ),
-    GoalSeekOp(
-        target_sheet="Project Inputs", target_cell="F31",
-        goal_sheet="Project Inputs", goal_cell="F30",
-        changing_sheet="Project Inputs", changing_cell="{col}32",
-        lower_bound=DEV_FEE_BOUNDS[0], upper_bound=DEV_FEE_BOUNDS[1],
-    ),
-)
 
 # ---------------------------------------------------------------------------
 # Cells to read back after solve (per-project, {col} templated)

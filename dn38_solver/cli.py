@@ -20,6 +20,24 @@ from dn38_solver.storage.database import (
     get_connection,
     get_runs,
 )
+from dn38_solver.types import ProjectResult, SolveStatus
+
+
+def _convergence_label(p: ProjectResult) -> str:
+    """Render a project's convergence outcome for the CLI tables.
+
+    Strict converged -> OK
+    Relaxed-tier (within +/-1pp / 5x tol, --allow-relaxed-eligible) -> OK*
+    Otherwise -> CHECK
+
+    Each formatter prints a one-line legend below its table when any
+    OK* labels appear so the asterisk is self-documenting.
+    """
+    if p.convergence_tier == "strict":
+        return "OK"
+    if p.convergence_tier == "relaxed":
+        return "OK*"
+    return "CHECK"
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -54,13 +72,18 @@ def _show_checkpoints(batch_id: str) -> None:
     print(f"{'='*80}")
     print(f"  {'Project':<32} {'Col':>4} {'NPP':>10} {'DevFee':>10} {'DSCR':>9} {'Eq%':>7} {'Conv':>6}")
     print(f"  {'-'*32} {'-'*4} {'-'*10} {'-'*10} {'-'*9} {'-'*7} {'-'*6}")
+    has_relaxed = False
     for p in projects:
         npp = f"${p.npp_per_w:.3f}" if p.npp_per_w is not None else "—"
         dev = f"${p.dev_fee_per_w:.3f}" if p.dev_fee_per_w is not None else "—"
         dscr = f"{p.dscr_multiple:.3f}x" if p.dscr_multiple is not None else "—"
         eq = f"{p.equity_pct*100:.2f}%" if p.equity_pct is not None else "—"
-        conv = "OK" if p.converged else "CHECK"
+        conv = _convergence_label(p)
+        if conv == "OK*":
+            has_relaxed = True
         print(f"  {p.name[:32]:<32} {p.col:>4} {npp:>10} {dev:>10} {dscr:>9} {eq:>7} {conv:>6}")
+    if has_relaxed:
+        print("  OK* = relaxed tier (equity +/-1pp, gaps <= 5x tol; --allow-relaxed-eligible)")
 
 
 def _show_history(limit: int = 20) -> None:
@@ -78,6 +101,7 @@ def _show_history(limit: int = 20) -> None:
     print(f"  {'Timestamp':<22} {'Workbook':<30} {'Projects':>8} {'Status':>14}")
     print(f"  {'-'*22} {'-'*30} {'-'*8} {'-'*14}")
 
+    has_relaxed = False
     for r in runs:
         ts = r.run_timestamp[:19]
         wb = r.workbook_name[:28]
@@ -87,8 +111,13 @@ def _show_history(limit: int = 20) -> None:
         for p in r.projects:
             npp = f"${p.npp_per_w:.3f}" if p.npp_per_w else "—"
             dev = f"${p.dev_fee_per_w:.3f}" if p.dev_fee_per_w else "—"
-            stat = "OK" if p.converged else "CHECK"
+            stat = _convergence_label(p)
+            if stat == "OK*":
+                has_relaxed = True
             print(f"    {p.name:<26} NPP={npp:>8}  DevFee={dev:>8}  [{stat}]")
+
+    if has_relaxed:
+        print("  OK* = relaxed tier (equity +/-1pp, gaps <= 5x tol; --allow-relaxed-eligible)")
 
 
 def main() -> None:
@@ -165,6 +194,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-save",
+        dest="save_solved",
+        action="store_false",
+        help="Skip writing <workbook>_SOLVED.xlsm at the end of the run. Useful for fast iteration.",
+    )
+    parser.set_defaults(save_solved=True)
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -195,11 +231,12 @@ def main() -> None:
         strict_validation=args.strict_validation,
         use_chunked=args.chunked,
         allow_relaxed=args.allow_relaxed,
+        save_solved=args.save_solved,
     )
 
-    # Exit code: 0 if converged, 1 if not
+    # Exit code: 0 if converged or dry-run; 1 otherwise.
     match record.status:
-        case "converged" | "dry_run":
+        case SolveStatus.CONVERGED.value | SolveStatus.DRY_RUN.value:
             sys.exit(0)
         case _:
             sys.exit(1)

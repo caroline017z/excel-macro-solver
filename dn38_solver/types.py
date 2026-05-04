@@ -41,43 +41,24 @@ class ProjectInfo(msgspec.Struct, frozen=True, kw_only=True):
 
 
 # ---------------------------------------------------------------------------
-# GoalSeek operations (COM worker contract)
+# Solve task (COM worker contract)
 # ---------------------------------------------------------------------------
 
-class GoalSeekOp(msgspec.Struct, frozen=True, kw_only=True):
-    """One GoalSeek operation for the COM worker."""
-    target_sheet: str
-    target_cell: str      # A1-style — the cell whose value should match goal
-    goal_sheet: str
-    goal_cell: str        # A1-style — cell holding the target value
-    changing_sheet: str
-    changing_cell: str    # A1-style — cell that GoalSeek adjusts
-    lower_bound: float
-    upper_bound: float
-
-
 class SolveTask(msgspec.Struct, frozen=True, kw_only=True):
-    """Per-project solve metadata. Built by sequence.build_solve_task; consumed by direct_runner.run_direct."""
+    """Per-project solve metadata. Built by sequence.build_solve_task; consumed
+    by direct_runner.run_direct.
+
+    Trimmed to the fields the runner actually reads. The convergence
+    constants and GoalSeek templates that used to ride on this struct are
+    owned by SolveHeadless.bas now -- VBA reads them directly as Private
+    Const, so passing them across the COM boundary was always inert.
+    """
     workbook_path: str
     project_offset: int
     project_col_letter: str
     project_name: str
-    calc_core_sheets: tuple[str, ...]
     project_index_cell: CellAddress
-    holdco_cell: CellAddress
-    equity_cell: CellAddress
-    equity_target_cell: CellAddress
-    total_uses_cell: CellAddress
-    goal_seeks_phase1: tuple[GoalSeekOp, ...]
-    goal_seeks_phase2: tuple[GoalSeekOp, ...]
-    max_iterations: int
-    max_gs_retries: int
-    irr_tolerance: float
-    equity_tolerance: float
-    gs_max_change: float
-    gs_max_iterations: int
     read_cells: tuple[CellAddress, ...]
-    saved_workbook_suffix: str = "_SOLVED"
 
 
 class SolveStatus(str, enum.Enum):

@@ -67,7 +67,7 @@ def _parse_project_result(
         else None
     )
 
-    is_converged = raw.get("status") == "converged"
+    is_converged = raw.get("status") == SolveStatus.CONVERGED.value
     meta = raw.get("meta") or {}
     tier_raw = meta.get("conv_tier")
     if isinstance(tier_raw, str) and tier_raw in {"strict", "relaxed", "none"}:
@@ -106,6 +106,7 @@ def solve_all(
     strict_validation: bool = False,
     use_chunked: bool = False,
     allow_relaxed: bool = False,
+    save_solved: bool = True,
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
@@ -131,6 +132,9 @@ def solve_all(
             toward the run-level CONVERGED status. Per-project
             ProjectResult.converged stays strict-only regardless. Default
             False preserves prior strict-only run-level reporting.
+        save_solved: when True (default), persist a `<workbook>_SOLVED.xlsm`
+            copy at end of run. Set False for fast iteration on Box-
+            mounted workbooks where the save is a nontrivial fixed cost.
     """
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:8]
@@ -276,6 +280,7 @@ def solve_all(
         timeout_sec=timeout_sec,
         use_chunked=use_chunked,
         checkpoint_callback=_checkpoint if use_chunked else None,
+        save_solved=save_solved,
     )
 
     # Phase 4: Parse results
@@ -293,12 +298,12 @@ def solve_all(
         project_results.append(pr)
 
         match raw.get("status"):
-            case "converged":
+            case SolveStatus.CONVERGED.value:
                 # tier is always "strict" here (status=converged implies
                 # bConverged from VBA, which only fires on strict).
                 log.info("  %s: CONVERGED in %d iter (%.1fs)",
                          pr.name, pr.iterations, raw.get("duration_sec", 0))
-            case "not_converged":
+            case SolveStatus.NOT_CONVERGED.value:
                 # Distinguish relaxed-tier hits from genuine non-convergence
                 # so the log reflects what's actually investment-grade vs.
                 # what needs a re-solve.
@@ -332,7 +337,7 @@ def solve_all(
             )
 
     # Handle batch-level errors
-    if batch_result.get("status") == "error" and not project_results:
+    if batch_result.get("status") == SolveStatus.ERROR.value and not project_results:
         log.error("COM worker error: %s", batch_result.get("error"))
         conn.close()
         return RunRecord(
