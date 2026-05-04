@@ -112,6 +112,11 @@ End Function
 
 Private Sub ResetSolverResultsHL(ByVal wsRes As Worksheet)
     wsRes.Cells.ClearContents
+    ' ClearContents preserves NumberFormat from prior runs. Pin cols O-R
+    ' (per-phase calc seconds) to 4-decimal so the values match what
+    ' Round(..., 4) writes -- a stale "%" or "$" format on these cells
+    ' would silently misread the telemetry in __SolverResults.
+    wsRes.Columns("O:R").NumberFormat = "0.0000"
     wsRes.Range("A1").Value = "Project Offset"
     wsRes.Range("B1").Value = "Project Name"
     wsRes.Range("C1").Value = "DSCR"

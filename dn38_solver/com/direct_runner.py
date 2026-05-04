@@ -121,7 +121,12 @@ class _StatusWriter:
         }
         payload.update(extras)
         try:
-            self._path.write_text(json.dumps(payload, default=str))
+            # Atomic swap so a Streamlit reader can never observe a half-
+            # written JSON. tmp file lives next to the target so .replace()
+            # stays on the same filesystem.
+            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload, default=str))
+            tmp_path.replace(self._path)
         except OSError:
             pass
 
@@ -174,7 +179,11 @@ def run_direct(
 
     try:
         pythoncom.CoInitialize()
-        excel = win32com.client.Dispatch("Excel.Application")
+        # DispatchEx forces a fresh COM instance so we never attach to a
+        # zombie EXCEL.EXE left over from a prior crash, and never share
+        # process state with an Excel session the user has open for their
+        # own work.
+        excel = win32com.client.DispatchEx("Excel.Application")
         excel.Visible = False
         excel.DisplayAlerts = False
         excel.ScreenUpdating = False
@@ -228,19 +237,26 @@ def run_direct(
 
         solve_time = time.time() - t0
         log.info("  Macro '%s' completed in %.1fs", macro_used, solve_time)
+
+        if macro_used is None:
+            # No macro to run is unrecoverable — there's nothing in
+            # __SolverResults to read and no output worth saving.
+            result["error"] = "No solver macro found in workbook"
+            return result
+
+        # macro_error and timeout are non-fatal: a chunked Finalize failure
+        # or a mid-portfolio crash still leaves valid rows in __SolverResults
+        # and converged values on Project Inputs / PT Returns. We always
+        # proceed to read whatever landed and save the xlsx so the partial
+        # state is recoverable. The error is propagated on the result so
+        # the orchestrator can mark the run accordingly and keep
+        # checkpoints rather than silently clearing them.
+        timeout_error: str | None = None
         if timeout_sec > 0 and solve_time > timeout_sec:
-            result["error"] = (
+            timeout_error = (
                 f"Macro execution exceeded timeout_sec={timeout_sec} "
                 f"(actual={solve_time:.1f}s)"
             )
-            return result
-
-        if macro_used is None:
-            result["error"] = "No solver macro found in workbook"
-            return result
-        if macro_error:
-            result["error"] = f"Macro {macro_used} failed: {macro_error}"
-            return result
 
         # --- Read results per project ---
         # SolveHeadless leaves calc in MANUAL mode.
@@ -259,6 +275,23 @@ def run_direct(
         solver_results, heartbeat = _read_solver_results_map(wb)
 
         for nt in norm_tasks:
+            meta = solver_results.get(nt.offset)
+            if meta is None:
+                # Mid-portfolio failure stopped before this project ran.
+                # Don't read its cells — they'd reflect either uninitialized
+                # state or another project's converged values, both of
+                # which would be misleading downstream.
+                project_results.append({
+                    "project_name": nt.name,
+                    "status": "not_attempted",
+                    "solved_values": {},
+                    "iterations_used": 0,
+                    "duration_sec": 0,
+                    "meta": {},
+                    "_summary": {"npp": None, "dev_fee": None, "fmv": None},
+                })
+                continue
+
             # Switch F2 with targeted recalc
             if has_switch:
                 try:
@@ -291,13 +324,19 @@ def run_direct(
             # Prefer per-project DSCR captured during solve loop to avoid
             # last-project F129 bleed in multi-project runs.
             dscr_key = "PT Returns!F129"
-            meta = solver_results.get(nt.offset)
-            if meta and "dscr" in meta:
+            if "dscr" in meta:
                 solved[dscr_key] = meta["dscr"]
+
+            # Trust VBA's converged_flag in column I rather than assuming
+            # every row read means convergence. A row exists for every
+            # project the macro attempted, including ones that timed out
+            # of their inner loop without hitting tolerance.
+            converged_flag = meta.get("converged_flag")
+            is_converged = bool(converged_flag) if converged_flag is not None else False
 
             project_results.append({
                 "project_name": nt.name,
-                "status": "converged",
+                "status": "converged" if is_converged else "not_converged",
                 "solved_values": solved,
                 "iterations_used": 0,
                 "duration_sec": 0,
@@ -339,7 +378,7 @@ def run_direct(
         tracker_projects = [
             {
                 "name": pr["project_name"],
-                "status": "converged",
+                "status": pr["status"],
                 **pr["_summary"],
             }
             for pr in project_results
@@ -349,12 +388,26 @@ def run_direct(
         for pr in project_results:
             pr.pop("_summary", None)
 
+        # Compose batch-level status from any error surfaced during the
+        # macro / timeout path. project_results is populated either way so
+        # the orchestrator can decide what to persist; the error string
+        # tells it whether to keep checkpoints around for forensics.
+        if macro_error:
+            batch_status = "error"
+            batch_error = f"Macro {macro_used} failed: {macro_error}"
+        elif timeout_error:
+            batch_status = "error"
+            batch_error = timeout_error
+        else:
+            batch_status = "converged"
+            batch_error = None
+
         result = {
-            "status": "converged",
+            "status": batch_status,
             "project_results": project_results,
             "duration_sec": round(total, 2),
             "saved_to": saved_to,
-            "error": None,
+            "error": batch_error,
             "macro_used": macro_used,
             "open_time_sec": round(open_time, 2),
             "warmup_time_sec": round(warmup_time, 2),
@@ -365,7 +418,7 @@ def run_direct(
         }
 
         status.update(
-            "complete",
+            "complete" if batch_error is None else "error",
             projects=tracker_projects,
             total_time_sec=total,
             macro_used=macro_used,
@@ -373,7 +426,7 @@ def run_direct(
             macro_time_sec=round(solve_time, 2),
             read_time_sec=round(read_time, 2),
             solver_heartbeat=heartbeat,
-            error=None,
+            error=batch_error,
         )
 
     except Exception as exc:
@@ -399,8 +452,13 @@ def run_direct(
                 excel.EnableEvents = True
             with contextlib.suppress(Exception):
                 excel.Quit()
-        with contextlib.suppress(Exception):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Log rather than swallow — a leaked tmp_dir typically means a
+        # zombie EXCEL.EXE still holds a file handle, and that's worth
+        # surfacing rather than silently filling up %TEMP%.
+        try:
+            shutil.rmtree(tmp_dir)
+        except OSError as rm_exc:
+            log.warning("Failed to remove tmp_dir %s: %s", tmp_dir, rm_exc)
         with contextlib.suppress(Exception):
             pythoncom.CoUninitialize()
 
@@ -491,9 +549,11 @@ def _run_chunked(
             except Exception as cb_exc:
                 # Persistence failure must never stall the solve. Log and
                 # carry on; the project's data is still in the workbook.
+                # Include row index so forensic recovery from logs alone
+                # can match the failure back to its __SolverResults row.
                 log.warning(
-                    "  Checkpoint callback failed for %s: %s",
-                    nt.name, cb_exc,
+                    "  Checkpoint callback failed for %s (row=%d): %s",
+                    nt.name, results_row, cb_exc,
                 )
 
     # Finalize is best-effort — it restores F2 and re-enables non-core

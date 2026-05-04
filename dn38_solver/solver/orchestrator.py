@@ -206,8 +206,19 @@ def solve_all(
         live IRR, FMV, NPP $) are left None and will be filled in by
         the post-solve cell read at end of run.
         """
-        proj = project_lookup.get(getattr(nt, "name", None))
+        raw_name = getattr(nt, "name", None)
+        proj = project_lookup.get(raw_name) if raw_name else None
+        if proj is None and isinstance(raw_name, str):
+            # Trailing/leading whitespace from VBA is the likely culprit
+            # for a name mismatch. Retry with the stripped form before
+            # giving up so a cosmetic difference doesn't drop the row.
+            proj = project_lookup.get(raw_name.strip())
         if proj is None:
+            log.warning(
+                "Checkpoint name lookup miss (%r) — partial result not "
+                "persisted for this project; subsequent projects continue.",
+                raw_name,
+            )
             return
         converged_flag = meta.get("converged_flag")
         partial = ProjectResult(
@@ -306,6 +317,11 @@ def solve_all(
         and post_validation is not None
         and not post_validation.ok
     )
+    # batch_error is set when the macro itself raised but partial data
+    # was still salvaged from __SolverResults (chunked Finalize failure,
+    # mid-portfolio crash). The run is marked ERROR so checkpoints are
+    # retained for forensics, even though some / all projects converged.
+    batch_error = batch_result.get("error")
     total_time = time.time() - start
 
     if post_failed:
@@ -314,6 +330,9 @@ def solve_all(
             f"Post-export validation failed: "
             f"{post_validation.total_errors} formula error(s) in saved workbook"
         )
+    elif batch_error:
+        status_value = SolveStatus.ERROR.value
+        error_msg = batch_error
     elif all_converged:
         status_value = SolveStatus.CONVERGED.value
         error_msg = None
