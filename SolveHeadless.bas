@@ -135,6 +135,7 @@ Private Sub ResetSolverResultsHL(ByVal wsRes As Worksheet)
     wsRes.Range("P1").Value = "Calc Secs NPP"
     wsRes.Range("Q1").Value = "Calc Secs Appr"
     wsRes.Range("R1").Value = "Calc Secs Full"
+    wsRes.Range("S1").Value = "Iterations"
 End Sub
 
 Private Sub WriteHeartbeatHL(ByVal wsRes As Worksheet, ByVal heartbeatText As String)
@@ -473,25 +474,33 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
     Dim bConverged  As Boolean
     Dim bColdMode   As Boolean
+    Dim bNeedCold   As Boolean
     Dim iGSRetry    As Integer
     Dim iIter       As Integer
     Dim iInner      As Integer
+    Dim iActualIters As Integer
     Dim bGSok       As Boolean
     Dim dEquityPct  As Double
     Dim dPrevEqPct  As Double
     Dim dIRRGap     As Double
     Dim dApprGap    As Double
     Dim dTotalUses  As Double
+    Dim dPrevNPP    As Double
+    Dim dPrevDevFee As Double
 
     bConverged = False
     bColdMode = False
-    iGSRetry = MAX_GS_RETRY_COLD
-    SetGoalSeekModeHL True
+    iGSRetry = MAX_GS_RETRY_WARM
+    SetGoalSeekModeHL False
     ResetCalcTierHL
     dPrevEqPct = -999
+    iActualIters = 0
 
     For iIter = 1 To MAX_ITER
-        If Timer - dSolveStart > PROJECT_TIMEOUT_SECONDS Then Exit For
+        If Timer - dSolveStart > PROJECT_TIMEOUT_SECONDS Then
+            iActualIters = iIter - 1
+            Exit For
+        End If
         rHoldCo.Value = 0
         CalcForPhase PHASE_FULL
 
@@ -503,6 +512,9 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         rHoldCo.Value = 1
         CalcForPhase PHASE_FULL
 
+        dPrevNPP = -999#
+        dPrevDevFee = -999#
+
         For iInner = 1 To iGSRetry
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
             CalcForPhase PHASE_NPP
@@ -513,6 +525,19 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
             dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
             dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
             If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+
+            ' Slope-stall break: GoalSeek made no measurable progress on
+            ' either changing cell vs. the prior retry. Further retries at
+            ' this calc tier won't move the answer — escalate at the outer
+            ' level instead.
+            If iInner > 1 _
+               And Abs(rNPP.Value - dPrevNPP) < 0.000001 _
+               And Abs(rDevFee.Value - dPrevDevFee) < 0.000001 Then
+                Exit For
+            End If
+            dPrevNPP = rNPP.Value
+            dPrevDevFee = rDevFee.Value
+
             EscalateCalcTierHL
         Next iInner
 
@@ -525,18 +550,33 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
         If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL Then
             bConverged = True
+            iActualIters = iIter
             Exit For
         End If
-        If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then Exit For
+        If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then
+            iActualIters = iIter
+            Exit For
+        End If
         dPrevEqPct = dEquityPct
 
-        If Not bColdMode Then
+        ' Residual-gated cold-mode escalation. Iter 1's actual residuals
+        ' decide whether iter 2+ needs the heavier retries / calc tier;
+        ' a portfolio that's already close to converged stays warm.
+        bNeedCold = (Abs(dEquityPct - 0.1) > 0.02) _
+                    Or (dIRRGap > IRR_TOLERANCE * 3) _
+                    Or (dApprGap > APPR_TOLERANCE * 3)
+
+        If Not bColdMode And bNeedCold Then
             bColdMode = True
             iGSRetry = MAX_GS_RETRY_COLD
             SetGoalSeekModeHL True
             EscalateCalcTierHL
         End If
     Next iIter
+
+    ' For-loop variable is one past MAX_ITER on natural completion; on an
+    ' Exit For the assignment inside the loop already captured the count.
+    If iActualIters = 0 Then iActualIters = MAX_ITER
 
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
@@ -556,6 +596,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     wsRes.Cells(resultsRow, 16).Value = Round(mCalcSecsNPP, 4)
     wsRes.Cells(resultsRow, 17).Value = Round(mCalcSecsAppr, 4)
     wsRes.Cells(resultsRow, 18).Value = Round(mCalcSecsFull, 4)
+    wsRes.Cells(resultsRow, 19).Value = iActualIters
     WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & projName
 
     SolveOneProjectByColHL = IIf(bConverged, 1, 0)
@@ -618,15 +659,19 @@ Public Sub SolveHeadless()
     Dim iIter       As Integer
     Dim iInner      As Integer
     Dim iGSRetry    As Integer
+    Dim iActualIters As Integer
     Dim bConverged  As Boolean
     Dim bGSok       As Boolean
     Dim bColdMode   As Boolean
+    Dim bNeedCold   As Boolean
     Dim dEquityPct  As Double
     Dim dPrevEqPct  As Double
     Dim dIRRGap     As Double
     Dim dApprGap    As Double
     Dim dTotalUses  As Double
     Dim dSolveStart As Double
+    Dim dPrevNPP    As Double
+    Dim dPrevDevFee As Double
 
     Dim rHoldCo     As Range
     Dim rEquity     As Range
@@ -672,6 +717,7 @@ Public Sub SolveHeadless()
         SetGoalSeekModeHL False
         ResetCalcTierHL
         dPrevEqPct = -999
+        iActualIters = 0
 
         ' Pre-seed if prior project left wild values in this column
         If rNPP.Value = "" Or rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then
@@ -697,6 +743,9 @@ Public Sub SolveHeadless()
             rHoldCo.Value = 1
             CalcForPhase PHASE_FULL
 
+            dPrevNPP = -999#
+            dPrevDevFee = -999#
+
             ' Steps 4-5: Sequential NPP / Appraisal solve
             ' Sequential (not batched) ensures each GoalSeek sees fresh recalc
             ' values — critical for cold-start solves with seed values far from optimal.
@@ -712,6 +761,19 @@ Public Sub SolveHeadless()
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
                 dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
                 If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+
+                ' Slope-stall break: GoalSeek made no measurable progress on
+                ' either changing cell vs. the prior retry. Further retries at
+                ' this calc tier won't move the answer — escalate at the outer
+                ' level instead.
+                If iInner > 1 _
+                   And Abs(rNPP.Value - dPrevNPP) < 0.000001 _
+                   And Abs(rDevFee.Value - dPrevDevFee) < 0.000001 Then
+                    Exit For
+                End If
+                dPrevNPP = rNPP.Value
+                dPrevDevFee = rDevFee.Value
+
                 EscalateCalcTierHL
                 WriteHeartbeatHL wsRes, "RETRY|" & CStr(Now) & "|Project=" & arrNames(i) & "|Inner=" & CStr(iInner)
             Next iInner
@@ -726,13 +788,23 @@ Public Sub SolveHeadless()
 
             If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL Then
                 bConverged = True
+                iActualIters = iIter
                 Exit For
             End If
-            If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then Exit For
+            If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then
+                iActualIters = iIter
+                Exit For
+            End If
             dPrevEqPct = dEquityPct
 
-            ' Escalate this project from warm to cold mode only when needed.
-            If Not bColdMode And iIter >= 1 Then
+            ' Residual-gated cold-mode escalation. Iter 1's actual residuals
+            ' decide whether iter 2+ needs the heavier retries / calc tier;
+            ' a portfolio that's already close to converged stays warm.
+            bNeedCold = (Abs(dEquityPct - 0.1) > 0.02) _
+                        Or (dIRRGap > IRR_TOLERANCE * 3) _
+                        Or (dApprGap > APPR_TOLERANCE * 3)
+
+            If Not bColdMode And bNeedCold Then
                 bColdMode = True
                 iGSRetry = MAX_GS_RETRY_COLD
                 SetGoalSeekModeHL True
@@ -740,6 +812,10 @@ Public Sub SolveHeadless()
             End If
 
         Next iIter
+
+        ' For-loop variable is one past MAX_ITER on natural completion; on an
+        ' Exit For the assignment inside the loop already captured the count.
+        If iActualIters = 0 Then iActualIters = MAX_ITER
 
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)
@@ -759,6 +835,7 @@ Public Sub SolveHeadless()
         wsRes.Cells(i + 1, 16).Value = Round(mCalcSecsNPP, 4)
         wsRes.Cells(i + 1, 17).Value = Round(mCalcSecsAppr, 4)
         wsRes.Cells(i + 1, 18).Value = Round(mCalcSecsFull, 4)
+        wsRes.Cells(i + 1, 19).Value = iActualIters
         WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & arrNames(i)
 
     Next i

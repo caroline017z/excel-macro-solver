@@ -338,7 +338,7 @@ def run_direct(
                 "project_name": nt.name,
                 "status": "converged" if is_converged else "not_converged",
                 "solved_values": solved,
-                "iterations_used": 0,
+                "iterations_used": int(meta.get("iterations") or 0),
                 "duration_sec": 0,
                 "meta": meta or {},
                 "_summary": {"npp": npp, "dev_fee": dev_fee, "fmv": fmv},
@@ -573,13 +573,13 @@ def _run_chunked(
 def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
     """Read a single row from __SolverResults in one COM round-trip.
 
-    Mirrors the bulk read schema (cols A–R) but for a single project,
+    Mirrors the bulk read schema (cols A–S) but for a single project,
     used by the chunked checkpoint hook so each callback fires with the
     same shape the post-solve bulk read produces.
     """
     try:
         ws = wb.Sheets(SOLVER_RESULTS_SHEET)
-        row_vals = ws.Range(f"A{results_row}:R{results_row}").Value
+        row_vals = ws.Range(f"A{results_row}:S{results_row}").Value
     except Exception:
         return {}
     if row_vals is None:
@@ -607,6 +607,7 @@ def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
         "calc_secs_npp": safe_float(row_vals[15]) if len(row_vals) > 15 else None,
         "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
         "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
+        "iterations": _to_int(row_vals[18]) if len(row_vals) > 18 else None,
     }
 
 
@@ -627,8 +628,8 @@ def _read_solver_results_map(
 ) -> tuple[dict[int, dict[str, float | str | None]], str | None]:
     """Read per-project solve telemetry captured by SolveHeadless VBA.
 
-    One bulk Range.Value read covering A2:R{2 + _RESULTS_BULK_ROWS - 1} replaces
-    the prior per-cell while loop (~18 COM round-trips per project, ~1080 for a
+    One bulk Range.Value read covering A2:S{2 + _RESULTS_BULK_ROWS - 1} replaces
+    the prior per-cell while loop (~19 COM round-trips per project, ~1140 for a
     60-project portfolio). The block is sparse-tolerant: rows whose A column is
     blank are treated as end-of-data.
 
@@ -636,7 +637,8 @@ def _read_solver_results_map(
     equity_pct, gaps, converged, calc tier, retry limit, mode, solve_seconds,
     heartbeat). Columns O–R carry per-phase calc-time telemetry written by
     CalcForPhase: cumulative seconds spent recalculating in the DSCR / NPP /
-    Appraisal / Full scopes for that project.
+    Appraisal / Full scopes for that project. Column S is the actual outer-loop
+    iteration count captured by the solve path.
     """
     out: dict[int, dict[str, float | str | None]] = {}
     try:
@@ -650,7 +652,7 @@ def _read_solver_results_map(
 
     last_row = 1 + _RESULTS_BULK_ROWS
     try:
-        block = ws.Range(f"A2:R{last_row}").Value
+        block = ws.Range(f"A2:S{last_row}").Value
     except Exception:
         return out, heartbeat
     if block is None:
@@ -690,5 +692,21 @@ def _read_solver_results_map(
             "calc_secs_npp": safe_float(row_vals[15]) if len(row_vals) > 15 else None,
             "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
             "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
+            "iterations": _to_int(row_vals[18]) if len(row_vals) > 18 else None,
         }
     return out, heartbeat
+
+
+def _to_int(v: object) -> int | None:
+    """Convert a COM scalar to int, returning None on failure.
+
+    Modeled on safe_float — VBA writes an Integer to column S, but the
+    pywin32 marshaller surfaces it as float when the cell is part of a
+    Range.Value bulk read. Coerce via float to handle both cases without
+    raising on a None / blank row.
+    """
+    if v is None or v == "":
+        return None
+    with contextlib.suppress(ValueError, TypeError):
+        return int(float(v))
+    return None
