@@ -43,7 +43,14 @@ def _parse_project_result(
     project: ProjectInfo,
     raw: dict,
 ) -> ProjectResult:
-    """Map a raw project result dict to a ProjectResult struct."""
+    """Map a raw project result dict to a ProjectResult struct.
+
+    The convergence tier is sourced from __SolverResults!T (written by
+    VBA's ClassifyConvergenceHL). Older runs that predate the column
+    fall back to inferring the tier from the strict converged flag so
+    historical SQLite rows render with sensible values rather than
+    blanking out the new field.
+    """
     sv = raw.get("solved_values", {})
     col = project.col_letter
 
@@ -60,6 +67,16 @@ def _parse_project_result(
         else None
     )
 
+    is_converged = raw.get("status") == "converged"
+    meta = raw.get("meta") or {}
+    tier_raw = meta.get("conv_tier")
+    if isinstance(tier_raw, str) and tier_raw in {"strict", "relaxed", "none"}:
+        tier = tier_raw
+    else:
+        # Pre-tier rows: infer from strict converged flag so older
+        # SQLite-loaded ProjectResults still classify cleanly.
+        tier = "strict" if is_converged else "none"
+
     return ProjectResult(
         name=project.name,
         col=project.col,
@@ -74,7 +91,8 @@ def _parse_project_result(
         wacc_target=get("Project Inputs", "F30"),
         dscr_multiple=get("PT Returns", "F129"),
         equity_pct=eq_pct,
-        converged=raw.get("status") == "converged",
+        converged=is_converged,
+        convergence_tier=tier,
         iterations=raw.get("iterations_used", 0),
     )
 
@@ -87,6 +105,7 @@ def solve_all(
     timeout_sec: int = 600,
     strict_validation: bool = False,
     use_chunked: bool = False,
+    allow_relaxed: bool = False,
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
@@ -107,6 +126,11 @@ def solve_all(
             invocation can exceed the ~900s COM RPC timeout — the win on
             cold portfolios that today crash before completion. Adds live
             per-project progress to the status JSON.
+        allow_relaxed: when True, projects whose convergence tier is
+            "relaxed" (equity within +/-1pp, inner gaps <= 5x tol) count
+            toward the run-level CONVERGED status. Per-project
+            ProjectResult.converged stays strict-only regardless. Default
+            False preserves prior strict-only run-level reporting.
     """
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:8]
@@ -221,6 +245,10 @@ def solve_all(
             )
             return
         converged_flag = meta.get("converged_flag")
+        tier_raw = meta.get("conv_tier")
+        tier = tier_raw if isinstance(tier_raw, str) and tier_raw in {
+            "strict", "relaxed", "none"
+        } else "none"
         partial = ProjectResult(
             name=proj.name,
             col=proj.col,
@@ -230,6 +258,7 @@ def solve_all(
             dscr_multiple=safe_float(meta.get("dscr")),
             equity_pct=safe_float(meta.get("equity_pct")),
             converged=bool(converged_flag) if converged_flag is not None else False,
+            convergence_tier=tier,
         )
         save_project_checkpoint(
             conn,
@@ -265,10 +294,21 @@ def solve_all(
 
         match raw.get("status"):
             case "converged":
+                # tier is always "strict" here (status=converged implies
+                # bConverged from VBA, which only fires on strict).
                 log.info("  %s: CONVERGED in %d iter (%.1fs)",
                          pr.name, pr.iterations, raw.get("duration_sec", 0))
             case "not_converged":
-                log.warning("  %s: NOT CONVERGED after %d iter", pr.name, pr.iterations)
+                # Distinguish relaxed-tier hits from genuine non-convergence
+                # so the log reflects what's actually investment-grade vs.
+                # what needs a re-solve.
+                if pr.convergence_tier == "relaxed":
+                    log.info(
+                        "  %s: CONVERGED (relaxed) in %d iter (%.1fs)",
+                        pr.name, pr.iterations, raw.get("duration_sec", 0),
+                    )
+                else:
+                    log.warning("  %s: NOT CONVERGED after %d iter", pr.name, pr.iterations)
             case _:
                 log.error("  %s: %s", pr.name, raw.get("status", "unknown"))
 
@@ -311,7 +351,16 @@ def solve_all(
     if post_validation is not None:
         log.info("  %s", format_validation_report(post_validation, "Solved"))
 
-    all_converged = all(pr.converged for pr in project_results)
+    # Run-level convergence applies the --allow-relaxed policy. The
+    # per-project ProjectResult.converged field stays strict-only --
+    # downstream consumers reading individual records get the unchanged
+    # strict semantics. Only the rolled-up run status is affected here.
+    def _ok_at_run_level(pr: ProjectResult) -> bool:
+        if pr.converged:
+            return True
+        return allow_relaxed and pr.convergence_tier == "relaxed"
+
+    all_converged = all(_ok_at_run_level(pr) for pr in project_results)
     post_failed = (
         strict_validation
         and post_validation is not None

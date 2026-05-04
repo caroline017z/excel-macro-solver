@@ -156,6 +156,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-relaxed",
+        action="store_true",
+        help=(
+            "Treat projects that hit the relaxed convergence band "
+            "(equity +/-1pp, gaps <= 5x tol) as converged in the run "
+            "record. Default: strict only."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -185,6 +194,7 @@ def main() -> None:
         timeout_sec=args.timeout,
         strict_validation=args.strict_validation,
         use_chunked=args.chunked,
+        allow_relaxed=args.allow_relaxed,
     )
 
     # Exit code: 0 if converged, 1 if not

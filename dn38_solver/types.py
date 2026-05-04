@@ -109,6 +109,7 @@ class ProjectResult(msgspec.Struct, frozen=True, kw_only=True):
     dscr_multiple: float | None = None
     equity_pct: float | None = None
     converged: bool = False
+    convergence_tier: str = "none"   # "strict" | "relaxed" | "none"
     iterations: int = 0
 
 

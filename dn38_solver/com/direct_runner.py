@@ -579,7 +579,7 @@ def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
     """
     try:
         ws = wb.Sheets(SOLVER_RESULTS_SHEET)
-        row_vals = ws.Range(f"A{results_row}:S{results_row}").Value
+        row_vals = ws.Range(f"A{results_row}:T{results_row}").Value
     except Exception:
         return {}
     if row_vals is None:
@@ -589,6 +589,7 @@ def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
         row_vals = row_vals[0]
     if len(row_vals) < 14:
         return {}
+    tier_raw = row_vals[19] if len(row_vals) > 19 else None
     return {
         "project_name": safe_str_or_float(row_vals[1]),
         "dscr": safe_float(row_vals[2]),
@@ -608,6 +609,7 @@ def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
         "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
         "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
         "iterations": _to_int(row_vals[18]) if len(row_vals) > 18 else None,
+        "conv_tier": tier_raw if isinstance(tier_raw, str) else "none",
     }
 
 
@@ -628,8 +630,8 @@ def _read_solver_results_map(
 ) -> tuple[dict[int, dict[str, float | str | None]], str | None]:
     """Read per-project solve telemetry captured by SolveHeadless VBA.
 
-    One bulk Range.Value read covering A2:S{2 + _RESULTS_BULK_ROWS - 1} replaces
-    the prior per-cell while loop (~19 COM round-trips per project, ~1140 for a
+    One bulk Range.Value read covering A2:T{2 + _RESULTS_BULK_ROWS - 1} replaces
+    the prior per-cell while loop (~20 COM round-trips per project, ~1200 for a
     60-project portfolio). The block is sparse-tolerant: rows whose A column is
     blank are treated as end-of-data.
 
@@ -638,7 +640,8 @@ def _read_solver_results_map(
     heartbeat). Columns O–R carry per-phase calc-time telemetry written by
     CalcForPhase: cumulative seconds spent recalculating in the DSCR / NPP /
     Appraisal / Full scopes for that project. Column S is the actual outer-loop
-    iteration count captured by the solve path.
+    iteration count captured by the solve path. Column T is the convergence
+    tier ("strict" / "relaxed" / "none") written by ClassifyConvergenceHL.
     """
     out: dict[int, dict[str, float | str | None]] = {}
     try:
@@ -652,7 +655,7 @@ def _read_solver_results_map(
 
     last_row = 1 + _RESULTS_BULK_ROWS
     try:
-        block = ws.Range(f"A2:S{last_row}").Value
+        block = ws.Range(f"A2:T{last_row}").Value
     except Exception:
         return out, heartbeat
     if block is None:
@@ -674,6 +677,7 @@ def _read_solver_results_map(
         # Older workbook builds without the phase-telemetry columns return
         # short rows (or None in O–R); use safe_float so a missing value
         # surfaces as None rather than raising.
+        tier_raw = row_vals[19] if len(row_vals) > 19 else None
         out[offset] = {
             "project_name": safe_str_or_float(row_vals[1]),
             "dscr": safe_float(row_vals[2]),
@@ -693,6 +697,7 @@ def _read_solver_results_map(
             "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
             "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
             "iterations": _to_int(row_vals[18]) if len(row_vals) > 18 else None,
+            "conv_tier": tier_raw if isinstance(tier_raw, str) else "none",
         }
     return out, heartbeat
 

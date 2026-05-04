@@ -24,6 +24,8 @@ Private Const MAX_GS_RETRY_COLD As Integer = 6
 Private Const GS_MAXITER_WARM   As Integer = 200
 Private Const GS_MAXITER_COLD   As Integer = 1000
 Private Const EQUITY_FINAL_TOL  As Double = 0.005
+Private Const EQUITY_RELAXED_TOL As Double = 0.010   ' +/-1.0pp band; investment-grade but outside strict
+Private Const RELAXED_GAP_FACTOR As Double = 5#       ' inner gaps must be <= 5x tol to count as relaxed
 Private Const IRR_TOLERANCE     As Double = 0.0003
 Private Const APPR_TOLERANCE    As Double = 0.0003
 Private Const DSCR_MIN          As Double = 0.25
@@ -136,7 +138,32 @@ Private Sub ResetSolverResultsHL(ByVal wsRes As Worksheet)
     wsRes.Range("Q1").Value = "Calc Secs Appr"
     wsRes.Range("R1").Value = "Calc Secs Full"
     wsRes.Range("S1").Value = "Iterations"
+    wsRes.Range("T1").Value = "Conv Tier"
 End Sub
+
+' Classify a project's outcome based on its final equity, IRR gap, and Appr gap.
+' Strict: equity within +/-0.5pp AND both inner gaps within tight tolerance.
+' Relaxed: equity within +/-1.0pp AND both inner gaps within 5x tolerance.
+' None: anything else. Strict beats relaxed; relaxed beats none.
+'
+' This is a classification helper only -- it does not affect bConverged.
+' Column I (Converged) keeps its strict-only semantics; column T carries
+' the tier so Python can apply --allow-relaxed policy at the run level.
+Private Function ClassifyConvergenceHL(ByVal dEquityPct As Double, _
+                                       ByVal dIRRGap As Double, _
+                                       ByVal dApprGap As Double) As String
+    If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL _
+       And dIRRGap <= IRR_TOLERANCE _
+       And dApprGap <= APPR_TOLERANCE Then
+        ClassifyConvergenceHL = "strict"
+    ElseIf Abs(dEquityPct - 0.1) <= EQUITY_RELAXED_TOL _
+       And dIRRGap <= IRR_TOLERANCE * RELAXED_GAP_FACTOR _
+       And dApprGap <= APPR_TOLERANCE * RELAXED_GAP_FACTOR Then
+        ClassifyConvergenceHL = "relaxed"
+    Else
+        ClassifyConvergenceHL = "none"
+    End If
+End Function
 
 Private Sub WriteHeartbeatHL(ByVal wsRes As Worksheet, ByVal heartbeatText As String)
     wsRes.Range("N1").Value = heartbeatText
@@ -553,6 +580,17 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
             iActualIters = iIter
             Exit For
         End If
+        ' Relaxed-tier early exit: equity within +/-1pp and inner gaps
+        ' within 5x tolerance is investment-grade. Skip the remaining
+        ' outer iterations -- they rarely tighten further. bConverged
+        ' stays False so column I keeps strict-only semantics; column T
+        ' carries the tier for Python-side policy.
+        If Abs(dEquityPct - 0.1) <= EQUITY_RELAXED_TOL _
+           And dIRRGap  <= IRR_TOLERANCE  * RELAXED_GAP_FACTOR _
+           And dApprGap <= APPR_TOLERANCE * RELAXED_GAP_FACTOR Then
+            iActualIters = iIter
+            Exit For
+        End If
         If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then
             iActualIters = iIter
             Exit For
@@ -597,6 +635,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     wsRes.Cells(resultsRow, 17).Value = Round(mCalcSecsAppr, 4)
     wsRes.Cells(resultsRow, 18).Value = Round(mCalcSecsFull, 4)
     wsRes.Cells(resultsRow, 19).Value = iActualIters
+    wsRes.Cells(resultsRow, 20).Value = ClassifyConvergenceHL(dEquityPct, dIRRGap, dApprGap)
     WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & projName
 
     SolveOneProjectByColHL = IIf(bConverged, 1, 0)
@@ -791,6 +830,17 @@ Public Sub SolveHeadless()
                 iActualIters = iIter
                 Exit For
             End If
+            ' Relaxed-tier early exit: equity within +/-1pp and inner gaps
+            ' within 5x tolerance is investment-grade. Skip the remaining
+            ' outer iterations -- they rarely tighten further. bConverged
+            ' stays False so column I keeps strict-only semantics; column T
+            ' carries the tier for Python-side policy.
+            If Abs(dEquityPct - 0.1) <= EQUITY_RELAXED_TOL _
+               And dIRRGap  <= IRR_TOLERANCE  * RELAXED_GAP_FACTOR _
+               And dApprGap <= APPR_TOLERANCE * RELAXED_GAP_FACTOR Then
+                iActualIters = iIter
+                Exit For
+            End If
             If Abs(dEquityPct - dPrevEqPct) < 0.000005 And iIter > 1 Then
                 iActualIters = iIter
                 Exit For
@@ -836,6 +886,7 @@ Public Sub SolveHeadless()
         wsRes.Cells(i + 1, 17).Value = Round(mCalcSecsAppr, 4)
         wsRes.Cells(i + 1, 18).Value = Round(mCalcSecsFull, 4)
         wsRes.Cells(i + 1, 19).Value = iActualIters
+        wsRes.Cells(i + 1, 20).Value = ClassifyConvergenceHL(dEquityPct, dIRRGap, dApprGap)
         WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & arrNames(i)
 
     Next i
