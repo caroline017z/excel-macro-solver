@@ -57,7 +57,7 @@ class GoalSeekOp(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class SolveTask(msgspec.Struct, frozen=True, kw_only=True):
-    """Full payload sent to com_worker.py via JSON stdin."""
+    """Per-project solve metadata. Built by sequence.build_solve_task; consumed by direct_runner.run_direct."""
     workbook_path: str
     project_offset: int
     project_col_letter: str
@@ -87,16 +87,6 @@ class SolveStatus(str, enum.Enum):
     ERROR = "error"
     TIMEOUT = "timeout"
     DRY_RUN = "dry_run"
-
-
-class SolveResult(msgspec.Struct, frozen=True, kw_only=True):
-    """Result returned from com_worker.py via JSON stdout."""
-    status: str               # SolveStatus value
-    solved_values: dict[str, float | str | None]
-    iterations_used: int
-    duration_sec: float
-    saved_to: str | None = None
-    error: str | None = None
 
 
 # ---------------------------------------------------------------------------

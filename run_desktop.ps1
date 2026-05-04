@@ -9,5 +9,5 @@ if (-not (Test-Path $wb)) {
 }
 
 Set-Location $repo
-python -u solve_via_macro.py $wb --timeout 5400
+python -u -m dn38_solver.cli $wb --timeout 5400
 Read-Host "Done. Press Enter to close"

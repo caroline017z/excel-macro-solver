@@ -298,8 +298,6 @@ Outstanding integration opportunities after this pass:
 | `SolveHeadless.bas` | VBA macro (headless, deterministic recalc, telemetry) | Active |
 | `import_vba_module.py` | Injects VBA into any workbook | Working |
 | `dn38_solver/com/direct_runner.py` | Direct COM execution, telemetry + heartbeat ingestion | Working |
-| `dn38_solver/com/launcher.py` | Subprocess launcher (legacy, replaced) | Deprecated |
-| `com_worker.py` | Subprocess COM worker (legacy, replaced) | Deprecated |
 | `dn38_solver/solver/orchestrator.py` | Main solve loop, result parsing | Working |
 | `dn38_solver/solver/sequence.py` | GoalSeek task builder | Working |
 | `dn38_solver/shadow/reader.py` | openpyxl workbook reader | Working |

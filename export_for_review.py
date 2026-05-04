@@ -22,8 +22,8 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, Alignment
 
-from config import DB_PATH, OUTPUT_ROWS, PROJECT_NAME_ROW, PROJECT_TOGGLE_ROW
-from db import get_connection, get_batch_runs, get_latest_run, get_runs
+from dn38_solver.config import DB_PATH, OUTPUT_ROWS, PROJECT_NAME_ROW, PROJECT_TOGGLE_ROW
+from dn38_solver.storage.database import get_connection, get_batch_runs, get_latest_run, get_runs
 
 
 # Row-label mapping (macro runner output labels -> Project Inputs row numbers)
