@@ -14,8 +14,10 @@ from pathlib import Path
 from dn38_solver.types import (
     ProjectInfo,
     ProjectResult,
+    RELAXED_LEGEND,
     RunRecord,
     SolveStatus,
+    convergence_label,
 )
 from dn38_solver.config import (
     OUTPUT_ROWS,
@@ -297,12 +299,19 @@ def solve_all(
         pr = _parse_project_result(project, raw)
         project_results.append(pr)
 
+        meta = raw.get("meta") or {}
+        # The chunked path hardcodes raw["duration_sec"]=0; the real per-
+        # project time is captured by VBA in __SolverResults!M (surfaced
+        # as meta["solve_seconds"]). Fall back to raw["duration_sec"] for
+        # the single-shot path's batch-level number.
+        solve_secs = meta.get("solve_seconds") or raw.get("duration_sec") or 0.0
+
         match raw.get("status"):
             case SolveStatus.CONVERGED.value:
                 # tier is always "strict" here (status=converged implies
                 # bConverged from VBA, which only fires on strict).
                 log.info("  %s: CONVERGED in %d iter (%.1fs)",
-                         pr.name, pr.iterations, raw.get("duration_sec", 0))
+                         pr.name, pr.iterations, solve_secs)
             case SolveStatus.NOT_CONVERGED.value:
                 # Distinguish relaxed-tier hits from genuine non-convergence
                 # so the log reflects what's actually investment-grade vs.
@@ -310,7 +319,7 @@ def solve_all(
                 if pr.convergence_tier == "relaxed":
                     log.info(
                         "  %s: CONVERGED (relaxed) in %d iter (%.1fs)",
-                        pr.name, pr.iterations, raw.get("duration_sec", 0),
+                        pr.name, pr.iterations, solve_secs,
                     )
                 else:
                     log.warning("  %s: NOT CONVERGED after %d iter", pr.name, pr.iterations)
@@ -321,7 +330,6 @@ def solve_all(
                  pr.npp_per_w or 0, pr.dev_fee_per_w or 0,
                  pr.fmv_per_w or 0, pr.dscr_multiple or 0)
 
-        meta = raw.get("meta") or {}
         phase_secs = (
             meta.get("calc_secs_dscr"),
             meta.get("calc_secs_npp"),
@@ -428,12 +436,17 @@ def solve_all(
     log.info("  %-28s %10s %10s %10s %8s %12s",
              "Project", "NPP $/W", "Dev Fee", "FMV", "DSCR", "Status")
     log.info("  %s %s %s %s %s %s", "-"*28, "-"*10, "-"*10, "-"*10, "-"*8, "-"*12)
+    has_relaxed = False
     for r in project_results:
         npp = f"${r.npp_per_w:.3f}" if r.npp_per_w is not None else "\u2014"
         dev = f"${r.dev_fee_per_w:.3f}" if r.dev_fee_per_w is not None else "\u2014"
         fmv = f"${r.fmv_per_w:.3f}" if r.fmv_per_w is not None else "\u2014"
         dscr = f"{r.dscr_multiple:.2f}x" if r.dscr_multiple is not None else "\u2014"
-        stat = "OK" if r.converged else "CHECK"
+        stat = convergence_label(r)
+        if stat == "OK*":
+            has_relaxed = True
         log.info("  %-28s %10s %10s %10s %8s %12s", r.name, npp, dev, fmv, dscr, stat)
+    if has_relaxed:
+        log.info("  %s", RELAXED_LEGEND)
 
     return record

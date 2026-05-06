@@ -107,6 +107,29 @@ class RunRecord(msgspec.Struct, frozen=True, kw_only=True):
     id: int | None = None
 
 
+def convergence_label(p: ProjectResult) -> str:
+    """Render a project's convergence outcome for terminal tables.
+
+    Strict converged -> OK
+    Relaxed-tier (within +/-1pp / 5x tol, --allow-relaxed-eligible) -> OK*
+    Otherwise -> CHECK
+
+    Callers that print a table should follow with a one-line legend below
+    when any OK* labels appear so the asterisk is self-documenting.
+    """
+    if p.convergence_tier == "strict":
+        return "OK"
+    if p.convergence_tier == "relaxed":
+        return "OK*"
+    return "CHECK"
+
+
+RELAXED_LEGEND = (
+    "OK* = relaxed tier (equity +/-1pp, gaps <= 5x tol; "
+    "--allow-relaxed-eligible)"
+)
+
+
 # ---------------------------------------------------------------------------
 # Diff reporting
 # ---------------------------------------------------------------------------

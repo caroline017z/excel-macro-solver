@@ -20,24 +20,12 @@ from dn38_solver.storage.database import (
     get_connection,
     get_runs,
 )
-from dn38_solver.types import ProjectResult, SolveStatus
-
-
-def _convergence_label(p: ProjectResult) -> str:
-    """Render a project's convergence outcome for the CLI tables.
-
-    Strict converged -> OK
-    Relaxed-tier (within +/-1pp / 5x tol, --allow-relaxed-eligible) -> OK*
-    Otherwise -> CHECK
-
-    Each formatter prints a one-line legend below its table when any
-    OK* labels appear so the asterisk is self-documenting.
-    """
-    if p.convergence_tier == "strict":
-        return "OK"
-    if p.convergence_tier == "relaxed":
-        return "OK*"
-    return "CHECK"
+from dn38_solver.types import (
+    ProjectResult,
+    RELAXED_LEGEND,
+    SolveStatus,
+    convergence_label,
+)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -78,12 +66,12 @@ def _show_checkpoints(batch_id: str) -> None:
         dev = f"${p.dev_fee_per_w:.3f}" if p.dev_fee_per_w is not None else "—"
         dscr = f"{p.dscr_multiple:.3f}x" if p.dscr_multiple is not None else "—"
         eq = f"{p.equity_pct*100:.2f}%" if p.equity_pct is not None else "—"
-        conv = _convergence_label(p)
+        conv = convergence_label(p)
         if conv == "OK*":
             has_relaxed = True
         print(f"  {p.name[:32]:<32} {p.col:>4} {npp:>10} {dev:>10} {dscr:>9} {eq:>7} {conv:>6}")
     if has_relaxed:
-        print("  OK* = relaxed tier (equity +/-1pp, gaps <= 5x tol; --allow-relaxed-eligible)")
+        print(f"  {RELAXED_LEGEND}")
 
 
 def _show_history(limit: int = 20) -> None:
@@ -111,13 +99,13 @@ def _show_history(limit: int = 20) -> None:
         for p in r.projects:
             npp = f"${p.npp_per_w:.3f}" if p.npp_per_w else "—"
             dev = f"${p.dev_fee_per_w:.3f}" if p.dev_fee_per_w else "—"
-            stat = _convergence_label(p)
+            stat = convergence_label(p)
             if stat == "OK*":
                 has_relaxed = True
             print(f"    {p.name:<26} NPP={npp:>8}  DevFee={dev:>8}  [{stat}]")
 
     if has_relaxed:
-        print("  OK* = relaxed tier (equity +/-1pp, gaps <= 5x tol; --allow-relaxed-eligible)")
+        print(f"  {RELAXED_LEGEND}")
 
 
 def main() -> None:
@@ -155,8 +143,12 @@ def main() -> None:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=600,
-        help="Solver macro timeout threshold in seconds (default: 600)",
+        default=1800,
+        help=(
+            "Solver macro timeout threshold in seconds (default: 1800). "
+            "Real portfolios run 700-1200s on the chunked path; the threshold "
+            "fires the run-level error status post-hoc, not an in-flight cancel."
+        ),
     )
     parser.add_argument(
         "--batch-id",
