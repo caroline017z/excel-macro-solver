@@ -181,8 +181,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Treat projects that hit the relaxed convergence band "
-            "(equity +/-1pp, gaps <= 5x tol) as converged in the run "
-            "record. Default: strict only."
+            "(equity +/-0.5pp, gaps <= 5x tol) as converged in the run "
+            "record. Default: strict only (+/-0.25pp)."
         ),
     )
     parser.add_argument(

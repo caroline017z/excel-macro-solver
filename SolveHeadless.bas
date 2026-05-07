@@ -30,14 +30,14 @@ Private Const MAX_GS_RETRY_WARM As Integer = 3
 Private Const MAX_GS_RETRY_COLD As Integer = 6
 Private Const GS_MAXITER_WARM   As Integer = 200
 Private Const GS_MAXITER_COLD   As Integer = 1000
-Private Const EQUITY_FINAL_TOL  As Double = 0.005
-Private Const EQUITY_RELAXED_TOL As Double = 0.010   ' +/-1.0pp band; investment-grade but outside strict
+Private Const EQUITY_FINAL_TOL  As Double = 0.0025   ' +/-0.25pp = 25bps off 10% min equity target
+Private Const EQUITY_RELAXED_TOL As Double = 0.005   ' +/-0.5pp band; investment-grade but outside strict
 Private Const RELAXED_GAP_FACTOR As Double = 5#       ' inner gaps must be <= 5x tol to count as relaxed
 Private Const IRR_TOLERANCE     As Double = 0.0003
 Private Const APPR_TOLERANCE    As Double = 0.0003
 Private Const DSCR_MIN          As Double = 0.25
 Private Const DSCR_MAX          As Double = 3#
-Private Const PROJECT_TIMEOUT_SECONDS As Double = 600
+Private Const PROJECT_TIMEOUT_SECONDS As Double = 1200   ' 20 min hard cap per project — catches runaway tier-3 escalations
 Private Const COL_SCAN_LIMIT    As Integer = 60
 
 ' Sanity bounds for NPP / Dev Fee — GoalSeek is unconstrained Newton-style
@@ -149,8 +149,8 @@ Private Sub ResetSolverResultsHL(ByVal wsRes As Worksheet)
 End Sub
 
 ' Classify a project's outcome based on its final equity, IRR gap, and Appr gap.
-' Strict: equity within +/-0.5pp AND both inner gaps within tight tolerance.
-' Relaxed: equity within +/-1.0pp AND both inner gaps within 5x tolerance.
+' Strict: equity within +/-0.25pp AND both inner gaps within tight tolerance.
+' Relaxed: equity within +/-0.5pp AND both inner gaps within 5x tolerance.
 ' None: anything else. Strict beats relaxed; relaxed beats none.
 '
 ' This is a classification helper only -- it does not affect bConverged.
@@ -321,6 +321,18 @@ Private Sub ResetPhaseTelemetryHL()
     mCalcSecsAppr = 0
     mCalcSecsFull = 0
 End Sub
+
+' Per-project elapsed seconds, robust to VBA Timer's midnight rollover.
+' Timer returns seconds since midnight (0..86400); subtraction goes
+' negative when the solve crosses 00:00:00. Without correction, the
+' per-project timeout check below fails and a runaway project can grind
+' for hours. Add 86400 once if Timer wrapped (single-day budgets only).
+Private Function ProjectElapsedHL(ByVal dStart As Double) As Double
+    Dim dEl As Double
+    dEl = Timer - dStart
+    If dEl < 0 Then dEl = dEl + 86400
+    ProjectElapsedHL = dEl
+End Function
 
 Private Sub ResetCalcTierHL()
     mCalcTier = 1
@@ -535,7 +547,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     iActualIters = 0
 
     For iIter = 1 To MAX_ITER
-        If Timer - dSolveStart > PROJECT_TIMEOUT_SECONDS Then
+        If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then
             iActualIters = iIter - 1
             Exit For
         End If
@@ -554,6 +566,8 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         dPrevDevFee = -999#
 
         For iInner = 1 To iGSRetry
+            If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then Exit For
+
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
             CalcForPhase PHASE_NPP
 
@@ -562,7 +576,16 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
             dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
             dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
-            If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+            If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then
+                ' Phase scopes can leave F37 reading a stale NPP Calc!H453.
+                ' Validate against full propagation before declaring conv-
+                ' ergence — Application.CalculateFull is the only call that
+                ' reliably re-evaluates cross-sheet OFFSET-via-F2 chains.
+                Application.CalculateFull
+                dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+                dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+                If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+            End If
 
             ' Slope-stall break: GoalSeek made no measurable progress on
             ' either changing cell vs. the prior retry. Further retries at
@@ -591,7 +614,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
             iActualIters = iIter
             Exit For
         End If
-        ' Relaxed-tier early exit: equity within +/-1pp and inner gaps
+        ' Relaxed-tier early exit: equity within +/-0.5pp and inner gaps
         ' within 5x tolerance is investment-grade. Skip the remaining
         ' outer iterations -- they rarely tighten further. bConverged
         ' stays False so column I keeps strict-only semantics; column T
@@ -638,6 +661,23 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' Exit For the assignment inside the loop already captured the count.
     If iActualIters = 0 Then iActualIters = MAX_ITER
 
+    ' Force full propagation so dIRRGap / dApprGap below are measured against
+    ' the truly-converged F37 / F31, not stale phase-scoped values.
+    Application.CalculateFull
+    dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+    dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+
+    ' Snapshot the converged F37 / F31 directly into the project's row 37
+    ' and row 31 cache cells as HARD VALUES. The original IF-formula cache
+    ' (=IF(colN_2=$F$2, $F$37, colN_37)) was unreliable -- it latched
+    ' transients during phase-scoped recalcs. Hard values guarantee the
+    ' user-visible cells reflect the converged state. The source workbook
+    ' on Box / OneDrive is unaffected because direct_runner.run_direct
+    ' opens a temp copy; only the saved _SOLVED.xlsm gets the hard values.
+    ' Re-running the macro re-overwrites with the new converged values.
+    wsPI.Cells(37, colIdx).Value = rIRRLive.Value
+    wsPI.Cells(31, colIdx).Value = rApprLive.Value
+
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
     wsRes.Cells(resultsRow, 3).Value = rDSCR.Value
@@ -650,7 +690,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     wsRes.Cells(resultsRow, 10).Value = mCalcTier
     wsRes.Cells(resultsRow, 11).Value = iGSRetry
     wsRes.Cells(resultsRow, 12).Value = IIf(bColdMode, "cold", "warm")
-    wsRes.Cells(resultsRow, 13).Value = Round(Timer - dSolveStart, 4)
+    wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
     wsRes.Cells(resultsRow, 14).Value = CStr(Now)
     wsRes.Cells(resultsRow, 15).Value = Round(mCalcSecsDSCR, 4)
     wsRes.Cells(resultsRow, 16).Value = Round(mCalcSecsNPP, 4)
@@ -789,6 +829,10 @@ Public Sub SolveHeadless()
         End If
 
         For iIter = 1 To MAX_ITER
+            If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then
+                iActualIters = iIter - 1
+                Exit For
+            End If
 
             ' Step 1: HoldCo OFF + recalc
             rHoldCo.Value = 0
@@ -811,6 +855,8 @@ Public Sub SolveHeadless()
             ' Sequential (not batched) ensures each GoalSeek sees fresh recalc
             ' values — critical for cold-start solves with seed values far from optimal.
             For iInner = 1 To iGSRetry
+                If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then Exit For
+
                 bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
                 If rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then rNPP.Value = NPP_SEED
                 CalcForPhase PHASE_NPP
@@ -821,7 +867,15 @@ Public Sub SolveHeadless()
 
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
                 dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
-                If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+                If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then
+                    ' Phase scopes can leave F37 reading a stale NPP Calc!H453.
+                    ' Validate against full propagation before declaring conv-
+                    ' ergence.
+                    Application.CalculateFull
+                    dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+                    dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+                    If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
+                End If
 
                 ' Slope-stall break: GoalSeek made no measurable progress on
                 ' either changing cell vs. the prior retry. Further retries at
@@ -852,7 +906,7 @@ Public Sub SolveHeadless()
                 iActualIters = iIter
                 Exit For
             End If
-            ' Relaxed-tier early exit: equity within +/-1pp and inner gaps
+            ' Relaxed-tier early exit: equity within +/-0.5pp and inner gaps
             ' within 5x tolerance is investment-grade. Skip the remaining
             ' outer iterations -- they rarely tighten further. bConverged
             ' stays False so column I keeps strict-only semantics; column T
@@ -900,6 +954,20 @@ Public Sub SolveHeadless()
         ' Exit For the assignment inside the loop already captured the count.
         If iActualIters = 0 Then iActualIters = MAX_ITER
 
+        ' Force full propagation so dIRRGap / dApprGap below are measured
+        ' against the truly-converged F37 / F31, not stale phase-scoped
+        ' values.
+        Application.CalculateFull
+        dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+        dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+
+        ' Snapshot the converged F37 / F31 directly into the project's row
+        ' 37 and row 31 cache cells as HARD VALUES. See SolveOneProjectByColHL
+        ' for the rationale. Source workbook on Box / OneDrive is unaffected
+        ' (direct_runner opens a temp copy); only _SOLVED.xlsm gets these.
+        wsPI.Cells(37, colIdx).Value = rIRRLive.Value
+        wsPI.Cells(31, colIdx).Value = rApprLive.Value
+
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)
         wsRes.Cells(i + 1, 3).Value = rDSCR.Value
@@ -912,7 +980,7 @@ Public Sub SolveHeadless()
         wsRes.Cells(i + 1, 10).Value = mCalcTier
         wsRes.Cells(i + 1, 11).Value = iGSRetry
         wsRes.Cells(i + 1, 12).Value = IIf(bColdMode, "cold", "warm")
-        wsRes.Cells(i + 1, 13).Value = Round(Timer - dSolveStart, 4)
+        wsRes.Cells(i + 1, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
         wsRes.Cells(i + 1, 14).Value = CStr(Now)
         wsRes.Cells(i + 1, 15).Value = Round(mCalcSecsDSCR, 4)
         wsRes.Cells(i + 1, 16).Value = Round(mCalcSecsNPP, 4)
