@@ -858,16 +858,25 @@ def _verify_merged_file(
 
         # Read all hard-stamped rows in a single iter_rows pass so we don't
         # pay openpyxl's per-cell re-iteration cost N × 6 times on big
-        # portfolios. Indexed by (row, col) -> cell value.
+        # portfolios. Use values_only=True with manual row/col indexing —
+        # values_only=False returns EmptyCell stubs for blank cells in
+        # read_only mode and EmptyCell does NOT have .row / .column
+        # attributes (it's a value-less placeholder), which crashed the
+        # verifier on the SMP WalkTEST. Indexed by (row, col) -> value.
         cell_values: dict[tuple[int, int], object] = {}
-        for r in ws.iter_rows(
-            min_row=min(HARD_STAMPED_ROWS),
+        first_row = min(HARD_STAMPED_ROWS)
+        for row_offset, row_values in enumerate(ws.iter_rows(
+            min_row=first_row,
             max_row=max(HARD_STAMPED_ROWS),
-            values_only=False,
-        ):
-            for cell in r:
-                if cell.row in HARD_STAMPED_ROWS:
-                    cell_values[(cell.row, cell.column)] = cell.value
+            values_only=True,
+        )):
+            actual_row = first_row + row_offset
+            if actual_row not in HARD_STAMPED_ROWS:
+                continue
+            for col_offset, value in enumerate(row_values):
+                # iter_rows with values_only starts at column 1 (A); offset
+                # is zero-based, so add 1 to get openpyxl's 1-based column.
+                cell_values[(actual_row, col_offset + 1)] = value
 
         cells_checked = 0
         for tasks_slice in partitions:
