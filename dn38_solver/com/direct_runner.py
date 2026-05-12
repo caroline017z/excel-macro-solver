@@ -19,6 +19,15 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple
 
+from dn38_solver.com.vba_contract import (
+    FINALIZE_SOLVE_ENV,
+    INIT_SOLVE_ENV,
+    SET_SKIP_OUTPUT_RECALC,
+    SOLVE_HEADLESS,
+    SOLVE_ONE_PROJECT_BY_COL,
+    SWITCH_PROJECT_AND_RECALC,
+    vba_call_str,
+)
 from dn38_solver.config import BASE_COL
 from dn38_solver.convert import safe_float, safe_str_or_float, safe_value
 from dn38_solver.shadow.validation import scan_workbook_errors
@@ -343,7 +352,7 @@ def run_direct(
         if skip_output_recalc:
             try:
                 excel.Application.Run(
-                    f"'{wb.Name}'!SetSkipOutputRecalcHL",
+                    vba_call_str(wb.Name, SET_SKIP_OUTPUT_RECALC),
                     True,
                 )
                 log.info("  Output-sheet recalc disabled for this run")
@@ -445,7 +454,7 @@ def run_direct(
             if has_switch:
                 try:
                     excel.Application.Run(
-                        f"'{wb.Name}'!SwitchProjectAndRecalc",
+                        vba_call_str(wb.Name, SWITCH_PROJECT_AND_RECALC),
                         nt.offset,
                     )
                     switched_with_recalc = True
@@ -513,7 +522,7 @@ def run_direct(
         if norm_tasks and has_switch:
             with contextlib.suppress(Exception):
                 excel.Application.Run(
-                    f"'{wb.Name}'!SwitchProjectAndRecalc",
+                    vba_call_str(wb.Name, SWITCH_PROJECT_AND_RECALC),
                     int(original_f2),
                 )
 
@@ -705,7 +714,7 @@ def _run_chunked(
     macro_used = "SolveHeadless"  # The chunked entry points live in this module
     has_switch = True
     try:
-        excel.Application.Run(f"'{wb.Name}'!InitSolveEnvHL")
+        excel.Application.Run(vba_call_str(wb.Name, INIT_SOLVE_ENV))
     except Exception as e:
         return macro_used, has_switch, f"InitSolveEnvHL failed: {e}"
 
@@ -726,7 +735,7 @@ def _run_chunked(
         )
         try:
             excel.Application.Run(
-                f"'{wb.Name}'!SolveOneProjectByColHL",
+                vba_call_str(wb.Name, SOLVE_ONE_PROJECT_BY_COL),
                 int(col_idx),
                 str(nt.name),
                 int(results_row),
@@ -756,7 +765,7 @@ def _run_chunked(
     # sheets, so we always try to call it even after a per-project error.
     try:
         excel.Application.Run(
-            f"'{wb.Name}'!FinalizeSolveEnvHL",
+            vba_call_str(wb.Name, FINALIZE_SOLVE_ENV),
             int(original_f2),
         )
     except Exception as e:
