@@ -183,6 +183,36 @@ Private Sub WriteHeartbeatHL(ByVal wsRes As Worksheet, ByVal heartbeatText As St
     wsRes.Range("N1").Value = heartbeatText
 End Sub
 
+' ==============================================================================
+'  INTERNAL: Safe formula -> constant via cell-self-assign.
+'  Refuses to stamp Excel error values (#DIV/0!, #VALUE!, #N/A, etc.) into
+'  the target cell. Without this guard the self-assign would freeze the
+'  error string into the saved workbook; the post-merge sanity gate then
+'  string-skips it (non-numeric expected -> silent skip in earlier code,
+'  now a flagged finding) and Caroline ships an IC-facing column with
+'  #DIV/0! visible. On error encounter we leave the formula in place and
+'  append an audit row to __SolverResults so the operator can trace which
+'  cell was skipped and which project / call site was responsible.
+' ==============================================================================
+Private Sub HardStampNumericHL(ByVal ws As Worksheet, _
+                                ByVal r As Long, _
+                                ByVal c As Long, _
+                                ByVal context As String)
+    Dim v As Variant
+    v = ws.Cells(r, c).Value
+    If IsError(v) Then
+        Dim wsRes As Worksheet
+        Set wsRes = EnsureSolverResultsSheetHL()
+        Dim auditRow As Long
+        auditRow = wsRes.Cells(wsRes.Rows.Count, "A").End(xlUp).Row + 1
+        wsRes.Cells(auditRow, 2).Value = "stamp_skipped:" & context & _
+            ":r" & r & "c" & c & ":" & CStr(v)
+        wsRes.Cells(auditRow, 14).Value = CStr(Now)
+        Exit Sub
+    End If
+    ws.Cells(r, c).Value = v
+End Sub
+
 
 ' ==============================================================================
 '  INTERNAL HELPERS
@@ -790,19 +820,19 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' but the FMV formula sometimes returns wrong values if dependencies
     ' span unsolved-by-this-worker projects. Convert to a hard value at
     ' solve-time when this project IS the active one and all its
-    ' upstream cells are converged. Cell-self-assign reads the calc'd
-    ' value (right side) and writes it as a constant (left side) — the
-    ' canonical VBA formula-to-value idiom.
-    wsPI.Cells(33, colIdx).Value = wsPI.Cells(33, colIdx).Value
+    ' upstream cells are converged. HardStampNumericHL refuses to stamp
+    ' Excel error values so a mid-solve #DIV/0! doesn't get frozen into
+    ' the IC-facing column.
+    HardStampNumericHL wsPI, 33, colIdx, "SOPBC"
     ' Rows 32 (Dev Fee), 38 (NPP $/W) are GoalSeek changing-cells, so
     ' they hold numeric values already; the self-assign is a no-op
     ' but cheap and keeps treatment uniform. Row 39 (NPP $) is typically
     ' a formula like =N38*MWdc and may pick up cross-project state via
     ' the MWdc lookup chain — explicitly hard-stamp to be safe. QA review
     ' flagged these as exposed to the same class of bug FMV had.
-    wsPI.Cells(32, colIdx).Value = wsPI.Cells(32, colIdx).Value
-    wsPI.Cells(38, colIdx).Value = wsPI.Cells(38, colIdx).Value
-    wsPI.Cells(39, colIdx).Value = wsPI.Cells(39, colIdx).Value
+    HardStampNumericHL wsPI, 32, colIdx, "SOPBC"
+    HardStampNumericHL wsPI, 38, colIdx, "SOPBC"
+    HardStampNumericHL wsPI, 39, colIdx, "SOPBC"
 
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
@@ -1094,12 +1124,13 @@ Public Sub SolveHeadless()
         wsPI.Cells(37, colIdx).Value = rIRRLive.Value
         wsPI.Cells(31, colIdx).Value = rApprLive.Value
         ' Rows 33 (FMV), 32 (Dev Fee), 38 (NPP $/W), 39 (NPP $) — same
-        ' rationale as SolveOneProjectByColHL. QA review flagged 32/38/39
-        ' as exposed to the same class of bug FMV had.
-        wsPI.Cells(33, colIdx).Value = wsPI.Cells(33, colIdx).Value
-        wsPI.Cells(32, colIdx).Value = wsPI.Cells(32, colIdx).Value
-        wsPI.Cells(38, colIdx).Value = wsPI.Cells(38, colIdx).Value
-        wsPI.Cells(39, colIdx).Value = wsPI.Cells(39, colIdx).Value
+        ' rationale as SolveOneProjectByColHL. HardStampNumericHL refuses
+        ' to stamp Excel error values so a mid-solve #DIV/0! doesn't
+        ' freeze into the IC-facing column.
+        HardStampNumericHL wsPI, 33, colIdx, "SHmain"
+        HardStampNumericHL wsPI, 32, colIdx, "SHmain"
+        HardStampNumericHL wsPI, 38, colIdx, "SHmain"
+        HardStampNumericHL wsPI, 39, colIdx, "SHmain"
 
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)

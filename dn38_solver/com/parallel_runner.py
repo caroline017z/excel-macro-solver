@@ -40,6 +40,10 @@ from typing import Sequence
 
 import msgspec
 
+from dn38_solver.com.cleanup import (
+    kill_excel_children,
+    kill_excel_children_for_handle,
+)
 from dn38_solver.types import SolveTask
 
 log = logging.getLogger(__name__)
@@ -121,11 +125,83 @@ def _partition_round_robin(
     return slices
 
 
-def _kill_worker_excel_children(worker_pid: int) -> None:
-    """Terminate any EXCEL.EXE under a worker PID. No-op if psutil missing."""
-    from dn38_solver.com.cleanup import kill_excel_children
+def _kill_worker_excel_children(worker_pid: int, handle=None) -> None:
+    """Terminate any EXCEL.EXE under a worker. No-op if psutil missing.
+
+    Prefers a `psutil.Process` handle captured at spawn time (defeats PID
+    reuse races on Windows after the worker has exited); falls back to
+    PID-based lookup when no handle is available.
+    """
     with contextlib.suppress(Exception):
-        kill_excel_children(worker_pid)
+        if handle is not None:
+            kill_excel_children_for_handle(handle)
+        else:
+            kill_excel_children(worker_pid)
+
+
+def _sweep_old_parent_tmps() -> None:
+    """Delete `38dn_parallel_*` dirs in %TEMP% older than the retention window.
+
+    Errored parallel runs are preserved for forensics, but Windows %TEMP%
+    is rarely auto-cleaned and each preserved dir holds N copies of the
+    workbook (~50–200MB each). After a few weeks of failures this silently
+    consumes tens of GB. Sweep on every run-start so the disk cost is
+    bounded by the retention window.
+
+    Retention defaults to 7 days; override with DN38_TMP_RETENTION_DAYS=N.
+    Failures are swallowed silently — disk hygiene must never block the
+    user's actual solve.
+    """
+    try:
+        days_raw = os.environ.get("DN38_TMP_RETENTION_DAYS", "7")
+        days = max(0, int(days_raw))
+    except ValueError:
+        days = 7
+    if days == 0:
+        return  # 0 = retain forever (escape hatch)
+    cutoff = time.time() - (days * 86400)
+    swept = 0
+    swept_bytes = 0
+    try:
+        tmpdir = Path(tempfile.gettempdir())
+    except Exception:
+        return
+    for entry in tmpdir.glob("38dn_parallel_*"):
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        # Best-effort byte count for the log line; cheap recursive glob
+        # and we already know the entry is going to be deleted.
+        try:
+            for f in entry.rglob("*"):
+                if f.is_file():
+                    swept_bytes += f.stat().st_size
+        except OSError:
+            pass
+        with contextlib.suppress(OSError):
+            shutil.rmtree(entry)
+            swept += 1
+    if swept:
+        log.info(
+            "  Swept %d old parent_tmp dir(s) (~%d MB freed, retention=%dd)",
+            swept, swept_bytes // (1024 * 1024), days,
+        )
+
+
+def _capture_proc_handle(pid: int):
+    """Best-effort psutil.Process at spawn time. Returns None if psutil
+    missing or process already gone (very tight race we accept silently)."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.Process(pid)
+    except Exception:
+        return None
 
 
 def run_parallel(
@@ -160,13 +236,16 @@ def run_parallel(
         log.warning("Clamping workers from %d to %d (MAX_WORKERS)", workers, n)
 
     start = time.time()
+    _sweep_old_parent_tmps()
     parent_tmp = Path(tempfile.mkdtemp(prefix="38dn_parallel_"))
 
     # Tracked across the try/finally so cleanup can always tear them down,
     # even if Ctrl+C lands mid-spawn or mid-wait. Without this, an interrupt
     # during a 20-minute solve leaves N hidden Excel processes running until
     # the user reboots.
-    procs: list[tuple[int, subprocess.Popen, Path, Path, Path, Path]] = []
+    # Tuple shape: (worker_id, popen, config_path, result_path,
+    #               stdout_path, stderr_path, psutil_handle_or_None)
+    procs: list[tuple] = []
     aggregator = None
     progress = None
     saved_to: str | None = None
@@ -200,6 +279,15 @@ def run_parallel(
         threads_per_worker: int | None = max(2, min(4, cpu // (n * 3)))
     elif excel_threads_per_worker == 0:
         threads_per_worker = None  # signals "no cap" to direct_runner
+    elif excel_threads_per_worker < 0:
+        # Refuse to silently coerce a typo. Without this, `--excel-threads-per-worker -1`
+        # would fall through `> 0` checks in direct_runner and apply no
+        # cap with no log line, leaving the user thinking their flag took
+        # effect. Fail loudly.
+        raise ValueError(
+            f"excel_threads_per_worker must be >= 0 (got {excel_threads_per_worker}); "
+            "use 0 for 'no cap, Excel default' or a positive integer to set the cap"
+        )
     else:
         if excel_threads_per_worker > SANITY_MAX_THREADS:
             log.warning(
@@ -286,18 +374,33 @@ def run_parallel(
             # them. Close our parent-side handles so we don't pin the inode.
             stdout_fh.close()
             stderr_fh.close()
-            procs.append((worker_id, proc, config_path, result_path, stdout_path, stderr_path))
+            # Capture a psutil.Process handle NOW, while we know the PID is
+            # still our worker. Used by cleanup paths after the worker has
+            # exited — psutil's create_time check defeats Windows PID reuse,
+            # so we don't accidentally reap a stranger's Excel children.
+            proc_handle = _capture_proc_handle(proc.pid)
+            procs.append((
+                worker_id, proc, config_path, result_path,
+                stdout_path, stderr_path, proc_handle,
+            ))
 
         # Start the status aggregator. Each worker writes its own status JSON;
         # the aggregator merges them into the canonical `solver_status.json`
         # the Streamlit tracker reads, so dashboards work without changes.
         from dn38_solver.com.direct_runner import STATUS_FILE
         from dn38_solver.com.status_aggregator import StatusAggregator
+        # Pass expected_worker_count explicitly so the aggregator's
+        # "don't roll up to complete until all workers have reported"
+        # guard is wired correctly. Defaulting via len(worker_status_paths)
+        # works today by coincidence (skipped empty slices => same length)
+        # but a future caller passing a different path set would silently
+        # break the gate.
         aggregator = StatusAggregator(
             worker_status_paths=worker_status_paths,
             output_path=STATUS_FILE,
             workbook_path=workbook_path,
             poll_interval=1.0,
+            expected_worker_count=len(procs),
         )
         aggregator.start()
 
@@ -306,7 +409,7 @@ def run_parallel(
         # a 10-20 minute cold solve. Without this the user sees nothing
         # between "Spawning worker N" and "Worker N completed".
         progress = _WorkerLogTailer(
-            sources=[(wid, err_path) for (wid, _, _, _, _, err_path) in procs],
+            sources=[(wid, err_path) for (wid, _, _, _, _, err_path, _) in procs],
             poll_interval=2.0,
         )
         progress.start()
@@ -317,7 +420,8 @@ def run_parallel(
         parent_timeout = max(timeout_sec, 60)
         deadline = time.time() + parent_timeout + 60  # +60s for cleanup grace
 
-        for worker_id, proc, config_path, result_path, stdout_path, stderr_path in procs:
+        for (worker_id, proc, config_path, result_path,
+             stdout_path, stderr_path, proc_handle) in procs:
             remaining = max(1, int(deadline - time.time()))
             try:
                 # stdout/stderr are redirected to files, so communicate()
@@ -328,7 +432,7 @@ def run_parallel(
                     "  Worker %d timeout after %ds — terminating and reaping "
                     "child Excel processes by PID", worker_id, remaining,
                 )
-                _kill_worker_excel_children(proc.pid)
+                _kill_worker_excel_children(proc.pid, handle=proc_handle)
                 proc.terminate()
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.communicate(timeout=10)
@@ -357,7 +461,9 @@ def run_parallel(
 
             if proc.returncode != 0:
                 log.error("  Worker %d exited with code %d", worker_id, proc.returncode)
-                _kill_worker_excel_children(proc.pid)
+                # Use the pinned handle, not the bare PID — the worker has
+                # already exited so the OS may have reused its PID.
+                _kill_worker_excel_children(proc.pid, handle=proc_handle)
                 try:
                     worker_results[worker_id] = json.loads(
                         result_path.read_text(encoding="utf-8")
@@ -526,9 +632,11 @@ def run_parallel(
                     )
                     if mismatches:
                         log.error(
-                            "  Post-merge verification: %d cell mismatch(es) "
-                            "between merged file and worker reports",
-                            len(mismatches),
+                            "  ✗ POST-MERGE VERIFICATION FAILED: "
+                            "%d cell mismatch(es) between merged file and "
+                            "worker reports. DO NOT SHIP %s — use the "
+                            "per-worker outputs in %s instead.",
+                            len(mismatches), saved_to, parent_tmp,
                         )
                         for m in mismatches[:10]:
                             log.error("    %s", m)
@@ -540,7 +648,7 @@ def run_parallel(
                             f"per-worker outputs in {parent_tmp} are authoritative"
                         )
                     else:
-                        log.info("  Post-merge verification: OK")
+                        log.info("  ✓ Post-merge verification: OK")
         else:
             # No worker produced a saved, converged output — nothing to merge.
             # Surface this clearly so the orchestrator marks the run as error
@@ -560,13 +668,13 @@ def run_parallel(
         # KeyboardInterrupt or any unhandled exception during merge. Order
         # matters: kill workers first so their final stderr writes have
         # a chance to land before the tailer stops.
-        for wid, p, _cfg, _res, _out, _err in procs:
+        for wid, p, _cfg, _res, _out, _err, p_handle in procs:
             if p.poll() is None:
                 log.warning(
                     "  Cleanup: terminating worker %d (pid=%d) and its "
                     "Excel children", wid, p.pid,
                 )
-                _kill_worker_excel_children(p.pid)
+                _kill_worker_excel_children(p.pid, handle=p_handle)
                 with contextlib.suppress(Exception):
                     p.terminate()
                 with contextlib.suppress(Exception):
@@ -574,10 +682,22 @@ def run_parallel(
                 if p.poll() is None:
                     with contextlib.suppress(Exception):
                         p.kill()
-        if progress is not None:
+                # Re-reap after kill — TerminateProcess may leave a brief
+                # window where Excel children get re-parented (typically
+                # to init / Session Manager) before they're cleaned up.
+                # Second pass catches them; safe to call when first call
+                # already cleaned everything (returns 0).
+                _kill_worker_excel_children(p.pid, handle=p_handle)
+        # Guard against the "constructed but never started" state — if
+        # an exception fired between StatusAggregator(...) and .start(),
+        # the thread object exists but has no underlying OS thread, and
+        # Thread.join() raises RuntimeError. is_alive() also returns
+        # False after start+exit, so combine with a manual _started flag
+        # check via the standard library attribute (`_started.is_set()`).
+        if progress is not None and progress._started.is_set():
             with contextlib.suppress(Exception):
                 progress.stop(join_timeout=5.0)
-        if aggregator is not None:
+        if aggregator is not None and aggregator._started.is_set():
             with contextlib.suppress(Exception):
                 aggregator.stop(join_timeout=5.0)
 
@@ -606,14 +726,18 @@ def run_parallel(
             float(w.get(key, 0) or 0) for w in worker_results.values()
         )
 
-    # Estimated sequential time = sum of every project's solve_seconds
-    # (from VBA's __SolverResults!M, surfaced as meta["solve_seconds"]).
-    # Comparing the parallel wall time to this gives the actual speedup,
-    # which is more useful than "elapsed vs. previous run" since project
-    # mix differs across runs.
+    # Estimated sequential time = sum of every attempted project's
+    # solve_seconds (from VBA's __SolverResults!M, surfaced as
+    # meta["solve_seconds"]). Comparing the parallel wall time to this
+    # gives the actual speedup, which is more useful than "elapsed vs.
+    # previous run" since project mix differs across runs.
+    # Skip not_attempted explicitly: their meta is empty so they'd
+    # contribute 0, but being explicit keeps the math obvious.
     estimated_sequential = 0.0
     for wresult in worker_results.values():
         for pr in wresult.get("project_results", []):
+            if pr.get("status") == "not_attempted":
+                continue
             meta = pr.get("meta") or {}
             try:
                 estimated_sequential += float(meta.get("solve_seconds") or 0.0)
@@ -639,12 +763,39 @@ def run_parallel(
     }
 
 
+# Per-row tolerance for the post-merge gate. Rows 31/32/33/37/38 are
+# dollar-per-watt or rate values (typical magnitude < $5); 1¢/W slack
+# absorbs openpyxl serialization rounding without missing real bugs.
+# Row 39 is NPP $ total ($ in millions) — 1¢ tolerance there would flag
+# every parallel run on float-roundtrip noise alone, so widen to $1.
+_VERIFY_TOL_BY_ROW: dict[int, float] = {
+    31: 0.01,
+    32: 0.01,
+    33: 0.01,
+    37: 0.01,
+    38: 0.01,
+    39: 1.0,
+}
+
+# How to pull the worker-reported expected value for each hard-stamped
+# row out of `solved_values`. Most rows have per-column entries
+# (`{col}38`, etc.) registered in READ_CELLS_TEMPLATES, but rows 31
+# (Live Appraisal IRR) and 37 (Live IRR) are only captured as the
+# active-project F-column — the VBA hard-stamps the per-column cell
+# at end-of-solve to the same value. Without this map the verifier
+# would silently skip rows 31 and 37 entirely (the bug Backend #1 found
+# in round-2 review).
+def _expected_address_for_row(row: int, col_letter: str) -> str:
+    if row in (31, 37):
+        return f"Project Inputs!F{row}"
+    return f"Project Inputs!{col_letter}{row}"
+
+
 def _verify_merged_file(
     *,
     final_path: Path,
     worker_results: dict[int, dict],
     partitions: list[list[SolveTask]],
-    abs_tol: float = 0.01,
 ) -> list[str]:
     """Re-open the merged xlsm and assert the hard-stamped convergence
     cells match what each worker reported.
@@ -660,9 +811,14 @@ def _verify_merged_file(
     Better to surface the inconsistency at run-end and force the user to
     consult the per-worker outputs.
 
-    Tolerance defaults to $0.01/W since the cells are hard-stamped exact
-    floats (cell-self-assign in VBA), but we leave a small slack for any
-    openpyxl serialization rounding.
+    Tolerance is per-row (see `_VERIFY_TOL_BY_ROW`) so $/W rows and the
+    NPP $ total row aren't held to the same scale.
+
+    The check covers BOTH converged and non-converged projects: a project
+    that didn't converge still got its row 31/32/33/37/38/39 cells
+    hard-stamped by VBA (cell-self-assign in SolveOneProjectByColHL), so
+    a corrupt merge of a non-converged project's column is just as bad
+    as a converged one's.
     """
     import openpyxl
     from openpyxl.utils import column_index_from_string
@@ -700,35 +856,70 @@ def _verify_merged_file(
                     )
                 name_to_result[pname] = pr
 
+        # Read all hard-stamped rows in a single iter_rows pass so we don't
+        # pay openpyxl's per-cell re-iteration cost N × 6 times on big
+        # portfolios. Indexed by (row, col) -> cell value.
+        cell_values: dict[tuple[int, int], object] = {}
+        for r in ws.iter_rows(
+            min_row=min(HARD_STAMPED_ROWS),
+            max_row=max(HARD_STAMPED_ROWS),
+            values_only=False,
+        ):
+            for cell in r:
+                if cell.row in HARD_STAMPED_ROWS:
+                    cell_values[(cell.row, cell.column)] = cell.value
+
+        cells_checked = 0
         for tasks_slice in partitions:
             for task in tasks_slice:
                 pr = name_to_result.get(task.project_name)
                 if pr is None:
                     continue
-                # Only verify converged projects. Non-converged projects
-                # legitimately have stale or missing values in the worker
-                # report, so a mismatch there is meaningless noise.
-                if pr.get("status") != "converged":
+                # Skip projects that were never attempted (worker crashed
+                # before reaching them) — they have no expected value to
+                # check against, and the merged file's cells will reflect
+                # whatever the master had pre-solve.
+                if pr.get("status") == "not_attempted":
                     continue
                 sv = pr.get("solved_values", {})
                 col_idx = column_index_from_string(task.project_col_letter)
                 for row in HARD_STAMPED_ROWS:
-                    expected = sv.get(
-                        f"Project Inputs!{task.project_col_letter}{row}"
+                    expected_key = _expected_address_for_row(
+                        row, task.project_col_letter,
                     )
+                    expected = sv.get(expected_key)
                     if expected is None:
+                        # Worker didn't report this cell at all — happens
+                        # for non-converged projects whose late-stage reads
+                        # legitimately produced None. Skip silently rather
+                        # than treating "no expectation" as a mismatch.
                         continue
                     try:
                         expected_f = float(expected)
                     except (TypeError, ValueError):
+                        # Non-numeric expected value (e.g., worker captured
+                        # an Excel error string like "#DIV/0!"). This is
+                        # itself a finding — flag it so the operator knows
+                        # a pre-existing error is being merged into the
+                        # canonical file.
+                        mismatches.append(
+                            f"{task.project_name} "
+                            f"{task.project_col_letter}{row}: "
+                            f"worker-reported value is non-numeric "
+                            f"({expected!r}); merged file likely contains "
+                            f"the same error — investigate at source"
+                        )
                         continue
-                    actual = ws.cell(row=row, column=col_idx).value
+                    cells_checked += 1
+                    tol = _VERIFY_TOL_BY_ROW.get(row, 0.01)
+                    actual = cell_values.get((row, col_idx))
                     if actual is None:
                         mismatches.append(
                             f"{task.project_name} "
                             f"{task.project_col_letter}{row}: "
-                            f"merged value missing (None); "
-                            f"expected {expected_f:.4f}"
+                            f"merged value is None (cached value missing — "
+                            f"the file may need a one-time interactive "
+                            f"open + save in Excel); expected {expected_f:.4f}"
                         )
                         continue
                     try:
@@ -741,14 +932,16 @@ def _verify_merged_file(
                             f"expected {expected_f:.4f}"
                         )
                         continue
-                    if abs(actual_f - expected_f) > abs_tol:
+                    if abs(actual_f - expected_f) > tol:
                         mismatches.append(
                             f"{task.project_name} "
                             f"{task.project_col_letter}{row}: "
                             f"merged={actual_f:.4f} vs "
                             f"worker-reported={expected_f:.4f} "
-                            f"(diff={actual_f - expected_f:+.4f})"
+                            f"(diff={actual_f - expected_f:+.4f}, tol={tol})"
                         )
+        if not mismatches:
+            log.info("    Verification covered %d cells", cells_checked)
     finally:
         with contextlib.suppress(Exception):
             wb.close()

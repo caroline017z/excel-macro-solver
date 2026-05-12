@@ -90,7 +90,7 @@ class ProjectResult(msgspec.Struct, frozen=True, kw_only=True):
     dscr_multiple: float | None = None
     equity_pct: float | None = None
     converged: bool = False
-    convergence_tier: str = "none"   # "strict" | "relaxed" | "none"
+    convergence_tier: str = "none"   # "strict" | "relaxed" | "none" | "not_attempted"
     iterations: int = 0
 
 
@@ -112,6 +112,7 @@ def convergence_label(p: ProjectResult) -> str:
 
     Strict converged -> OK   (equity within +/-0.25pp of 10% target)
     Relaxed-tier     -> OK*  (within +/-0.5pp / 5x gap tol, --allow-relaxed-eligible)
+    Not attempted    -> SKIP (worker crashed before reaching this project)
     Otherwise        -> CHECK
 
     Callers that print a table should follow with a one-line legend below
@@ -121,6 +122,8 @@ def convergence_label(p: ProjectResult) -> str:
         return "OK"
     if p.convergence_tier == "relaxed":
         return "OK*"
+    if p.convergence_tier == "not_attempted":
+        return "SKIP"
     return "CHECK"
 
 

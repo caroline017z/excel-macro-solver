@@ -6,6 +6,7 @@ This mirrors the VBA macro's approach and avoids cold-start per project.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 import uuid
@@ -72,7 +73,15 @@ def _parse_project_result(
     is_converged = raw.get("status") == SolveStatus.CONVERGED.value
     meta = raw.get("meta") or {}
     tier_raw = meta.get("conv_tier")
-    if isinstance(tier_raw, str) and tier_raw in {"strict", "relaxed", "none"}:
+    if raw.get("status") == "not_attempted":
+        # Worker crashed before reaching this project. Distinguish from
+        # genuine non-convergence so the end-of-run rollup doesn't
+        # overstate the failure rate (and so the speedup math can
+        # exclude these from the wall-time-vs-sequential comparison).
+        tier = "not_attempted"
+    elif isinstance(tier_raw, str) and tier_raw in {
+        "strict", "relaxed", "none", "not_attempted",
+    }:
         tier = tier_raw
     else:
         # Pre-tier rows: infer from strict converged flag so older
@@ -288,17 +297,37 @@ def solve_all(
         # per Issue #8 design — Excel recalcs them on next interactive
         # open since the project-column cells are correct).
         from dn38_solver.com.parallel_runner import run_parallel
-        batch_result = run_parallel(
-            workbook_path=str(workbook_path),
-            tasks=tasks,
-            workers=workers,
-            original_f2=int(original_f2) if original_f2 else 1,
-            timeout_sec=timeout_sec,
-            use_chunked=use_chunked,
-            skip_output_recalc=skip_output_recalc,
-            strip_sheets=strip_sheets,
-            excel_threads_per_worker=excel_threads_per_worker,
-        )
+        try:
+            batch_result = run_parallel(
+                workbook_path=str(workbook_path),
+                tasks=tasks,
+                workers=workers,
+                original_f2=int(original_f2) if original_f2 else 1,
+                timeout_sec=timeout_sec,
+                use_chunked=use_chunked,
+                skip_output_recalc=skip_output_recalc,
+                strip_sheets=strip_sheets,
+                excel_threads_per_worker=excel_threads_per_worker,
+            )
+        except BaseException as exc:
+            # KeyboardInterrupt is BaseException, not Exception — catch
+            # it here so we still close the SQLite connection and emit
+            # a RunRecord(ERROR) instead of leaking conn and dropping
+            # the run from the audit trail. Re-raising would also leave
+            # the user without the batch_id to diagnose with.
+            log.exception("Parallel runner crashed (or interrupted)")
+            with contextlib.suppress(Exception):
+                conn.close()
+            return RunRecord(
+                workbook_name=workbook_path.name,
+                run_timestamp=now_iso(),
+                batch_id=batch_id,
+                solver_mode="hybrid_shadow",
+                projects=(),
+                total_duration_sec=time.time() - start,
+                status=SolveStatus.ERROR.value,
+                error=f"parallel runner failed: {type(exc).__name__}: {exc}",
+            )
         # Persist per-project checkpoints for the parallel path. The chunked
         # single-worker path uses an in-flight checkpoint_callback; parallel
         # workers can't share the parent's SQLite connection across processes,
@@ -502,9 +531,20 @@ def solve_all(
         est_seq = batch_result.get("estimated_sequential_sec")
         if est_seq and total_time > 0:
             speedup = est_seq / total_time
+            # Caveat the speedup line on small portfolios \u2014 fixed startup
+            # cost (worker spawn + Excel open + status threads) dominates
+            # below ~4 projects and the bare number reads as "parallel is
+            # broken" without context.
+            caveat = ""
+            if len(project_results) < 4:
+                caveat = (
+                    "  (small portfolio \u2014 parallel overhead dominates; "
+                    "expect <1x below ~4 projects)"
+                )
             log.info(
-                "  Parallel speedup: %.2fx (%.1fs parallel vs %.1fs estimated sequential)",
-                speedup, total_time, est_seq,
+                "  Parallel speedup: %.2fx "
+                "(%.1fs parallel vs %.1fs estimated sequential)%s",
+                speedup, total_time, est_seq, caveat,
             )
         merge_path = batch_result.get("merge_path")
         if merge_path == "openpyxl":
@@ -517,24 +557,54 @@ def solve_all(
         elif merge_path == "copy_master":
             log.error(
                 "  Merge path: copy_master fallback \u2014 only worker-0's columns "
-                "are converged. Consult per-worker outputs in the temp dir."
+                "are converged. DO NOT SHIP the merged file; use the per-worker "
+                "_SOLVED.xlsm files in the parent_tmp directory (path was logged "
+                "by parallel_runner above) instead."
             )
 
-    if batch_result.get("saved_to"):
-        log.info("  Solved workbook: %s", batch_result["saved_to"])
     log.info("  Run id=%d | Status: %s", row_id, record.status)
+    # Print "Solved workbook" path AFTER status so an ERROR run doesn't
+    # tempt the user to copy the path before noticing the run failed.
+    if batch_result.get("saved_to"):
+        if record.status == SolveStatus.CONVERGED.value:
+            log.info("  Solved workbook: %s", batch_result["saved_to"])
+        else:
+            log.warning(
+                "  Solved workbook (NOT ship-ready, see Status above): %s",
+                batch_result["saved_to"],
+            )
 
     # Convergence-tier rollup so the user sees at a glance how many
     # projects hit strict vs relaxed vs no convergence \u2014 one number per
     # tier rather than scanning the per-project table.
-    tier_counts: dict[str, int] = {"strict": 0, "relaxed": 0, "none": 0}
+    tier_counts: dict[str, int] = {
+        "strict": 0, "relaxed": 0, "none": 0, "not_attempted": 0,
+    }
     for r in project_results:
         tier_counts[r.convergence_tier] = tier_counts.get(r.convergence_tier, 0) + 1
-    log.info(
-        "  Convergence: %d strict / %d relaxed / %d none (of %d total)",
-        tier_counts["strict"], tier_counts["relaxed"], tier_counts["none"],
-        len(project_results),
+    n_total = len(project_results)
+    n_attempted = n_total - tier_counts["not_attempted"]
+    n_ship = tier_counts["strict"] + (
+        tier_counts["relaxed"] if allow_relaxed else 0
     )
+    # Lead with the IC-relevant number \u2014 Caroline's first question is
+    # always "can I send this file?" Tier breakdown follows for context.
+    log.info(
+        "  Ship-ready: %d/%d projects%s",
+        n_ship, n_total,
+        f"  (relaxed counted, --allow-relaxed)" if allow_relaxed else "",
+    )
+    log.info(
+        "  Convergence: %d strict / %d relaxed / %d none / %d not_attempted",
+        tier_counts["strict"], tier_counts["relaxed"],
+        tier_counts["none"], tier_counts["not_attempted"],
+    )
+    if tier_counts["not_attempted"]:
+        log.warning(
+            "  %d project(s) were not attempted \u2014 likely a worker crash "
+            "before that slice; check parent_tmp for forensics.",
+            tier_counts["not_attempted"],
+        )
 
     log.info("=" * 60)
     log.info("  %-28s %10s %10s %10s %8s %12s",
