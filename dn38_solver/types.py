@@ -117,6 +117,36 @@ class RunRecord(msgspec.Struct, frozen=True, kw_only=True):
     id: int | None = None
 
 
+class RunMetrics(msgspec.Struct, frozen=True, kw_only=True):
+    """Sidecar metrics for a solver run.
+
+    Holds the non-RunRecord values surfaced in the end-of-run summary
+    (parallel speedup, merge path, worker count). Persisted to the
+    `solver_run_metrics` table by `dn38_solver.storage.database`, keyed
+    by `run_id` (FK to `solver_runs.id`).
+
+    Why a sidecar struct instead of fields on RunRecord: every run-level
+    signal added since v0.1 has faced the same false choice — bolt onto
+    RunRecord and break the SQLite schema, or leave it in `batch_result`
+    and lose it after the log line. The sidecar pattern lets the stable
+    persistence shape stay stable while runtime-only metrics get their
+    own home and can grow without rippling through every consumer of
+    RunRecord (Streamlit dashboard, --show-checkpoints CLI, etc.).
+
+    `merge_path`: "openpyxl" | "vba_fallback" | "copy_master" | None.
+        None for single-worker runs (run_direct doesn't merge).
+    `workers_used`: clamped count of workers actually spawned.
+    `estimated_sequential_sec`: sum of every attempted project's
+        meta.solve_seconds. Comparing wall time to this gives the actual
+        parallel speedup; > 1 means parallel paid off.
+    """
+    run_id: int
+    workers_used: int
+    merge_path: str | None = None
+    estimated_sequential_sec: float | None = None
+    wall_time_sec: float | None = None
+
+
 def convergence_label(p: ProjectResult) -> str:
     """Render a project's convergence outcome for terminal tables.
 

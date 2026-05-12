@@ -16,6 +16,7 @@ from dn38_solver.types import (
     ProjectInfo,
     ProjectResult,
     RELAXED_LEGEND,
+    RunMetrics,
     RunRecord,
     SolveStatus,
     convergence_label,
@@ -37,6 +38,7 @@ from dn38_solver.storage.database import (
     now_iso,
     save_project_checkpoint,
     save_run,
+    save_run_metrics,
 )
 
 log = logging.getLogger(__name__)
@@ -515,6 +517,23 @@ def solve_all(
         # already written under the same batch_id stay alongside the final
         # RunRecord).
         row_id = save_run(conn, record)
+
+        # Sidecar metrics (merge_path, parallel speedup, worker count).
+        # Must NOT abort the solve on failure — the run is already in
+        # solver_runs; metrics are nice-to-have audit detail. The whole
+        # block is wrapped in try so a schema-version mismatch on an
+        # ancient DB doesn't kill an otherwise-clean run.
+        try:
+            metrics = RunMetrics(
+                run_id=row_id,
+                workers_used=int(batch_result.get("workers_used") or workers or 1),
+                merge_path=batch_result.get("merge_path"),
+                estimated_sequential_sec=batch_result.get("estimated_sequential_sec"),
+                wall_time_sec=round(total_time, 2),
+            )
+            save_run_metrics(conn, metrics)
+        except Exception as metrics_exc:
+            log.warning("RunMetrics persistence failed: %s", metrics_exc)
         if use_chunked and record.status == SolveStatus.CONVERGED.value:
             # Run finished cleanly — drop the per-project checkpoint rows
             # so the audit trail only retains incidents worth keeping.

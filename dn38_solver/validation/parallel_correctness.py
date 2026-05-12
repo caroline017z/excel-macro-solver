@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -72,6 +73,7 @@ class ValidationReport:
     failing_projects: list[str]
     pre_solve_f2: int | None = None
     note: str | None = None  # populated when a non-fatal check fails
+    parallel_merge_path: str | None = None  # from RunMetrics; None for old DBs
 
 
 def _by_name(record: RunRecord) -> dict[str, ProjectResult]:
@@ -190,16 +192,6 @@ def validate_parallel(
     )
 
     log.info("\n[Pass 2] Parallel run (%d workers)...", workers)
-    # NOTE: solve_all returns RunRecord which doesn't currently expose
-    # `merge_path` (the openpyxl / vba_fallback / copy_master tier).
-    # The validator's per-project diff catches a corrupt merge in the
-    # general case (mismatched values fail the tolerance check), but
-    # cannot catch the narrow edge case where a copy_master fallback
-    # happens to coincide with all-projects-on-master (e.g., 1 project
-    # with N=2 round-robin). The orchestrator logs merge_path at ERROR
-    # severity for copy_master, so user-visible regression is preserved
-    # via stderr; plumbing merge_path into ValidationReport requires a
-    # RunRecord schema change deferred to a follow-up.
     par_record = solve_all(
         workbook_path,
         batch_id=par_batch,
@@ -209,6 +201,28 @@ def validate_parallel(
         save_solved=False,
         workers=workers,
     )
+
+    # Read sidecar metrics to surface merge_path in the report. Catches
+    # the narrow edge case the per-project diff misses: a copy_master
+    # fallback that happens to coincide with all-projects-on-master
+    # (e.g., 1 project with N=2 round-robin) would diff clean despite
+    # being structurally compromised. Schema-v3 DBs predate the metrics
+    # table — load_run_metrics returns None there and we skip the check
+    # rather than crashing.
+    par_merge_path: str | None = None
+    if par_record.id is not None:
+        from dn38_solver.storage.database import get_connection, load_run_metrics
+        with closing(get_connection()) as conn:
+            par_metrics = load_run_metrics(conn, par_record.id)
+        if par_metrics is not None:
+            par_merge_path = par_metrics.merge_path
+            if par_merge_path == "copy_master":
+                log.warning(
+                    "  Parallel run used copy_master fallback merge — "
+                    "values may match sequential by coincidence (single "
+                    "worker owned all projects); per-worker outputs in "
+                    "parent_tmp are authoritative."
+                )
 
     seq_by_name = _by_name(seq_record)
     par_by_name = _by_name(par_record)
@@ -238,6 +252,7 @@ def validate_parallel(
         all_pass=not failing,
         failing_projects=failing,
         pre_solve_f2=pre_f2,
+        parallel_merge_path=par_merge_path,
     )
 
 
@@ -254,6 +269,8 @@ def format_report(report: ValidationReport) -> str:
     lines.append(f"  Parallel time:     {report.parallel_duration:.1f}s "
                  f"(batch {report.parallel_batch_id})")
     lines.append(f"  Speedup:           {report.speedup:.2f}x")
+    if report.parallel_merge_path:
+        lines.append(f"  Merge path:        {report.parallel_merge_path}")
     if report.pre_solve_f2 is not None:
         lines.append(f"  Pre-solve F2:      {report.pre_solve_f2}")
     lines.append(f"  Projects compared: {len(report.project_diffs)}")

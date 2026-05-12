@@ -14,11 +14,11 @@ from pathlib import Path
 import msgspec
 
 from dn38_solver.config import DB_PATH
-from dn38_solver.types import ProjectResult, RunRecord
+from dn38_solver.types import ProjectResult, RunMetrics, RunRecord
 
 log = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _CREATE_RUNS = """\
 CREATE TABLE IF NOT EXISTS solver_runs (
@@ -60,6 +60,22 @@ CREATE TABLE IF NOT EXISTS _meta (
 )
 """
 
+# Sidecar table for non-RunRecord run metrics (merge_path, parallel
+# speedup, worker count). Keyed by run_id with FK to solver_runs.id —
+# kept separate from solver_runs so adding new metrics doesn't break
+# the stable RunRecord persistence shape (Streamlit reader, batch_id
+# CLI, audit history).
+_CREATE_RUN_METRICS = """\
+CREATE TABLE IF NOT EXISTS solver_run_metrics (
+    run_id                    INTEGER PRIMARY KEY,
+    workers_used              INTEGER NOT NULL,
+    merge_path                TEXT,
+    estimated_sequential_sec  REAL,
+    wall_time_sec             REAL,
+    FOREIGN KEY (run_id) REFERENCES solver_runs(id) ON DELETE CASCADE
+)
+"""
+
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     """Open (or create) the SQLite database with WAL mode.
@@ -84,6 +100,7 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute(_CREATE_CHECKPOINTS)
     conn.execute(_CREATE_CHECKPOINTS_INDEX)
     conn.execute(_CREATE_META)
+    conn.execute(_CREATE_RUN_METRICS)
     conn.execute(
         "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
         ("schema_version", str(_SCHEMA_VERSION)),
@@ -259,6 +276,65 @@ def clear_project_checkpoints(
     )
     conn.commit()
     return cursor.rowcount or 0
+
+
+def save_run_metrics(
+    conn: sqlite3.Connection,
+    metrics: RunMetrics,
+) -> None:
+    """Persist a RunMetrics sidecar. Idempotent (UPSERT on run_id).
+
+    Called by the orchestrator after `save_run` returns the new run_id.
+    A failure here MUST NOT abort the solve — the run is already saved
+    in solver_runs and the metrics are nice-to-have, not load-bearing.
+    Caller wraps in try/except and logs.warning on failure.
+    """
+    conn.execute(
+        """\
+        INSERT INTO solver_run_metrics
+            (run_id, workers_used, merge_path,
+             estimated_sequential_sec, wall_time_sec)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+            workers_used             = excluded.workers_used,
+            merge_path               = excluded.merge_path,
+            estimated_sequential_sec = excluded.estimated_sequential_sec,
+            wall_time_sec            = excluded.wall_time_sec
+        """,
+        (
+            metrics.run_id,
+            metrics.workers_used,
+            metrics.merge_path,
+            metrics.estimated_sequential_sec,
+            metrics.wall_time_sec,
+        ),
+    )
+    conn.commit()
+
+
+def load_run_metrics(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> RunMetrics | None:
+    """Fetch RunMetrics for a run. Returns None if no metrics row exists.
+
+    Older runs (pre-schema-v4 or single-worker runs that didn't write
+    metrics) legitimately have no row here. Callers should treat None as
+    "metrics unavailable, fall back to log-only output."
+    """
+    row = conn.execute(
+        "SELECT * FROM solver_run_metrics WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return RunMetrics(
+        run_id=row["run_id"],
+        workers_used=row["workers_used"],
+        merge_path=row["merge_path"],
+        estimated_sequential_sec=row["estimated_sequential_sec"],
+        wall_time_sec=row["wall_time_sec"],
+    )
 
 
 def now_iso() -> str:
