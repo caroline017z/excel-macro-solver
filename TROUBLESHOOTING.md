@@ -68,9 +68,10 @@ This was the primary blocker for production use on unsolved workbooks. The core 
 
 ### Remaining Gaps
 
-1. **Chunked execution is not implemented yet** (still single macro invocation for all toggled projects).
-2. **Timeout guard is post-run** (cannot interrupt a blocked COM macro call mid-execution yet).
-3. **Cold-start benchmark validation pending** in a Windows+Excel environment with the canonical workbook fixtures.
+1. **Cold-start end-to-end validation pending** on a real portfolio workbook in a Windows+Excel environment. The engineering is in place (recalc ladder, chunking, telemetry, hard-value F37/F31 snapshot, post-loop CalculateFull validation) but has not been verified against a fresh cold portfolio fixture.
+2. **Timeout guard is post-run** (cannot interrupt a blocked COM macro call mid-execution yet). The chunked path mitigates this in practice because no single COM call exceeds the project-level 20-min cap.
+3. **Adaptive retry on chunk failure** not implemented — a failed `SolveOneProjectByColHL` aborts the remaining chunks rather than reopening Excel and retrying the failed project in cold mode.
+4. **Regression harness with warm/cold/stress fixtures** not implemented — runs are validated ad-hoc rather than against a baseline.
 
 ### The Problem
 
