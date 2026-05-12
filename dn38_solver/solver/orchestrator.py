@@ -109,6 +109,8 @@ def solve_all(
     use_chunked: bool = False,
     allow_relaxed: bool = False,
     save_solved: bool = True,
+    skip_output_recalc: bool = False,
+    strip_sheets: tuple[str, ...] = (),
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
@@ -283,6 +285,8 @@ def solve_all(
         use_chunked=use_chunked,
         checkpoint_callback=_checkpoint if use_chunked else None,
         save_solved=save_solved,
+        skip_output_recalc=skip_output_recalc,
+        strip_sheets=strip_sheets,
     )
 
     # Phase 4: Parse results
