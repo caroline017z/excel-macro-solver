@@ -72,13 +72,26 @@ def main() -> int:
     log = logging.getLogger(__name__)
 
     def _write_terminal_status(phase: str, **extras: object) -> None:
-        """Write a final status JSON so the parent aggregator can tell
-        finished/errored from stalled-mid-solve. Without this, a worker
-        that segfaults or is OS-killed leaves the aggregator reporting
-        phase=solving forever.
+        """Merge a terminal-status payload into the existing status JSON.
+
+        The worker's `_StatusWriter` (inside `run_direct`) already wrote a
+        rich payload with `total_projects`, the per-project list, durations,
+        and the heartbeat string. Naively overwriting that with a stub would
+        zero out everything and the StatusAggregator would report
+        `total_projects=0` / empty projects list at run-end — Streamlit
+        dashboard goes blank. So we read the existing file and only update
+        the keys we care about (phase, status, saved_to, error). If no
+        existing file (worker died before _StatusWriter even ran), we write
+        the stub so the aggregator can still distinguish error from stalled.
         """
         try:
-            payload = {
+            existing: dict = {}
+            try:
+                existing = json.loads(status_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+
+            payload: dict = {
                 "phase": phase,
                 "worker_id": worker_id,
                 "workbook": config.get("workbook_path", ""),
@@ -86,7 +99,11 @@ def main() -> int:
                 "projects": [],
                 "elapsed_sec": 0,
             }
+            payload.update(existing)  # preserve _StatusWriter's rich keys
+            payload["phase"] = phase  # but our terminal phase wins
+            payload["worker_id"] = worker_id
             payload.update(extras)
+
             tmp = status_path.with_suffix(status_path.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
             tmp.replace(status_path)

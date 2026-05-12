@@ -488,9 +488,17 @@ Public Sub StampConvergedValuesHL(ByVal colIdx As Integer, _
     ' Bounds guardrail. Reject anything outside the project-column band
     ' [PI_BASE_COL+1 .. PI_BASE_COL+COL_SCAN_LIMIT] so a corrupted filename
     ' parse in parallel_runner's _merge_via_vba_fallback can't silently
-    ' overwrite the wrong cells.
-    If colIdx < PI_BASE_COL + 1 Then Exit Sub
-    If colIdx > PI_BASE_COL + COL_SCAN_LIMIT Then Exit Sub
+    ' overwrite the wrong cells. Raise Err.Number=5 (invalid procedure
+    ' call) instead of Exit Sub so the parent's Application.Run sees the
+    ' COM exception — a silent skip would let the merge "succeed" while
+    ' actually leaving the master worker's pre-solve values in place for
+    ' that project, which is exactly the silent-corruption mode the merge
+    ' verification gate is designed to catch.
+    If colIdx < PI_BASE_COL + 1 Or colIdx > PI_BASE_COL + COL_SCAN_LIMIT Then
+        Err.Raise 5, "StampConvergedValuesHL", _
+            "colIdx " & colIdx & " out of bounds [" & (PI_BASE_COL + 1) & _
+            ".." & (PI_BASE_COL + COL_SCAN_LIMIT) & "]"
+    End If
 
     Dim wsPI As Worksheet
     Set wsPI = ThisWorkbook.Sheets(SHT_PI)
@@ -786,6 +794,15 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' value (right side) and writes it as a constant (left side) — the
     ' canonical VBA formula-to-value idiom.
     wsPI.Cells(33, colIdx).Value = wsPI.Cells(33, colIdx).Value
+    ' Rows 32 (Dev Fee), 38 (NPP $/W) are GoalSeek changing-cells, so
+    ' they hold numeric values already; the self-assign is a no-op
+    ' but cheap and keeps treatment uniform. Row 39 (NPP $) is typically
+    ' a formula like =N38*MWdc and may pick up cross-project state via
+    ' the MWdc lookup chain — explicitly hard-stamp to be safe. QA review
+    ' flagged these as exposed to the same class of bug FMV had.
+    wsPI.Cells(32, colIdx).Value = wsPI.Cells(32, colIdx).Value
+    wsPI.Cells(38, colIdx).Value = wsPI.Cells(38, colIdx).Value
+    wsPI.Cells(39, colIdx).Value = wsPI.Cells(39, colIdx).Value
 
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
@@ -1076,8 +1093,13 @@ Public Sub SolveHeadless()
         ' (direct_runner opens a temp copy); only _SOLVED.xlsm gets these.
         wsPI.Cells(37, colIdx).Value = rIRRLive.Value
         wsPI.Cells(31, colIdx).Value = rApprLive.Value
-        ' Row 33 (FMV) — same rationale as SolveOneProjectByColHL.
+        ' Rows 33 (FMV), 32 (Dev Fee), 38 (NPP $/W), 39 (NPP $) — same
+        ' rationale as SolveOneProjectByColHL. QA review flagged 32/38/39
+        ' as exposed to the same class of bug FMV had.
         wsPI.Cells(33, colIdx).Value = wsPI.Cells(33, colIdx).Value
+        wsPI.Cells(32, colIdx).Value = wsPI.Cells(32, colIdx).Value
+        wsPI.Cells(38, colIdx).Value = wsPI.Cells(38, colIdx).Value
+        wsPI.Cells(39, colIdx).Value = wsPI.Cells(39, colIdx).Value
 
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)
