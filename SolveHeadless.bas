@@ -350,17 +350,39 @@ Private Sub EscalateCalcTierHL()
 End Sub
 
 Private Sub CalcOutputSheetsHL()
-    ' Honor the Python-controllable skip flag. Set via SetSkipOutputRecalcHL
-    ' before Init / SolveHeadless. Skipping saves 10-30s per run on workbooks
-    ' with heavy Dashboard / Waterfall Sensitivity sheets — Excel will recalc
-    ' them lazily on the next interactive open instead.
+    ' Output sheets split into two groups so the skip flag never starves
+    ' critical downstream tabs:
+    '
+    '   ALWAYS recalc: Dashboard, Table
+    '     -- summary surfaces the deal team relies on every run; per
+    '        Caroline's spec these must reflect the converged state.
+    '
+    '   SKIP-IF-FLAGGED: Portfolio, AT Returns_WIP, Corp Model Output,
+    '                    Cust Prop, Waterfall Sensitivity
+    '     -- portfolio rollups and scenario tabs that the team typically
+    '        inspects separately. Stale state here is acceptable for
+    '        speed; Excel recalcs lazily on next interactive open.
+    '
+    ' mSkipOutputRecalc=True only affects the second group. Set via
+    ' SetSkipOutputRecalcHL from Python before Init / SolveHeadless.
+
+    Dim vAlways As Variant
+    Dim vOptional As Variant
+    Dim vSh As Variant
+
+    vAlways = Array("Dashboard", "Table")
+    For Each vSh In vAlways
+        On Error Resume Next
+        Sheets(CStr(vSh)).EnableCalculation = True
+        Sheets(CStr(vSh)).Calculate
+        On Error GoTo 0
+    Next
+
     If mSkipOutputRecalc Then Exit Sub
 
-    Dim vSheets As Variant
-    Dim vSh     As Variant
-    vSheets = Array("Portfolio", "AT Returns_WIP", "Corp Model Output", _
-                    "Cust Prop", "Dashboard", "Table", "Waterfall Sensitivity")
-    For Each vSh In vSheets
+    vOptional = Array("Portfolio", "AT Returns_WIP", "Corp Model Output", _
+                      "Cust Prop", "Waterfall Sensitivity")
+    For Each vSh In vOptional
         On Error Resume Next
         Sheets(CStr(vSh)).EnableCalculation = True
         Sheets(CStr(vSh)).Calculate

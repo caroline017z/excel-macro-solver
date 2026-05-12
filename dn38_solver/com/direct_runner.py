@@ -192,25 +192,42 @@ def run_direct(
     # original workbook on Box/OneDrive is unaffected — we always operate
     # on a tempfile copy.
     if strip_sheets:
-        try:
-            import openpyxl
-            wb_strip = openpyxl.load_workbook(str(temp_path), keep_vba=True)
-            removed = []
-            for sheet_name in strip_sheets:
-                if sheet_name in wb_strip.sheetnames:
-                    del wb_strip[sheet_name]
-                    removed.append(sheet_name)
-            if removed:
-                wb_strip.save(str(temp_path))
-                log.info("  Stripped %d sheet(s) from temp copy: %s",
-                         len(removed), ", ".join(removed))
-            wb_strip.close()
-        except Exception as strip_exc:
+        # Hard guardrail: refuse to strip sheets the solver / deal team
+        # depend on every run. Even if the user passes one of these names,
+        # silently skip it and log a warning rather than corrupt the run.
+        _CRITICAL_SHEETS = {
+            "Dashboard", "Table", "PT Returns", "NPP Calc", "Appraisal",
+            "Perm Debt", "Tax Equity", "CL", "Project Inputs",
+        }
+        requested = list(strip_sheets)
+        rejected = [s for s in requested if s in _CRITICAL_SHEETS]
+        safe_to_strip = [s for s in requested if s not in _CRITICAL_SHEETS]
+        if rejected:
             log.warning(
-                "Sheet strip failed (%s) — proceeding with full workbook. "
-                "Common cause: a core-sheet formula references the deleted "
-                "sheet, which would create #REF! errors on save.", strip_exc,
+                "Refusing to strip critical sheet(s): %s. These sheets "
+                "must recalc every run. Stripping ignored for these names.",
+                ", ".join(rejected),
             )
+        if safe_to_strip:
+            try:
+                import openpyxl
+                wb_strip = openpyxl.load_workbook(str(temp_path), keep_vba=True)
+                removed = []
+                for sheet_name in safe_to_strip:
+                    if sheet_name in wb_strip.sheetnames:
+                        del wb_strip[sheet_name]
+                        removed.append(sheet_name)
+                if removed:
+                    wb_strip.save(str(temp_path))
+                    log.info("  Stripped %d sheet(s) from temp copy: %s",
+                             len(removed), ", ".join(removed))
+                wb_strip.close()
+            except Exception as strip_exc:
+                log.warning(
+                    "Sheet strip failed (%s) — proceeding with full workbook. "
+                    "Common cause: a core-sheet formula references the deleted "
+                    "sheet, which would create #REF! errors on save.", strip_exc,
+                )
 
     excel = None
     wb = None

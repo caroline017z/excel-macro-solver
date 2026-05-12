@@ -197,11 +197,13 @@ def main() -> None:
         dest="skip_output_recalc",
         action="store_true",
         help=(
-            "Skip the final CalcOutputSheetsHL pass that recalculates Portfolio, "
-            "AT Returns_WIP, Corp Model Output, Cust Prop, Dashboard, Table, and "
-            "Waterfall Sensitivity. Core solve results are unaffected; Excel "
-            "recalcs the output sheets lazily on the next interactive open. "
-            "Saves 10-30s per run on workbooks with #REF!-heavy output sheets."
+            "Skip the optional output-sheet recalc at finalize: Portfolio, "
+            "AT Returns_WIP, Corp Model Output, Cust Prop, Waterfall "
+            "Sensitivity. Dashboard and Table ALWAYS recalc regardless of "
+            "this flag (deal-summary surfaces). Core 13 sheets (Project "
+            "Inputs / PT Returns / NPP Calc / Appraisal / Perm Debt / Tax "
+            "Equity / CL / etc.) also always recalc during the solve loop. "
+            "Saves 10-30s per run on workbooks with heavy portfolio rollups."
         ),
     )
     parser.set_defaults(skip_output_recalc=False)
@@ -210,10 +212,13 @@ def main() -> None:
         default="",
         help=(
             "Comma-separated list of sheet names to DELETE from the temp copy "
-            "before opening (e.g. 'Dashboard,Waterfall Sensitivity'). Useful "
-            "when output sheets carry stale #REF! cells that slow SaveAs and "
-            "validation. Original workbook is never modified. Only safe when "
-            "no core-sheet formula references the deleted sheets."
+            "before opening (e.g. 'Waterfall Sensitivity,AT Returns_WIP'). "
+            "Original workbook is never modified. NEVER strip critical "
+            "sheets: Dashboard, Table, PT Returns, NPP Calc, Appraisal, "
+            "Perm Debt, Tax Equity, CL, Project Inputs — these are required "
+            "every run and stripping them will produce wrong results or "
+            "#REF! errors. Safe candidates: Waterfall Sensitivity, "
+            "AT Returns_WIP, Corp Model Output, Cust Prop, Portfolio."
         ),
     )
     parser.add_argument(
