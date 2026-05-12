@@ -9,7 +9,10 @@ venv/
 
 # Data
 results.db
+results.db-shm
+results.db-wal
 solver_status.json
+solver_status_w*.json
 *.xlsm
 *.xlsx
 

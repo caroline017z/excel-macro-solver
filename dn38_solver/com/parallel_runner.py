@@ -113,6 +113,7 @@ def run_parallel(
 
     # Spawn workers
     procs: list[tuple[int, subprocess.Popen[bytes], Path, Path]] = []
+    worker_status_paths: list[Path] = []
     for worker_id, slice_tasks in enumerate(partitions):
         if not slice_tasks:
             continue
@@ -122,6 +123,7 @@ def run_parallel(
         result_path = wdir / "result.json"
         output_path = wdir / f"{Path(workbook_path).stem}_SOLVED_w{worker_id}.xlsm"
         status_path = wdir / f"solver_status_w{worker_id}.json"
+        worker_status_paths.append(status_path)
 
         tasks_json = msgspec.json.encode(slice_tasks).decode("utf-8")
         config = {
@@ -156,6 +158,19 @@ def run_parallel(
             creationflags=creationflags,
         )
         procs.append((worker_id, proc, config_path, result_path))
+
+    # Start the status aggregator. Each worker writes its own status JSON;
+    # the aggregator merges them into the canonical `solver_status.json`
+    # the Streamlit tracker reads, so dashboards work without changes.
+    from dn38_solver.com.direct_runner import STATUS_FILE
+    from dn38_solver.com.status_aggregator import StatusAggregator
+    aggregator = StatusAggregator(
+        worker_status_paths=worker_status_paths,
+        output_path=STATUS_FILE,
+        workbook_path=workbook_path,
+        poll_interval=1.0,
+    )
+    aggregator.start()
 
     # Wait for all workers. Per-worker timeout is the parent-level timeout
     # since each worker handles only its slice; the cap should be generous
@@ -225,19 +240,22 @@ def run_parallel(
         if wresult.get("error"):
             worker_errors.append(f"w{wid}: {wresult['error']}")
         for pr in wresult.get("project_results", []):
-            # The project_results dicts already key into __SolverResults
-            # by name; we need the offset to align back to the master
-            # task ordering. Pull it from meta where the worker captured it.
-            meta = pr.get("meta") or {}
-            offset = meta.get("project_offset") or meta.get("offset")
+            # Use the top-level project_offset stamped by direct_runner.
+            # Falling back to name-based lookup is unsafe — portfolios can
+            # have duplicate project names across LLCs.
+            offset = pr.get("project_offset")
             if offset is None:
-                # Fall back to name lookup if offset wasn't recorded
-                for t in tasks:
-                    if t.project_name == pr.get("project_name"):
-                        offset = t.project_offset
-                        break
-            if offset is not None:
-                by_offset[int(offset)] = pr
+                meta = pr.get("meta") or {}
+                offset = meta.get("project_offset") or meta.get("offset")
+            if offset is None:
+                log.warning(
+                    "Worker %d returned a project_result with no offset key; "
+                    "skipping rather than name-matching (unsafe with "
+                    "duplicate names). project_name=%r",
+                    wid, pr.get("project_name"),
+                )
+                continue
+            by_offset[int(offset)] = pr
 
     project_results: list[dict] = []
     for t in tasks:
@@ -255,13 +273,22 @@ def run_parallel(
             project_results.append(pr)
 
     # Merge the worker _SOLVED.xlsm files into one canonical output.
-    # Strategy: pick worker 0's file as master, copy converged cells
-    # (the per-project columns) from each other worker's file via
-    # openpyxl. Cross-project portfolio aggregates may be stale per
-    # Caroline's spec — Excel recalcs them on next interactive open.
+    # Strategy: pick a successfully-converged worker as master, copy
+    # converged cells (the per-project columns) from each other worker's
+    # file via openpyxl. Cross-project portfolio aggregates may be stale
+    # per Caroline's spec — Excel recalcs them on next interactive open.
     saved_to: str | None = None
-    if procs:
-        master_worker_id = procs[0][0]
+    # Prefer the lowest-id worker whose status is "converged" AND who
+    # actually saved a file. Falling back to procs[0] regardless of
+    # outcome risks merging on top of an errored worker's empty/corrupt
+    # output.
+    candidate_masters = sorted(
+        (wid for wid, r in worker_results.items()
+         if r.get("status") == "converged" and r.get("saved_to")
+         and Path(r["saved_to"]).exists()),
+    )
+    if candidate_masters:
+        master_worker_id = candidate_masters[0]
         master_result = worker_results.get(master_worker_id, {})
         master_src = master_result.get("saved_to")
         if master_src and Path(master_src).exists():
@@ -284,25 +311,74 @@ def run_parallel(
                 log.info("  Merged %d worker output(s) into %s",
                          len(worker_results), final_path)
             except Exception as merge_exc:
+                # openpyxl merge failed — most likely keep_vba=True did
+                # not survive the round-trip on this workbook's macro
+                # project. Fall back to a VBA-side merge that uses Excel
+                # COM (which handles .xlsm natively) to stamp converged
+                # column values from peer workers into the master.
                 log.warning(
-                    "  Merge step failed (%s) — falling back to master "
-                    "worker's output as-is. Per-project columns owned by "
-                    "other workers will reflect their PRE-solve values.",
-                    merge_exc,
+                    "  openpyxl merge failed (%s) — trying VBA-helper "
+                    "fallback via Excel COM", merge_exc,
                 )
-                # Fall back: just copy master_src to final_path. Caller
-                # still has each worker's individual _SOLVED.xlsm in the
-                # parent tmp_dir for forensic recovery.
-                final_path = Path(workbook_path).parent / (
-                    Path(workbook_path).stem + "_SOLVED" + Path(workbook_path).suffix
-                )
-                with contextlib.suppress(Exception):
-                    shutil.copy2(master_src, final_path)
+                others_paths = [
+                    Path(worker_results[wid].get("saved_to", ""))
+                    for wid in worker_results
+                    if wid != master_worker_id
+                    and worker_results[wid].get("saved_to")
+                ]
+                try:
+                    _merge_via_vba_fallback(
+                        master_src=Path(master_src),
+                        others=others_paths,
+                        final_path=final_path,
+                        partitions=partitions,
+                        worker_results=worker_results,
+                        master_worker_id=master_worker_id,
+                    )
                     saved_to = str(final_path)
+                    log.info(
+                        "  VBA-helper fallback succeeded: merged %d output(s) into %s",
+                        len(worker_results), final_path,
+                    )
+                except Exception as vba_exc:
+                    log.warning(
+                        "  VBA-helper fallback also failed (%s) — copying "
+                        "master worker's output as-is. Per-project columns "
+                        "owned by other workers will reflect their PRE-solve "
+                        "values; consult the per-worker _SOLVED.xlsm files "
+                        "in %s for forensic recovery.",
+                        vba_exc, parent_tmp,
+                    )
+                    with contextlib.suppress(Exception):
+                        shutil.copy2(master_src, final_path)
+                        saved_to = str(final_path)
+                    # Force run-level error so the user knows the merged
+                    # file is not authoritative and so parent_tmp is
+                    # preserved for forensics (see cleanup gate below).
+                    worker_errors.append(
+                        "merge fell back to master-only — per-project "
+                        "columns owned by non-master workers reflect "
+                        "PRE-solve values, not converged values"
+                    )
+    else:
+        # No worker produced a saved, converged output — nothing to merge.
+        # Surface this clearly so the orchestrator marks the run as error
+        # and keeps parent_tmp for forensics.
+        log.error(
+            "  No worker produced a converged _SOLVED.xlsm — skipping merge. "
+            "Worker outcomes: %s",
+            {wid: r.get("status") for wid, r in worker_results.items()},
+        )
+        worker_errors.append(
+            "no converged worker output to merge — all workers errored or "
+            "produced no saved file"
+        )
 
     # Cleanup worker temp dirs (keep parent tmp_dir only if a worker errored
     # — useful for forensics; otherwise drop everything).
-    if not worker_errors:
+    # DN38_KEEP_WORKER_TMP=1 forces retention regardless (debugging hatch).
+    keep_tmp = bool(worker_errors) or os.environ.get("DN38_KEEP_WORKER_TMP") == "1"
+    if not keep_tmp:
         with contextlib.suppress(OSError):
             shutil.rmtree(parent_tmp)
     else:
@@ -322,6 +398,11 @@ def run_parallel(
         return sum(
             float(w.get(key, 0) or 0) for w in worker_results.values()
         )
+
+    # Stop the status aggregator before returning so the final solver_status.json
+    # reflects the terminal state. Daemon thread, so a join failure won't
+    # block the process — but in normal flow this exits within poll_interval.
+    aggregator.stop(join_timeout=2.0)
 
     return {
         "status": batch_status,
@@ -368,8 +449,17 @@ def _merge_solved_workbooks(
     # recalc anything in openpyxl.
     OUTPUT_ROWS = (31, 32, 33, 37, 38, 39)
 
-    # Load master with keep_vba so the .xlsm round-trips with macros intact
+    # Load master with keep_vba so the .xlsm round-trips with macros intact.
+    # If openpyxl couldn't grab the macro project blob, raise so the caller
+    # falls back to the VBA-helper merge path (Excel COM) — saving without
+    # macros would produce a silently broken .xlsm.
     wb_master = openpyxl.load_workbook(str(master_src), keep_vba=True)
+    if getattr(wb_master, "vba_archive", None) is None:
+        wb_master.close()
+        raise RuntimeError(
+            "openpyxl could not load the workbook's VBA project; "
+            "saving via openpyxl would strip macros. Falling back."
+        )
     ws_pi_master = wb_master["Project Inputs"] if "Project Inputs" in wb_master.sheetnames else None
 
     if ws_pi_master is None:
@@ -416,3 +506,138 @@ def _merge_solved_workbooks(
 
     wb_master.save(str(final_path))
     wb_master.close()
+
+
+def _merge_via_vba_fallback(
+    *,
+    master_src: Path,
+    others: list[Path],
+    final_path: Path,
+    partitions: list[list[SolveTask]],
+    worker_results: dict[int, dict],
+    master_worker_id: int,
+) -> None:
+    """VBA-helper merge path. Used when openpyxl can't round-trip the .xlsm.
+
+    Opens the master in a fresh Excel COM session, reads converged column
+    values from each peer worker's SOLVED file via openpyxl (read-only, no
+    save), and calls SolveHeadless's StampConvergedValuesHL via
+    Application.Run to write them into the master. Excel handles the .xlsm
+    save natively so the macro project stays intact.
+
+    Requires SolveHeadless.bas's StampConvergedValuesHL to be present in
+    the master workbook (it is, since master is a worker's own _SOLVED
+    file and workers all imported the module before solving).
+    """
+    import openpyxl
+    import pythoncom
+    import win32com.client
+    from openpyxl.utils import column_index_from_string
+
+    pythoncom.CoInitialize()
+    excel = None
+    wb = None
+    try:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        with contextlib.suppress(Exception):
+            excel.AutomationSecurity = 1
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.EnableEvents = False
+
+        wb = excel.Workbooks.Open(str(master_src), ReadOnly=False, UpdateLinks=0)
+
+        # Verify StampConvergedValuesHL is actually callable before the
+        # per-project loop. Without this check, every per-project Application.Run
+        # would raise, the except-and-continue at the bottom of the loop would
+        # swallow each error silently, and we'd SaveAs a workbook that looks
+        # right but has only worker-0's converged values.
+        try:
+            vbp = wb.VBProject
+            found = False
+            for i in range(1, vbp.VBComponents.Count + 1):
+                comp = vbp.VBComponents.Item(i)
+                try:
+                    cm = comp.CodeModule
+                    if cm.Find("StampConvergedValuesHL", 1, 1, cm.CountOfLines, 999, True, False, False):
+                        found = True
+                        break
+                except Exception:
+                    continue
+            if not found:
+                raise RuntimeError(
+                    "StampConvergedValuesHL not found in workbook VBA. "
+                    "The module is required for the merge fallback path; "
+                    "re-import SolveHeadless.bas via import_vba_module.py."
+                )
+        except Exception as verify_exc:
+            log.error("  VBA merge precondition failed: %s", verify_exc)
+            raise
+
+        for other_path in others:
+            if not other_path.exists():
+                continue
+            # Extract worker id from filename: "<stem>_SOLVED_w{id}.xlsm"
+            stem = other_path.stem
+            if "_w" not in stem:
+                continue
+            try:
+                wid = int(stem.rsplit("_w", 1)[1])
+            except ValueError:
+                continue
+            if wid >= len(partitions):
+                continue
+
+            # Read peer worker's converged values via openpyxl (read-only).
+            try:
+                wb_other = openpyxl.load_workbook(
+                    str(other_path), data_only=True, read_only=True,
+                )
+            except Exception:
+                continue
+            ws_pi_other = wb_other["Project Inputs"] if "Project Inputs" in wb_other.sheetnames else None
+            if ws_pi_other is None:
+                wb_other.close()
+                continue
+
+            for task in partitions[wid]:
+                col_idx = column_index_from_string(task.project_col_letter)
+                npp = ws_pi_other.cell(row=38, column=col_idx).value
+                dev_fee = ws_pi_other.cell(row=32, column=col_idx).value
+                fmv = ws_pi_other.cell(row=33, column=col_idx).value
+                live_irr = ws_pi_other.cell(row=37, column=col_idx).value
+                appr_live = ws_pi_other.cell(row=31, column=col_idx).value
+                npp_total = ws_pi_other.cell(row=39, column=col_idx).value
+                # Pass zeros for cells the peer didn't populate so the VBA
+                # Sub doesn't trip on Variant/Empty across the COM boundary
+                try:
+                    excel.Application.Run(
+                        f"'{wb.Name}'!StampConvergedValuesHL",
+                        int(col_idx),
+                        float(npp or 0),
+                        float(dev_fee or 0),
+                        float(fmv or 0),
+                        float(live_irr or 0),
+                        float(appr_live or 0),
+                        float(npp_total or 0),
+                    )
+                except Exception as stamp_exc:
+                    log.warning(
+                        "  StampConvergedValuesHL failed for col %d (%s): %s",
+                        col_idx, task.project_name, stamp_exc,
+                    )
+            wb_other.close()
+
+        # SaveAs to final canonical path with explicit FileFormat=52
+        # (xlOpenXMLWorkbookMacroEnabled) so the VBA project survives.
+        wb.SaveAs(str(final_path), FileFormat=52)
+
+    finally:
+        if wb is not None:
+            with contextlib.suppress(Exception):
+                wb.Close(SaveChanges=False)
+        if excel is not None:
+            with contextlib.suppress(Exception):
+                excel.Quit()
+        with contextlib.suppress(Exception):
+            pythoncom.CoUninitialize()

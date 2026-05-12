@@ -81,7 +81,7 @@ class _StatusWriter:
     Output is still JSON to STATUS_FILE for the Streamlit tracker.
     """
 
-    __slots__ = ("_base", "_start", "_path")
+    __slots__ = ("_base", "_start", "_path", "_worker_id")
 
     def __init__(
         self,
@@ -90,6 +90,7 @@ class _StatusWriter:
         proj_names: list[str],
         start: float,
         path: Path = STATUS_FILE,
+        worker_id: int | None = None,
     ) -> None:
         self._base = {
             "workbook": workbook_path,
@@ -98,6 +99,7 @@ class _StatusWriter:
         }
         self._start = start
         self._path = path
+        self._worker_id = worker_id
 
     def update(
         self,
@@ -119,6 +121,8 @@ class _StatusWriter:
             "projects": projects or [],
             "elapsed_sec": time.time() - self._start,
         }
+        if self._worker_id is not None:
+            payload["worker_id"] = self._worker_id
         payload.update(extras)
         try:
             # Atomic swap so a Streamlit reader can never observe a half-
@@ -145,6 +149,7 @@ def run_direct(
     output_path: str | None = None,
     status_path: Path | None = None,
     excel_threads: int | None = None,
+    worker_id: int | None = None,
 ) -> dict:
     """Open Excel, run SolveHeadless, read results, close. All in-process.
 
@@ -315,6 +320,7 @@ def run_direct(
             proj_names=proj_names,
             start=start,
             path=status_path if status_path is not None else STATUS_FILE,
+            worker_id=worker_id,
         )
         status.update("opening", per_project_status="pending")
 
@@ -420,11 +426,12 @@ def run_direct(
                 # which would be misleading downstream.
                 project_results.append({
                     "project_name": nt.name,
+                    "project_offset": nt.offset,
                     "status": "not_attempted",
                     "solved_values": {},
                     "iterations_used": 0,
                     "duration_sec": 0,
-                    "meta": {},
+                    "meta": {"project_offset": nt.offset},
                     "_summary": {"npp": None, "dev_fee": None, "fmv": None},
                 })
                 continue
@@ -481,13 +488,21 @@ def run_direct(
             converged_flag = meta.get("converged_flag")
             is_converged = bool(converged_flag) if converged_flag is not None else False
 
+            # Stamp project_offset into meta so downstream consumers
+            # (parallel_runner.run_parallel re-keying across workers) can
+            # align results without relying on project names, which may
+            # not be unique across an intake portfolio.
+            meta = dict(meta) if meta else {}
+            meta["project_offset"] = nt.offset
+
             project_results.append({
                 "project_name": nt.name,
+                "project_offset": nt.offset,
                 "status": "converged" if is_converged else "not_converged",
                 "solved_values": solved,
                 "iterations_used": int(meta.get("iterations") or 0),
                 "duration_sec": 0,
-                "meta": meta or {},
+                "meta": meta,
                 "_summary": {"npp": npp, "dev_fee": dev_fee, "fmv": fmv},
             })
 
