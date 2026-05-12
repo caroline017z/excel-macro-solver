@@ -99,8 +99,22 @@ def main() -> int:
                 "projects": [],
                 "elapsed_sec": 0,
             }
-            payload.update(existing)  # preserve _StatusWriter's rich keys
-            payload["phase"] = phase  # but our terminal phase wins
+            # Whitelist the keys we want to carry forward from the
+            # _StatusWriter payload, rather than blanket-merging. A
+            # blanket update would forward any transient key a future
+            # _StatusWriter version added (including potentially stale
+            # `error` set during a recoverable mid-solve hiccup) into
+            # the terminal status, where the aggregator would then
+            # surface it as a run-level error. Explicit is safer.
+            CARRY_FORWARD = (
+                "total_projects", "projects", "elapsed_sec",
+                "open_time_sec", "warmup_time_sec", "solve_time_sec",
+                "read_time_sec", "solver_heartbeat",
+            )
+            for k in CARRY_FORWARD:
+                if k in existing:
+                    payload[k] = existing[k]
+            payload["phase"] = phase  # terminal phase always wins
             payload["worker_id"] = worker_id
             payload.update(extras)
 
@@ -109,6 +123,15 @@ def main() -> int:
             tmp.replace(status_path)
         except Exception:
             pass  # never let status-write failure mask the real outcome
+
+    def _atomic_write_result(payload: dict) -> None:
+        """Write result.json via tmp + replace so a parent reading mid-write
+        (or a SIGTERM during the write) never sees a half-written file. Same
+        idiom as `_StatusWriter` and `_atomic_write_json` elsewhere.
+        """
+        tmp = result_path.with_suffix(result_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+        tmp.replace(result_path)
 
     try:
         tasks_bytes = config["tasks_json"].encode("utf-8")
@@ -132,7 +155,7 @@ def main() -> int:
         )
         result["worker_id"] = worker_id
 
-        result_path.write_text(json.dumps(result, default=str), encoding="utf-8")
+        _atomic_write_result(result)
         log.info("Worker %d wrote result (%s)", worker_id, result.get("status"))
         # Write terminal status AFTER result.json so the parent can rely
         # on phase=complete meaning "result.json is fully written."
@@ -154,7 +177,7 @@ def main() -> int:
             "project_results": [],
         }
         try:
-            result_path.write_text(json.dumps(err_payload), encoding="utf-8")
+            _atomic_write_result(err_payload)
         except Exception:
             pass
         log.exception("Worker %d crashed", worker_id)

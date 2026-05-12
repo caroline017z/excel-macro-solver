@@ -43,6 +43,65 @@ python -m dn38_solver.cli --show-checkpoints <batch_id>
 
 ---
 
+## What the end-of-run summary tells you
+
+Every run prints a structured summary block. Read it top-to-bottom; the lines are
+ordered by what you most likely care about.
+
+**1. `Ship-ready: X/Y projects`** — the IC-relevant number. X is the count of
+projects that converged at the strict tier (or strict + relaxed if you passed
+`--allow-relaxed`). Y is the total project count. If `X == Y` and the Status
+line says `CONVERGED`, the merged file is safe to send.
+
+**2. `Convergence: A strict / B relaxed / C none / D not_attempted`** — tier
+breakdown. `not_attempted` is non-zero when a worker crashed before reaching
+some of its assigned projects; those rows in the merged file are stale and
+should be re-solved before shipping.
+
+**3. `Parallel speedup: N.NNx (wall vs estimated sequential)`** — only printed
+in parallel mode. The estimated sequential time is the sum of every attempted
+project's solve seconds (from VBA's per-project timings). On portfolios under
+~4 projects, fixed startup cost dominates and you'll see <1x — the summary
+annotates this so you don't think parallel is broken.
+
+**4. `Merge path: ...`** — only in parallel mode. Three tiers, severity-graded:
+- `openpyxl` (INFO) — the standard path; per-project columns in the merged
+  file are authoritative.
+- `vba_fallback` (WARNING) — openpyxl couldn't round-trip the macro project
+  for this workbook, so we fell back to opening the master in Excel and
+  stamping converged values via VBA. The merged file is correct; flag a
+  recurring warning so we can investigate why openpyxl is failing.
+- `copy_master` (ERROR) — both merge paths failed and we copied the
+  worker-0-master file as-is. **DO NOT SHIP** the merged file. The
+  per-worker `_SOLVED.xlsm` files in the preserved `parent_tmp` directory
+  are authoritative for projects owned by the non-master workers.
+
+**5. `Post-merge verification: OK` or `FAILED`** — the merged file is re-opened
+via openpyxl and the hard-stamped convergence cells (Project Inputs rows
+31/32/33/37/38/39 per project) are diffed against each worker's reported
+solved values, with per-row tolerances ($0.01/W for the rate rows, $1 for
+the NPP $ total row). Any mismatch is a silent-corruption finding; the run
+is marked ERROR and the `parent_tmp` directory is preserved for forensics.
+The error message names the path explicitly.
+
+**6. `Run id=N | Status: ...`** — SQLite row id and final status. ERROR runs
+keep their per-project checkpoints in the database; clean runs drop them.
+
+**7. `Solved workbook: ...`** — printed AFTER status. On ERROR runs the path
+is logged at WARNING severity with a "NOT ship-ready" prefix so you don't
+accidentally email the file before noticing the run failed.
+
+**Disk hygiene:** every parallel run that errors preserves its `parent_tmp`
+directory under `%TEMP%\38dn_parallel_*` (typically 50–200MB). On the next
+parallel run, dirs older than 7 days are auto-swept. Override with
+`DN38_TMP_RETENTION_DAYS=N` (set to 0 to retain forever).
+
+**Force-keep tmp on success:** set `DN38_KEEP_WORKER_TMP=1` to retain
+`parent_tmp` even when the run succeeds (useful for debugging the merge
+path itself).
+
+---
+
 ## Architecture
 
 ```

@@ -190,6 +190,16 @@ def validate_parallel(
     )
 
     log.info("\n[Pass 2] Parallel run (%d workers)...", workers)
+    # NOTE: solve_all returns RunRecord which doesn't currently expose
+    # `merge_path` (the openpyxl / vba_fallback / copy_master tier).
+    # The validator's per-project diff catches a corrupt merge in the
+    # general case (mismatched values fail the tolerance check), but
+    # cannot catch the narrow edge case where a copy_master fallback
+    # happens to coincide with all-projects-on-master (e.g., 1 project
+    # with N=2 round-robin). The orchestrator logs merge_path at ERROR
+    # severity for copy_master, so user-visible regression is preserved
+    # via stderr; plumbing merge_path into ValidationReport requires a
+    # RunRecord schema change deferred to a follow-up.
     par_record = solve_all(
         workbook_path,
         batch_id=par_batch,
