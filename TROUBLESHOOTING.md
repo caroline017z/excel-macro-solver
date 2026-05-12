@@ -6,6 +6,43 @@ Python automation tool that calls VBA macros in Excel pricing models (885K formu
 
 ---
 
+## Quick start: portfolio runs
+
+**One-time per workbook:** import the VBA macro module.
+```powershell
+python import_vba_module.py "C:\path\to\your_workbook.xlsm"
+```
+
+**Standard single-process run** (recommended for ≤ 5 projects or warm workbooks):
+```powershell
+.\run_desktop.ps1 "C:\path\to\your_workbook.xlsm"
+```
+
+**Parallel run** (recommended for cold portfolios with ≥ 6 projects):
+```powershell
+.\run_desktop.ps1 "C:\path\to\your_workbook.xlsm" -Workers 2
+```
+2 workers ≈ 50% wall-clock reduction; 4 workers ≈ 75%. Each Excel instance uses ~1-2 GB RAM. Cap is 8.
+
+**Live progress dashboard** (optional, runs in a separate terminal):
+```powershell
+.\run_dashboard.bat
+```
+In parallel mode the dashboard renders one column per worker so you can spot a stalled instance.
+
+**Correctness validation** (run once after upgrading or on a new portfolio):
+```powershell
+python validate_parallel.py "C:\path\to\your_workbook.xlsm" --workers 2
+```
+Runs the solver in single-worker mode, then parallel, and diffs per-project NPP / Dev Fee / FMV / DSCR / Live IRR / Appraisal IRR / Equity % to 1e-4. Exit code 0 means parallel matches sequential.
+
+**Inspect a failed mid-run:** per-project checkpoints survive crashes.
+```powershell
+python -m dn38_solver.cli --show-checkpoints <batch_id>
+```
+
+---
+
 ## Architecture
 
 ```
@@ -68,10 +105,19 @@ This was the primary blocker for production use on unsolved workbooks. The core 
 
 ### Remaining Gaps
 
-1. **Cold-start end-to-end validation pending** on a real portfolio workbook in a Windows+Excel environment. The engineering is in place (recalc ladder, chunking, telemetry, hard-value F37/F31 snapshot, post-loop CalculateFull validation) but has not been verified against a fresh cold portfolio fixture.
-2. **Timeout guard is post-run** (cannot interrupt a blocked COM macro call mid-execution yet). The chunked path mitigates this in practice because no single COM call exceeds the project-level 20-min cap.
-3. **Adaptive retry on chunk failure** not implemented — a failed `SolveOneProjectByColHL` aborts the remaining chunks rather than reopening Excel and retrying the failed project in cold mode.
-4. **Regression harness with warm/cold/stress fixtures** not implemented — runs are validated ad-hoc rather than against a baseline.
+1. **Cold-start end-to-end validation: COMPLETE** as of 2026-05-12 on SMP WalkTEST (6 projects, 1366s macro, 5/6 strict + 1/6 relaxed convergence, zero Tier-3 escalations, no COM RPC failures). PR #7 merged the reliability fixes.
+2. **Parallel execution across N Excel instances**: implemented via `--workers N` CLI flag. Each worker runs in its own subprocess with its own Excel COM session and a round-robin slice of projects. Parent merges per-project converged cells into a single `_SOLVED.xlsm` via openpyxl (`keep_vba=True`), with a VBA-helper fallback path (`StampConvergedValuesHL` via Excel COM) if the openpyxl round-trip fails. See Issue #8.
+3. **Timeout guard is post-run** (cannot interrupt a blocked COM macro call mid-execution yet). The chunked path mitigates this in practice because no single COM call exceeds the project-level 20-min cap. Parallel mode adds PID-scoped Excel cleanup via `kill_excel_children` on worker timeout.
+4. **Adaptive retry on chunk failure** not implemented — a failed `SolveOneProjectByColHL` aborts the remaining chunks for that worker rather than reopening Excel and retrying the failed project in cold mode.
+5. **Streamlit tracker multi-worker UX**: each worker writes its own `solver_status_w{id}.json` and a parent thread (`StatusAggregator`) merges them into the canonical `solver_status.json` that the dashboard reads. Tracker UI displays per-worker entries via the `worker_id` field on each project record.
+
+### Validation
+
+Parallel-vs-sequential correctness gate:
+```
+python validate_parallel.py <workbook.xlsm> --workers 2
+```
+Runs the solver in single-worker mode (sequential baseline), then in parallel, and diffs per-project NPP / Dev Fee / FMV / DSCR / Live IRR / Appraisal IRR / Equity %. Default tolerance 1e-4. Exit code 0 if all fields are within tolerance, 1 otherwise. See `dn38_solver/validation/parallel_correctness.py`.
 
 ### The Problem
 

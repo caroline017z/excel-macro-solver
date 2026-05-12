@@ -32,6 +32,23 @@ def load_status() -> dict | None:
         return None
 
 
+def _render_project_row(p: dict) -> None:
+    """Render one project's in-progress row. Shared by flat and per-worker views."""
+    name = p.get("name", "?")
+    proj_status = p.get("status", "pending")
+    if proj_status == "solving":
+        iteration = p.get("iteration", 0)
+        max_iter = p.get("max_iter", 8)
+        pct = iteration / max(max_iter, 1)
+        st.progress(pct, text=f"🔄 {name} — iter {iteration}/{max_iter}")
+    elif proj_status == "converged":
+        st.progress(1.0, text=f"✅ {name} — converged")
+    elif proj_status == "not_converged":
+        st.progress(1.0, text=f"⚠️ {name} — not converged")
+    else:
+        st.progress(0.0, text=f"⏳ {name} — pending")
+
+
 def main() -> None:
     st.title("38DN Convergence Solver")
 
@@ -50,12 +67,16 @@ def main() -> None:
     total_projects = status.get("total_projects", len(projects))
     elapsed = status.get("elapsed_sec", 0)
     macro_name = status.get("macro_used", "—")
+    worker_count = status.get("worker_count")  # set by StatusAggregator in parallel mode
 
     # Header
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Phase", phase.replace("_", " ").title())
-    col2.metric("Elapsed", f"{elapsed:.0f}s" if elapsed < 120 else f"{elapsed/60:.1f} min")
-    col3.metric("Workbook", Path(workbook).stem[:40] if workbook else "—")
+    is_parallel = worker_count is not None and worker_count > 1
+    cols = st.columns(4 if is_parallel else 3)
+    cols[0].metric("Phase", phase.replace("_", " ").title())
+    cols[1].metric("Elapsed", f"{elapsed:.0f}s" if elapsed < 120 else f"{elapsed/60:.1f} min")
+    cols[2].metric("Workbook", Path(workbook).stem[:40] if workbook else "—")
+    if is_parallel:
+        cols[3].metric("Workers", str(worker_count))
 
     st.divider()
 
@@ -111,7 +132,6 @@ def main() -> None:
 
     if phase == "solving":
         current_project = status.get("current_project", 0)
-        current_name = status.get("current_name", "—")
 
         st.subheader(f"Solving {total_projects} projects")
         st.caption(f"Macro: {macro_name}")
@@ -120,23 +140,25 @@ def main() -> None:
         overall_pct = current_project / max(total_projects, 1)
         st.progress(overall_pct, text=f"Project {current_project}/{total_projects}")
 
-        # Per-project status
-        for p in projects:
-            name = p.get("name", "?")
-            proj_status = p.get("status", "pending")
+        # Per-worker rendering when parallel mode is active.
+        # When the StatusAggregator merges multiple worker JSONs, each
+        # project entry carries a worker_id. Group them so Caroline can
+        # see at a glance which worker is on which project and spot a
+        # stalled instance instead of squinting at a flat list.
+        if is_parallel and any("worker_id" in p for p in projects):
+            grouped: dict[int, list[dict]] = {}
+            for p in projects:
+                grouped.setdefault(int(p.get("worker_id", 0)), []).append(p)
 
-            if proj_status == "solving":
-                iteration = p.get("iteration", 0)
-                max_iter = p.get("max_iter", 8)
-                inner = p.get("inner_iter", 0)
-                pct = iteration / max(max_iter, 1)
-                st.progress(pct, text=f"🔄 {name} — iter {iteration}/{max_iter}")
-            elif proj_status == "converged":
-                st.progress(1.0, text=f"✅ {name} — converged")
-            elif proj_status == "not_converged":
-                st.progress(1.0, text=f"⚠️ {name} — not converged")
-            else:
-                st.progress(0.0, text=f"⏳ {name} — pending")
+            worker_cols = st.columns(len(grouped))
+            for col, wid in zip(worker_cols, sorted(grouped)):
+                with col:
+                    st.markdown(f"**Worker {wid}** — {len(grouped[wid])} project(s)")
+                    for p in grouped[wid]:
+                        _render_project_row(p)
+        else:
+            for p in projects:
+                _render_project_row(p)
 
         time.sleep(1)
         st.rerun()

@@ -2,11 +2,17 @@
 # default for ad-hoc one-off solves. Portfolio runs should pass the path
 # explicitly, e.g.:
 #   .\run_desktop.ps1 "C:\Users\CarolineZepecki\OneDrive - 38 Degrees North\38DN-MD_CI Renewables_Project Blue Crab_Pricing Model_2026.04.21.xlsm"
+#
+# Parallel mode (Issue #8): pass -Workers N to spawn N Excel instances.
+#   .\run_desktop.ps1 $wb -Workers 2
 param(
     [string]$Workbook = "$env:USERPROFILE\Box\2. Deal Flow\Novel Energy Solutions\Pricing Model\38DN-IL_Novel Energy Solutions_lease financing_PricingModel_100% Commercial_2026.04.15.xlsm",
     [int]$TimeoutSec = 3600,
+    [int]$Workers = 1,
     [switch]$NoChunked,
-    [switch]$StrictOnly
+    [switch]$StrictOnly,
+    [switch]$NoOutputRecalc,
+    [string]$StripSheets = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,8 +31,11 @@ Set-Location $repo
 #   --allow-relaxed counts +/-0.5pp equity hits as run-level converged
 # Pass -NoChunked / -StrictOnly to opt out.
 $cliArgs = @($Workbook, "--timeout", $TimeoutSec)
-if (-not $NoChunked)  { $cliArgs += "--chunked" }
-if (-not $StrictOnly) { $cliArgs += "--allow-relaxed" }
+if (-not $NoChunked)    { $cliArgs += "--chunked" }
+if (-not $StrictOnly)   { $cliArgs += "--allow-relaxed" }
+if ($Workers -gt 1)     { $cliArgs += "--workers"; $cliArgs += $Workers }
+if ($NoOutputRecalc)    { $cliArgs += "--no-output-recalc" }
+if ($StripSheets)       { $cliArgs += "--strip-sheets"; $cliArgs += $StripSheets }
 
 python -u -m dn38_solver.cli @cliArgs
 Read-Host "Done. Press Enter to close"

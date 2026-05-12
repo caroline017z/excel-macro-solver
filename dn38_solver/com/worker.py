@@ -69,11 +69,11 @@ def main() -> int:
         stream=sys.stderr,
     )
     log = logging.getLogger(__name__)
-    log.info("Worker %d starting on %d task(s)", worker_id, len(config.get("tasks_json", "")))
 
     try:
         tasks_bytes = config["tasks_json"].encode("utf-8")
         tasks = msgspec.json.decode(tasks_bytes, type=list[SolveTask])
+        log.info("Worker %d starting on %d task(s)", worker_id, len(tasks))
 
         result = run_direct(
             workbook_path=config["workbook_path"],
@@ -88,6 +88,7 @@ def main() -> int:
             output_path=config["output_path"],
             status_path=Path(config["status_path"]),
             excel_threads=config.get("excel_threads"),
+            worker_id=worker_id,
         )
         result["worker_id"] = worker_id
 

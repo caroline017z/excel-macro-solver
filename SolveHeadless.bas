@@ -466,6 +466,61 @@ End Sub
 
 
 ' ==============================================================================
+'  PUBLIC: VBA-side merge helper for the parallel runner's fallback path.
+'
+'  When openpyxl-based merge (keep_vba=True round-trip) fails to preserve
+'  the workbook's macros or formulas, parallel_runner falls back to opening
+'  the master workbook in a fresh Excel session and calling this Sub once
+'  per other-worker-owned project, stamping the converged column outputs
+'  directly via Excel COM. Excel handles the .xlsm round-trip natively, so
+'  this is the durable fallback.
+'
+'  Stamps the same six rows that VBA hardcoded at end-of-solve into the
+'  per-project columns (see SolveOneProjectByColHL / SolveHeadless body).
+' ==============================================================================
+Public Sub StampConvergedValuesHL(ByVal colIdx As Integer, _
+                                   ByVal npp As Double, _
+                                   ByVal devFee As Double, _
+                                   ByVal fmv As Double, _
+                                   ByVal liveIRR As Double, _
+                                   ByVal apprLive As Double, _
+                                   ByVal nppTotal As Double)
+    ' Bounds guardrail. Reject anything outside the project-column band
+    ' [PI_BASE_COL+1 .. PI_BASE_COL+COL_SCAN_LIMIT] so a corrupted filename
+    ' parse in parallel_runner's _merge_via_vba_fallback can't silently
+    ' overwrite the wrong cells.
+    If colIdx < PI_BASE_COL + 1 Then Exit Sub
+    If colIdx > PI_BASE_COL + COL_SCAN_LIMIT Then Exit Sub
+
+    Dim wsPI As Worksheet
+    Set wsPI = ThisWorkbook.Sheets(SHT_PI)
+    wsPI.Cells(PI_ROW_NPP, colIdx).Value = npp
+    wsPI.Cells(PI_ROW_DEV_FEE, colIdx).Value = devFee
+    wsPI.Cells(33, colIdx).Value = fmv
+    wsPI.Cells(37, colIdx).Value = liveIRR
+    wsPI.Cells(31, colIdx).Value = apprLive
+    wsPI.Cells(39, colIdx).Value = nppTotal
+
+    ' Append an audit row to __SolverResults so a bad merge is forensically
+    ' recoverable. Columns mirror the per-solve schema, prefixed "merge"
+    ' in column B to distinguish from solve rows.
+    Dim wsRes As Worksheet
+    Set wsRes = EnsureSolverResultsSheetHL()
+    Dim r As Long
+    r = wsRes.Cells(wsRes.Rows.Count, "A").End(xlUp).Row + 1
+    wsRes.Cells(r, 1).Value = colIdx - PI_BASE_COL
+    wsRes.Cells(r, 2).Value = "merge:col=" & colIdx
+    wsRes.Cells(r, 3).Value = npp
+    wsRes.Cells(r, 4).Value = devFee
+    wsRes.Cells(r, 5).Value = fmv
+    wsRes.Cells(r, 6).Value = liveIRR
+    wsRes.Cells(r, 7).Value = apprLive
+    wsRes.Cells(r, 8).Value = nppTotal
+    wsRes.Cells(r, 14).Value = CStr(Now)
+End Sub
+
+
+' ==============================================================================
 '  PUBLIC: Chunked entry points for Python-driven progress reporting
 '
 '  Python calls: InitSolveEnvHL -> (SolveOneProjectByColHL per project) -> FinalizeSolveEnvHL
