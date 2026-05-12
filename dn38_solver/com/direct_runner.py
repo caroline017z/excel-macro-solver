@@ -280,7 +280,7 @@ def run_direct(
         # here looks identical to "macro not in workbook" downstream.
         try:
             excel.AutomationSecurity = 1
-            log.info("  AutomationSecurity set to Low (=1)")
+            log.debug("  AutomationSecurity set to Low (=1)")
         except Exception as as_exc:
             log.warning(
                 "Could not set AutomationSecurity=1 (%s) — Excel will use "
@@ -301,7 +301,7 @@ def run_direct(
             try:
                 excel.MultiThreadedCalculation.Enabled = True
                 excel.MultiThreadedCalculation.ThreadCount = excel_threads
-                log.info(
+                log.debug(
                     "  MultiThreadedCalculation.ThreadCount capped at %d",
                     excel_threads,
                 )
@@ -324,14 +324,14 @@ def run_direct(
         )
         status.update("opening", per_project_status="pending")
 
-        log.info("  Opening workbook via COM...")
+        log.debug("  Opening workbook via COM...")
         wb = excel.Workbooks.Open(
             str(temp_path),
             ReadOnly=False,
             UpdateLinks=0,
         )
         open_time = time.time() - start
-        log.info("  Opened in %.1fs", open_time)
+        log.debug("  Opened in %.1fs", open_time)
 
         warmup_time = 0.0
 
@@ -406,7 +406,7 @@ def run_direct(
         # has_switch indicates whether SwitchProjectAndRecalc lives
         # alongside the macro that ran; the runner helpers report it
         # rather than inferring from a name string.
-        log.info("  Reading results for %d project(s)...", len(tasks))
+        log.debug("  Reading results for %d project(s)...", len(tasks))
         status.update(
             "reading",
             per_project_status="reading",
@@ -507,7 +507,7 @@ def run_direct(
             })
 
         read_time = time.time() - t0
-        log.info("  Read %d project(s) in %.1fs", len(tasks), read_time)
+        log.debug("  Read %d project(s) in %.1fs", len(tasks), read_time)
 
         # Restore original F2
         if norm_tasks and has_switch:

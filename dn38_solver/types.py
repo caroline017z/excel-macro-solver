@@ -6,7 +6,17 @@ python-modern-performance-standards skill. msgspec only, never pydantic.
 from __future__ import annotations
 
 import enum
+from typing import Literal
+
 import msgspec
+
+
+# Convergence-tier constants. Keep this Literal in sync with
+# convergence_label() and orchestrator._parse_project_result(). msgspec
+# validates Literal values at decode time, so a SQLite row with a stale
+# tier string surfaces immediately rather than slipping through to the
+# rollup as a silently-mis-categorized row.
+ConvergenceTier = Literal["strict", "relaxed", "none", "not_attempted"]
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +100,7 @@ class ProjectResult(msgspec.Struct, frozen=True, kw_only=True):
     dscr_multiple: float | None = None
     equity_pct: float | None = None
     converged: bool = False
-    convergence_tier: str = "none"   # "strict" | "relaxed" | "none" | "not_attempted"
+    convergence_tier: ConvergenceTier = "none"
     iterations: int = 0
 
 

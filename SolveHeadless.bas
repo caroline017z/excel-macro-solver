@@ -201,13 +201,28 @@ Private Sub HardStampNumericHL(ByVal ws As Worksheet, _
     Dim v As Variant
     v = ws.Cells(r, c).Value
     If IsError(v) Then
+        ' Audit-row write must NEVER abort the solve. If __SolverResults
+        ' is structure-protected, the workbook is read-only, or
+        ' Worksheets.Add fails (workbook protection, sheet limit, etc.),
+        ' an unhandled error here would propagate up through
+        ' SolveOneProjectByColHL / SolveHeadless and kill the run mid-
+        ' portfolio — the exact failure mode the helper is meant to
+        ' prevent. Bracket the entire audit-row block so any failure to
+        ' log just drops the audit silently; the formula-not-stamped
+        ' invariant (which is what protects the IC-facing column from
+        ' #DIV/0!) still holds because we Exit Sub before the value
+        ' assignment regardless.
+        On Error Resume Next
         Dim wsRes As Worksheet
         Set wsRes = EnsureSolverResultsSheetHL()
-        Dim auditRow As Long
-        auditRow = wsRes.Cells(wsRes.Rows.Count, "A").End(xlUp).Row + 1
-        wsRes.Cells(auditRow, 2).Value = "stamp_skipped:" & context & _
-            ":r" & r & "c" & c & ":" & CStr(v)
-        wsRes.Cells(auditRow, 14).Value = CStr(Now)
+        If Not wsRes Is Nothing Then
+            Dim auditRow As Long
+            auditRow = wsRes.Cells(wsRes.Rows.Count, "A").End(xlUp).Row + 1
+            wsRes.Cells(auditRow, 2).Value = "stamp_skipped:" & context & _
+                ":r" & r & "c" & c & ":" & CStr(v)
+            wsRes.Cells(auditRow, 14).Value = CStr(Now)
+        End If
+        On Error GoTo 0
         Exit Sub
     End If
     ws.Cells(r, c).Value = v
