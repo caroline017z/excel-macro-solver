@@ -100,6 +100,13 @@ Private mCalcSecsNPP  As Double
 Private mCalcSecsAppr As Double
 Private mCalcSecsFull As Double
 
+' --- Output-sheet recalc toggle (Python-controllable) ---
+' When True, FinalizeSolveEnvHL / SolveHeadless skip CalcOutputSheetsHL,
+' leaving downstream sheets (Dashboard, Waterfall Sensitivity, etc.)
+' un-recalculated. Excel recalcs them lazily on next interactive open.
+' Default False preserves prior behavior.
+Private mSkipOutputRecalc As Boolean
+
 
 Private Function EnsureSolverResultsSheetHL() As Worksheet
     Dim ws As Worksheet
@@ -343,6 +350,12 @@ Private Sub EscalateCalcTierHL()
 End Sub
 
 Private Sub CalcOutputSheetsHL()
+    ' Honor the Python-controllable skip flag. Set via SetSkipOutputRecalcHL
+    ' before Init / SolveHeadless. Skipping saves 10-30s per run on workbooks
+    ' with heavy Dashboard / Waterfall Sensitivity sheets — Excel will recalc
+    ' them lazily on the next interactive open instead.
+    If mSkipOutputRecalc Then Exit Sub
+
     Dim vSheets As Variant
     Dim vSh     As Variant
     vSheets = Array("Portfolio", "AT Returns_WIP", "Corp Model Output", _
@@ -353,6 +366,15 @@ Private Sub CalcOutputSheetsHL()
         Sheets(CStr(vSh)).Calculate
         On Error GoTo 0
     Next
+End Sub
+
+Public Sub SetSkipOutputRecalcHL(ByVal bSkip As Boolean)
+    ' Public setter for the output-sheet recalc toggle.
+    ' Python calls this via Application.Run before InitSolveEnvHL or
+    ' single-shot SolveHeadless. Both code paths funnel through
+    ' CalcOutputSheetsHL, so guarding there covers chunked and non-chunked
+    ' runs with one switch.
+    mSkipOutputRecalc = bSkip
 End Sub
 
 Private Sub DisableNonCoreSheets()

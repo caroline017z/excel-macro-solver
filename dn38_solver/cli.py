@@ -193,6 +193,30 @@ def main() -> None:
     )
     parser.set_defaults(save_solved=True)
     parser.add_argument(
+        "--no-output-recalc",
+        dest="skip_output_recalc",
+        action="store_true",
+        help=(
+            "Skip the final CalcOutputSheetsHL pass that recalculates Portfolio, "
+            "AT Returns_WIP, Corp Model Output, Cust Prop, Dashboard, Table, and "
+            "Waterfall Sensitivity. Core solve results are unaffected; Excel "
+            "recalcs the output sheets lazily on the next interactive open. "
+            "Saves 10-30s per run on workbooks with #REF!-heavy output sheets."
+        ),
+    )
+    parser.set_defaults(skip_output_recalc=False)
+    parser.add_argument(
+        "--strip-sheets",
+        default="",
+        help=(
+            "Comma-separated list of sheet names to DELETE from the temp copy "
+            "before opening (e.g. 'Dashboard,Waterfall Sensitivity'). Useful "
+            "when output sheets carry stale #REF! cells that slow SaveAs and "
+            "validation. Original workbook is never modified. Only safe when "
+            "no core-sheet formula references the deleted sheets."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -215,6 +239,10 @@ def main() -> None:
         print(f"ERROR: Workbook not found: {workbook_path}")
         sys.exit(1)
 
+    strip_sheets = tuple(
+        s.strip() for s in args.strip_sheets.split(",") if s.strip()
+    )
+
     record = solve_all(
         workbook_path,
         batch_id=args.batch_id,
@@ -224,6 +252,8 @@ def main() -> None:
         use_chunked=args.chunked,
         allow_relaxed=args.allow_relaxed,
         save_solved=args.save_solved,
+        skip_output_recalc=args.skip_output_recalc,
+        strip_sheets=strip_sheets,
     )
 
     # Exit code: 0 if converged or dry-run; 1 otherwise.
