@@ -189,6 +189,23 @@ def run_direct(
         # process state with an Excel session the user has open for their
         # own work.
         excel = win32com.client.DispatchEx("Excel.Application")
+        # msoAutomationSecurityLow = 1. With the default ByUI security
+        # (=2), Excel treats headless automation as no-consent and blocks
+        # macros configured as "Disable with notification" in Trust
+        # Center — surfacing as "Cannot run the macro ... macros may be
+        # disabled." Setting Low scopes the override to this COM session
+        # only, so the user's interactive Excel settings are unchanged.
+        # Surface any failure rather than swallow it — a silent failure
+        # here looks identical to "macro not in workbook" downstream.
+        try:
+            excel.AutomationSecurity = 1
+            log.info("  AutomationSecurity set to Low (=1)")
+        except Exception as as_exc:
+            log.warning(
+                "Could not set AutomationSecurity=1 (%s) — Excel will use "
+                "Trust Center default and may block macro execution.",
+                as_exc,
+            )
         excel.Visible = False
         excel.DisplayAlerts = False
         excel.ScreenUpdating = False
@@ -297,17 +314,27 @@ def run_direct(
                 })
                 continue
 
-            # Switch F2 with targeted recalc
+            # Switch F2 with targeted recalc. The fallback path sets F2
+            # directly via Range.Value, which does NOT trigger recalc under
+            # xlCalculationManual — reads after that would see the previous
+            # project's values. Force a full recalc when we fall back so
+            # the legacy-macro path doesn't silently mix projects.
+            switched_with_recalc = False
             if has_switch:
                 try:
                     excel.Application.Run(
                         f"'{wb.Name}'!SwitchProjectAndRecalc",
                         nt.offset,
                     )
+                    switched_with_recalc = True
                 except Exception:
                     _set_f2(wb, nt.idx_cell, nt.offset)
             else:
                 _set_f2(wb, nt.idx_cell, nt.offset)
+
+            if not switched_with_recalc:
+                with contextlib.suppress(Exception):
+                    excel.CalculateFull()
 
             # Read cells
             solved: dict[str, float | str | None] = {}
@@ -363,22 +390,36 @@ def run_direct(
         # Save solved workbook (opt-out via save_solved=False for fast
         # iteration runs; the post-export validation gate only runs when
         # there's actually a saved file to scan).
+        # Box/OneDrive sync conflicts can silently fail SaveAs — log so a
+        # multi-hour solve doesn't vanish without a trail.
         saved_to = None
         if save_solved:
             wb_path = Path(workbook_path)
             solved_name = wb_path.stem + "_SOLVED" + wb_path.suffix
             solved_path = wb_path.parent / solved_name
-            with contextlib.suppress(Exception):
+            try:
                 wb.SaveAs(str(solved_path))
                 saved_to = str(solved_path)
+            except Exception as save_exc:
+                log.warning(
+                    "SaveAs failed for %s: %s — converged values remain in "
+                    "__SolverResults and the open workbook but no _SOLVED file "
+                    "was written.", solved_path, save_exc,
+                )
 
         # Post-export formula-error gate: scan the just-saved file for
         # cached Excel error tokens (#REF! / #DIV/0! / #VALUE! / etc.).
         # Pure-Python via openpyxl — no LibreOffice dependency.
         validation = None
         if saved_to is not None:
-            with contextlib.suppress(Exception):
+            try:
                 validation = scan_workbook_errors(saved_to)
+            except Exception as val_exc:
+                log.warning(
+                    "Post-export validation scan failed for %s: %s — solve "
+                    "results are still valid but #REF!/#DIV/0! cells were not "
+                    "checked.", saved_to, val_exc,
+                )
 
         total = time.time() - start
 

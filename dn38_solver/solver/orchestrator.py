@@ -344,6 +344,21 @@ def solve_all(
                 dscr_s + npp_s + appr_s + full_s,
             )
 
+        # Tier 3 = Application.CalculateFull fallback. Reaching it means
+        # the cheaper recalc tiers didn't propagate dirty dependents
+        # cleanly. Surface it so a regression in cold-start convergence
+        # isn't buried in __SolverResults!J.
+        try:
+            calc_tier = int(meta.get("calc_tier") or 0)
+        except (TypeError, ValueError):
+            calc_tier = 0
+        if calc_tier >= 3:
+            log.warning(
+                "    %s reached Tier 3 (CalculateFull) — cheaper recalc "
+                "tiers did not propagate cleanly; check model for new "
+                "OFFSET/INDIRECT volatility.", pr.name,
+            )
+
     # Handle batch-level errors
     if batch_result.get("status") == SolveStatus.ERROR.value and not project_results:
         log.error("COM worker error: %s", batch_result.get("error"))
