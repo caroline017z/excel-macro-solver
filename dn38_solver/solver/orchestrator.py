@@ -111,6 +111,7 @@ def solve_all(
     save_solved: bool = True,
     skip_output_recalc: bool = False,
     strip_sheets: tuple[str, ...] = (),
+    workers: int = 1,
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
@@ -277,17 +278,37 @@ def solve_all(
 
     # Phase 3: Run VBA macro via direct COM (no subprocess)
     log.info("[Phase 2] Running VBA macro via direct COM (%d projects)...", len(projects))
-    batch_result = run_direct(
-        workbook_path=str(workbook_path),
-        tasks=tasks,
-        original_f2=int(original_f2) if original_f2 else 1,
-        timeout_sec=timeout_sec,
-        use_chunked=use_chunked,
-        checkpoint_callback=_checkpoint if use_chunked else None,
-        save_solved=save_solved,
-        skip_output_recalc=skip_output_recalc,
-        strip_sheets=strip_sheets,
-    )
+    if workers > 1:
+        # Parallel path: each worker is its own subprocess with its own
+        # Excel COM session and a round-robin slice of projects. Parent
+        # merges per-project output cells from each worker's _SOLVED.xlsm
+        # into a single canonical _SOLVED.xlsm next to the source.
+        # Portfolio-level aggregates may be stale post-merge (acceptable
+        # per Issue #8 design — Excel recalcs them on next interactive
+        # open since the project-column cells are correct).
+        from dn38_solver.com.parallel_runner import run_parallel
+        batch_result = run_parallel(
+            workbook_path=str(workbook_path),
+            tasks=tasks,
+            workers=workers,
+            original_f2=int(original_f2) if original_f2 else 1,
+            timeout_sec=timeout_sec,
+            use_chunked=use_chunked,
+            skip_output_recalc=skip_output_recalc,
+            strip_sheets=strip_sheets,
+        )
+    else:
+        batch_result = run_direct(
+            workbook_path=str(workbook_path),
+            tasks=tasks,
+            original_f2=int(original_f2) if original_f2 else 1,
+            timeout_sec=timeout_sec,
+            use_chunked=use_chunked,
+            checkpoint_callback=_checkpoint if use_chunked else None,
+            save_solved=save_solved,
+            skip_output_recalc=skip_output_recalc,
+            strip_sheets=strip_sheets,
+        )
 
     # Phase 4: Parse results
     project_results: list[ProjectResult] = []
