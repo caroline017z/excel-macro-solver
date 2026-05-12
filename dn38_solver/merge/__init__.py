@@ -43,6 +43,7 @@ from pathlib import Path
 
 from openpyxl.utils import column_index_from_string
 
+from dn38_solver.com.vba_contract import STAMP_CONVERGED_VALUES, vba_call_str
 from dn38_solver.types import SolveTask
 
 log = logging.getLogger(__name__)
@@ -195,6 +196,8 @@ def merge_via_vba_fallback(
         # would raise, the except-and-continue at the bottom of the loop
         # would swallow each error silently, and we'd SaveAs a workbook
         # that looks right but has only worker-0's converged values.
+        # Sourced from vba_contract so a future rename in the .bas surfaces
+        # as a Python ImportError instead of a string-mismatch at runtime.
         try:
             vbp = wb.VBProject
             found = False
@@ -203,7 +206,7 @@ def merge_via_vba_fallback(
                 try:
                     cm = comp.CodeModule
                     if cm.Find(
-                        "StampConvergedValuesHL", 1, 1,
+                        STAMP_CONVERGED_VALUES.name, 1, 1,
                         cm.CountOfLines, 999, True, False, False,
                     ):
                         found = True
@@ -212,7 +215,7 @@ def merge_via_vba_fallback(
                     continue
             if not found:
                 raise RuntimeError(
-                    "StampConvergedValuesHL not found in workbook VBA. "
+                    f"{STAMP_CONVERGED_VALUES.name} not found in workbook VBA. "
                     "The module is required for the merge fallback path; "
                     "re-import SolveHeadless.bas via import_vba_module.py."
                 )
@@ -255,7 +258,7 @@ def merge_via_vba_fallback(
                 # Sub doesn't trip on Variant/Empty across the COM boundary
                 try:
                     excel.Application.Run(
-                        f"'{wb.Name}'!StampConvergedValuesHL",
+                        vba_call_str(wb.Name, STAMP_CONVERGED_VALUES),
                         int(col_idx),
                         float(npp or 0),
                         float(dev_fee or 0),
@@ -266,7 +269,8 @@ def merge_via_vba_fallback(
                     )
                 except Exception as stamp_exc:
                     log.warning(
-                        "  StampConvergedValuesHL failed for col %d (%s): %s",
+                        "  %s failed for col %d (%s): %s",
+                        STAMP_CONVERGED_VALUES.name,
                         col_idx, task.project_name, stamp_exc,
                     )
             wb_other.close()
