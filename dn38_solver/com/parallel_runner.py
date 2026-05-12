@@ -146,7 +146,14 @@ def run_parallel(
     on workers > 1 without other changes downstream:
         {status, project_results, duration_sec, saved_to, error,
          macro_used, open_time_sec, warmup_time_sec, solve_time_sec,
-         read_time_sec, solver_heartbeat, validation}
+         read_time_sec, solver_heartbeat, validation,
+         merge_path, estimated_sequential_sec}
+
+    `merge_path` is one of "openpyxl" | "vba_fallback" | "copy_master" |
+    None and tells the orchestrator how authoritative the merged file is.
+    `estimated_sequential_sec` is the sum of per-project solve seconds
+    (from each worker's __SolverResults timings), so the caller can
+    print real speedup instead of guessing.
     """
     n = max(1, min(workers, MAX_WORKERS))
     if n != workers:
@@ -154,6 +161,19 @@ def run_parallel(
 
     start = time.time()
     parent_tmp = Path(tempfile.mkdtemp(prefix="38dn_parallel_"))
+
+    # Tracked across the try/finally so cleanup can always tear them down,
+    # even if Ctrl+C lands mid-spawn or mid-wait. Without this, an interrupt
+    # during a 20-minute solve leaves N hidden Excel processes running until
+    # the user reboots.
+    procs: list[tuple[int, subprocess.Popen, Path, Path, Path, Path]] = []
+    aggregator = None
+    progress = None
+    saved_to: str | None = None
+    merge_path: str | None = None
+    worker_errors: list[str] = []
+    worker_results: dict[int, dict] = {}
+    project_results: list[dict] = []
 
     # Cap Excel threads per worker so N × Excel doesn't oversubscribe CPU.
     # Validated empirically on SMP WalkTEST: cpu_count // n_workers (24/2=12)
@@ -163,17 +183,39 @@ def run_parallel(
     # sharply diminishing returns past ~4 threads anyway, so the default
     # is a conservative cap that leaves headroom for coordination overhead.
     # User can override via the CLI flag if their workload differs.
+    #
+    # Semantics of `excel_threads_per_worker`:
+    #   None    -> use the default 1/3-of-cores cap (per-worker)
+    #   0       -> no cap; let Excel use its built-in default (cpu_count)
+    #   1..32   -> set Excel's ThreadCount to exactly that value
+    #   >32     -> clamped to 32 (sanity cap; Excel's own implementation
+    #              caps at 1024 but anything past 32 is wasted on the kind
+    #              of dependency-chain heavy recalc this model does)
     cpu = os.cpu_count() or 4
-    if excel_threads_per_worker is not None and excel_threads_per_worker > 0:
-        threads_per_worker = excel_threads_per_worker
-    else:
+    SANITY_MAX_THREADS = 32
+    if excel_threads_per_worker is None:
         # Default: 1/3 of available cores per worker, min 2, max 4.
         # On a 24-core box with 2 workers: 4 + 4 = 8 calc threads, leaving
         # 16 cores for OS / coordination / file I/O.
-        threads_per_worker = max(2, min(4, cpu // (n * 3)))
+        threads_per_worker: int | None = max(2, min(4, cpu // (n * 3)))
+    elif excel_threads_per_worker == 0:
+        threads_per_worker = None  # signals "no cap" to direct_runner
+    else:
+        if excel_threads_per_worker > SANITY_MAX_THREADS:
+            log.warning(
+                "  Clamping excel_threads_per_worker from %d to %d (sanity cap)",
+                excel_threads_per_worker, SANITY_MAX_THREADS,
+            )
+            threads_per_worker = SANITY_MAX_THREADS
+        else:
+            threads_per_worker = int(excel_threads_per_worker)
+    threads_label = (
+        "Excel default (no cap)" if threads_per_worker is None
+        else f"{threads_per_worker} Excel threads each"
+    )
     log.info(
-        "  Parallel mode: %d workers × %d Excel threads each (cpu_count=%d)",
-        n, threads_per_worker, cpu,
+        "  Parallel mode: %d workers × %s (cpu_count=%d)",
+        n, threads_label, cpu,
     )
 
     partitions = _partition_round_robin(tasks, n)
@@ -182,304 +224,362 @@ def run_parallel(
         ", ".join(f"w{i}={len(p)}" for i, p in enumerate(partitions)),
     )
 
-    # Spawn workers. Each worker's stdout/stderr is redirected to a file
-    # in its temp dir, NOT to a subprocess.PIPE — Windows anonymous pipes
-    # have a ~65KB buffer, and a long cold solve can easily emit more than
-    # that to stderr, deadlocking the worker (writes to a full pipe block
-    # until the parent reads, but proc.communicate() is what reads). Log
-    # files round-trip cleanly and let the parent tail them for live
-    # progress without any blocking risk.
-    procs: list[tuple[int, subprocess.Popen, Path, Path, Path, Path]] = []
-    worker_status_paths: list[Path] = []
-    for worker_id, slice_tasks in enumerate(partitions):
-        if not slice_tasks:
-            continue
-        wdir = parent_tmp / f"w{worker_id}"
-        wdir.mkdir(parents=True, exist_ok=True)
-        config_path = wdir / "config.json"
-        result_path = wdir / "result.json"
-        output_path = wdir / f"{Path(workbook_path).stem}_SOLVED_w{worker_id}.xlsm"
-        status_path = wdir / f"solver_status_w{worker_id}.json"
-        worker_status_paths.append(status_path)
+    try:
+        # Spawn workers. Each worker's stdout/stderr is redirected to a file
+        # in its temp dir, NOT to a subprocess.PIPE — Windows anonymous pipes
+        # have a ~65KB buffer, and a long cold solve can easily emit more than
+        # that to stderr, deadlocking the worker (writes to a full pipe block
+        # until the parent reads, but proc.communicate() is what reads). Log
+        # files round-trip cleanly and let the parent tail them for live
+        # progress without any blocking risk.
+        worker_status_paths: list[Path] = []
+        for worker_id, slice_tasks in enumerate(partitions):
+            if not slice_tasks:
+                continue
+            wdir = parent_tmp / f"w{worker_id}"
+            wdir.mkdir(parents=True, exist_ok=True)
+            config_path = wdir / "config.json"
+            result_path = wdir / "result.json"
+            output_path = wdir / f"{Path(workbook_path).stem}_SOLVED_w{worker_id}.xlsm"
+            status_path = wdir / f"solver_status_w{worker_id}.json"
+            worker_status_paths.append(status_path)
 
-        tasks_json = msgspec.json.encode(slice_tasks).decode("utf-8")
-        config = {
-            "workbook_path": workbook_path,
-            "tasks_json": tasks_json,
-            "output_path": str(output_path),
-            "status_path": str(status_path),
-            "worker_id": worker_id,
-            "original_f2": int(original_f2),
-            "timeout_sec": int(timeout_sec),
-            "use_chunked": bool(use_chunked),
-            "skip_output_recalc": bool(skip_output_recalc),
-            "strip_sheets": list(strip_sheets),
-            "excel_threads": threads_per_worker,
-        }
-        config_path.write_text(json.dumps(config), encoding="utf-8")
-
-        cmd = [
-            sys.executable, "-u", "-m", "dn38_solver.com.worker",
-            str(config_path), str(result_path),
-        ]
-        # CREATE_NO_WINDOW = 0x08000000 — suppress console flash for each
-        # worker subprocess. Windows-only flag; ignored on other OS.
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = 0x08000000
-        log.info("  Spawning worker %d (%d projects)...", worker_id, len(slice_tasks))
-        # Open log files unbuffered (binary 'wb' with no flush deferral)
-        # so the parent's tailing thread sees worker writes immediately.
-        stdout_path = wdir / "stdout.log"
-        stderr_path = wdir / "stderr.log"
-        stdout_fh = open(stdout_path, "wb", buffering=0)
-        stderr_fh = open(stderr_path, "wb", buffering=0)
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stdout_fh,
-            stderr=stderr_fh,
-            creationflags=creationflags,
-        )
-        # We keep handles open in the child; the parent doesn't write to
-        # them. Close our parent-side handles so we don't pin the inode.
-        stdout_fh.close()
-        stderr_fh.close()
-        procs.append((worker_id, proc, config_path, result_path, stdout_path, stderr_path))
-
-    # Start the status aggregator. Each worker writes its own status JSON;
-    # the aggregator merges them into the canonical `solver_status.json`
-    # the Streamlit tracker reads, so dashboards work without changes.
-    from dn38_solver.com.direct_runner import STATUS_FILE
-    from dn38_solver.com.status_aggregator import StatusAggregator
-    aggregator = StatusAggregator(
-        worker_status_paths=worker_status_paths,
-        output_path=STATUS_FILE,
-        workbook_path=workbook_path,
-        poll_interval=1.0,
-    )
-    aggregator.start()
-
-    # Live-progress thread: tails each worker's stderr.log and forwards
-    # new lines to the parent log so the terminal isn't silent during
-    # a 10-20 minute cold solve. Without this the user sees nothing
-    # between "Spawning worker N" and "Worker N completed".
-    progress = _WorkerLogTailer(
-        sources=[(wid, err_path) for (wid, _, _, _, _, err_path) in procs],
-        poll_interval=2.0,
-    )
-    progress.start()
-
-    # Wait for all workers. Per-worker timeout is the parent-level timeout
-    # since each worker handles only its slice; the cap should be generous
-    # enough that no worker hits it before its slice's COM session does.
-    worker_results: dict[int, dict] = {}
-    parent_timeout = max(timeout_sec, 60)
-    deadline = time.time() + parent_timeout + 60  # +60s for cleanup grace
-
-    for worker_id, proc, config_path, result_path, stdout_path, stderr_path in procs:
-        remaining = max(1, int(deadline - time.time()))
-        try:
-            # stdout/stderr are redirected to files, so communicate()
-            # blocks only on the process exit — no PIPE buffer to drain.
-            proc.communicate(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            log.warning(
-                "  Worker %d timeout after %ds — terminating and reaping "
-                "child Excel processes by PID", worker_id, remaining,
-            )
-            _kill_worker_excel_children(proc.pid)
-            proc.terminate()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=10)
-            if proc.poll() is None:
-                proc.kill()
-            worker_results[worker_id] = {
-                "status": "error",
-                "error": f"Worker {worker_id} timed out",
-                "project_results": [],
+            tasks_json = msgspec.json.encode(slice_tasks).decode("utf-8")
+            config = {
+                "workbook_path": workbook_path,
+                "tasks_json": tasks_json,
+                "output_path": str(output_path),
+                "status_path": str(status_path),
+                "worker_id": worker_id,
+                "original_f2": int(original_f2),
+                "timeout_sec": int(timeout_sec),
+                "use_chunked": bool(use_chunked),
+                "skip_output_recalc": bool(skip_output_recalc),
+                "strip_sheets": list(strip_sheets),
+                "excel_threads": threads_per_worker,
             }
-            continue
+            config_path.write_text(json.dumps(config), encoding="utf-8")
 
-        # Worker stderr is now in stderr_path and the live tailer has already
-        # forwarded it during the run. Drain any final lines for completeness.
-        with contextlib.suppress(OSError):
-            tail = stderr_path.read_text(encoding="utf-8", errors="replace")
-            # Only forward lines the tailer hasn't already printed; tailer
-            # tracks per-file byte offsets so we just print the recent tail
-            # as INFO if the worker errored, otherwise the lines were
-            # already streamed live.
-            if proc.returncode != 0 and tail.strip():
-                log.info("  --- worker %d stderr tail ---", worker_id)
-                for line in tail.splitlines()[-30:]:
-                    log.info("  %s", line)
+            cmd = [
+                sys.executable, "-u", "-m", "dn38_solver.com.worker",
+                str(config_path), str(result_path),
+            ]
+            # CREATE_NO_WINDOW = 0x08000000 — suppress console flash for each
+            # worker subprocess. Windows-only flag; ignored on other OS.
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = 0x08000000
+            log.info("  Spawning worker %d (%d projects)...", worker_id, len(slice_tasks))
+            # Open log files unbuffered (binary 'wb' with no flush deferral)
+            # so the parent's tailing thread sees worker writes immediately.
+            stdout_path = wdir / "stdout.log"
+            stderr_path = wdir / "stderr.log"
+            stdout_fh = open(stdout_path, "wb", buffering=0)
+            stderr_fh = open(stderr_path, "wb", buffering=0)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+                creationflags=creationflags,
+            )
+            # We keep handles open in the child; the parent doesn't write to
+            # them. Close our parent-side handles so we don't pin the inode.
+            stdout_fh.close()
+            stderr_fh.close()
+            procs.append((worker_id, proc, config_path, result_path, stdout_path, stderr_path))
 
-        if proc.returncode != 0:
-            log.error("  Worker %d exited with code %d", worker_id, proc.returncode)
-            _kill_worker_excel_children(proc.pid)
+        # Start the status aggregator. Each worker writes its own status JSON;
+        # the aggregator merges them into the canonical `solver_status.json`
+        # the Streamlit tracker reads, so dashboards work without changes.
+        from dn38_solver.com.direct_runner import STATUS_FILE
+        from dn38_solver.com.status_aggregator import StatusAggregator
+        aggregator = StatusAggregator(
+            worker_status_paths=worker_status_paths,
+            output_path=STATUS_FILE,
+            workbook_path=workbook_path,
+            poll_interval=1.0,
+        )
+        aggregator.start()
+
+        # Live-progress thread: tails each worker's stderr.log and forwards
+        # new lines to the parent log so the terminal isn't silent during
+        # a 10-20 minute cold solve. Without this the user sees nothing
+        # between "Spawning worker N" and "Worker N completed".
+        progress = _WorkerLogTailer(
+            sources=[(wid, err_path) for (wid, _, _, _, _, err_path) in procs],
+            poll_interval=2.0,
+        )
+        progress.start()
+
+        # Wait for all workers. Per-worker timeout is the parent-level timeout
+        # since each worker handles only its slice; the cap should be generous
+        # enough that no worker hits it before its slice's COM session does.
+        parent_timeout = max(timeout_sec, 60)
+        deadline = time.time() + parent_timeout + 60  # +60s for cleanup grace
+
+        for worker_id, proc, config_path, result_path, stdout_path, stderr_path in procs:
+            remaining = max(1, int(deadline - time.time()))
+            try:
+                # stdout/stderr are redirected to files, so communicate()
+                # blocks only on the process exit — no PIPE buffer to drain.
+                proc.communicate(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                log.warning(
+                    "  Worker %d timeout after %ds — terminating and reaping "
+                    "child Excel processes by PID", worker_id, remaining,
+                )
+                _kill_worker_excel_children(proc.pid)
+                proc.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.communicate(timeout=10)
+                if proc.poll() is None:
+                    proc.kill()
+                worker_results[worker_id] = {
+                    "status": "error",
+                    "error": f"Worker {worker_id} timed out",
+                    "project_results": [],
+                }
+                continue
+
+            # Worker stderr is now in stderr_path and the live tailer has
+            # already forwarded it during the run. Drain any final lines
+            # for completeness.
+            with contextlib.suppress(OSError):
+                tail = stderr_path.read_text(encoding="utf-8", errors="replace")
+                # Only forward lines the tailer hasn't already printed;
+                # tailer tracks per-file byte offsets so we just print the
+                # recent tail as INFO if the worker errored, otherwise the
+                # lines were already streamed live.
+                if proc.returncode != 0 and tail.strip():
+                    log.info("  --- worker %d stderr tail ---", worker_id)
+                    for line in tail.splitlines()[-30:]:
+                        log.info("  %s", line)
+
+            if proc.returncode != 0:
+                log.error("  Worker %d exited with code %d", worker_id, proc.returncode)
+                _kill_worker_excel_children(proc.pid)
+                try:
+                    worker_results[worker_id] = json.loads(
+                        result_path.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    worker_results[worker_id] = {
+                        "status": "error",
+                        "error": f"Worker {worker_id} exited non-zero, no result file",
+                        "project_results": [],
+                    }
+                continue
+
             try:
                 worker_results[worker_id] = json.loads(
                     result_path.read_text(encoding="utf-8")
                 )
-            except Exception:
+            except Exception as exc:
+                log.error("  Could not read worker %d result: %s", worker_id, exc)
                 worker_results[worker_id] = {
                     "status": "error",
-                    "error": f"Worker {worker_id} exited non-zero, no result file",
+                    "error": f"Could not read worker {worker_id} result: {exc}",
                     "project_results": [],
                 }
-            continue
 
-        try:
-            worker_results[worker_id] = json.loads(
-                result_path.read_text(encoding="utf-8")
-            )
-        except Exception as exc:
-            log.error("  Could not read worker %d result: %s", worker_id, exc)
-            worker_results[worker_id] = {
-                "status": "error",
-                "error": f"Could not read worker {worker_id} result: {exc}",
-                "project_results": [],
-            }
+        # Aggregate per-project results in original task order.
+        by_offset: dict[int, dict] = {}
+        for wid, wresult in worker_results.items():
+            if wresult.get("error"):
+                worker_errors.append(f"w{wid}: {wresult['error']}")
+            for pr in wresult.get("project_results", []):
+                # Use the top-level project_offset stamped by direct_runner.
+                # Falling back to name-based lookup is unsafe — portfolios
+                # can have duplicate project names across LLCs.
+                offset = pr.get("project_offset")
+                if offset is None:
+                    meta = pr.get("meta") or {}
+                    offset = meta.get("project_offset") or meta.get("offset")
+                if offset is None:
+                    log.warning(
+                        "Worker %d returned a project_result with no offset "
+                        "key; skipping rather than name-matching (unsafe with "
+                        "duplicate names). project_name=%r",
+                        wid, pr.get("project_name"),
+                    )
+                    continue
+                by_offset[int(offset)] = pr
 
-    # Aggregate per-project results in original task order. Build offset->result.
-    by_offset: dict[int, dict] = {}
-    worker_errors: list[str] = []
-    for wid, wresult in worker_results.items():
-        if wresult.get("error"):
-            worker_errors.append(f"w{wid}: {wresult['error']}")
-        for pr in wresult.get("project_results", []):
-            # Use the top-level project_offset stamped by direct_runner.
-            # Falling back to name-based lookup is unsafe — portfolios can
-            # have duplicate project names across LLCs.
-            offset = pr.get("project_offset")
-            if offset is None:
-                meta = pr.get("meta") or {}
-                offset = meta.get("project_offset") or meta.get("offset")
-            if offset is None:
-                log.warning(
-                    "Worker %d returned a project_result with no offset key; "
-                    "skipping rather than name-matching (unsafe with "
-                    "duplicate names). project_name=%r",
-                    wid, pr.get("project_name"),
-                )
-                continue
-            by_offset[int(offset)] = pr
+        for t in tasks:
+            pr = by_offset.get(t.project_offset)
+            if pr is None:
+                project_results.append({
+                    "project_name": t.project_name,
+                    "status": "not_attempted",
+                    "solved_values": {},
+                    "iterations_used": 0,
+                    "duration_sec": 0,
+                    "meta": {},
+                })
+            else:
+                project_results.append(pr)
 
-    project_results: list[dict] = []
-    for t in tasks:
-        pr = by_offset.get(t.project_offset)
-        if pr is None:
-            project_results.append({
-                "project_name": t.project_name,
-                "status": "not_attempted",
-                "solved_values": {},
-                "iterations_used": 0,
-                "duration_sec": 0,
-                "meta": {},
-            })
-        else:
-            project_results.append(pr)
-
-    # Merge the worker _SOLVED.xlsm files into one canonical output.
-    # Strategy: pick a successfully-converged worker as master, copy
-    # converged cells (the per-project columns) from each other worker's
-    # file via openpyxl. Cross-project portfolio aggregates may be stale
-    # per Caroline's spec — Excel recalcs them on next interactive open.
-    saved_to: str | None = None
-    # Prefer the lowest-id worker whose status is "converged" AND who
-    # actually saved a file. Falling back to procs[0] regardless of
-    # outcome risks merging on top of an errored worker's empty/corrupt
-    # output.
-    candidate_masters = sorted(
-        (wid for wid, r in worker_results.items()
-         if r.get("status") == "converged" and r.get("saved_to")
-         and Path(r["saved_to"]).exists()),
-    )
-    if candidate_masters:
-        master_worker_id = candidate_masters[0]
-        master_result = worker_results.get(master_worker_id, {})
-        master_src = master_result.get("saved_to")
-        if master_src and Path(master_src).exists():
-            wb_path = Path(workbook_path)
-            final_path = wb_path.parent / f"{wb_path.stem}_SOLVED{wb_path.suffix}"
-            try:
-                _merge_solved_workbooks(
-                    master_src=Path(master_src),
-                    others=[
+        # Merge the worker _SOLVED.xlsm files into one canonical output.
+        # Strategy: pick a successfully-converged worker as master, copy
+        # converged cells (the per-project columns) from each other worker's
+        # file via openpyxl. Cross-project portfolio aggregates may be stale
+        # per Caroline's spec — Excel recalcs them on next interactive open.
+        # Prefer the lowest-id worker whose status is "converged" AND who
+        # actually saved a file. Falling back to procs[0] regardless of
+        # outcome risks merging on top of an errored worker's empty/corrupt
+        # output.
+        candidate_masters = sorted(
+            (wid for wid, r in worker_results.items()
+             if r.get("status") == "converged" and r.get("saved_to")
+             and Path(r["saved_to"]).exists()),
+        )
+        if candidate_masters:
+            master_worker_id = candidate_masters[0]
+            master_result = worker_results.get(master_worker_id, {})
+            master_src = master_result.get("saved_to")
+            if master_src and Path(master_src).exists():
+                wb_path = Path(workbook_path)
+                final_path = wb_path.parent / f"{wb_path.stem}_SOLVED{wb_path.suffix}"
+                try:
+                    _merge_solved_workbooks(
+                        master_src=Path(master_src),
+                        others=[
+                            Path(worker_results[wid].get("saved_to", ""))
+                            for wid in worker_results
+                            if wid != master_worker_id
+                            and worker_results[wid].get("saved_to")
+                        ],
+                        final_path=final_path,
+                        partitions=partitions,
+                        master_worker_id=master_worker_id,
+                    )
+                    saved_to = str(final_path)
+                    merge_path = "openpyxl"
+                    log.info("  Merged %d worker output(s) into %s",
+                             len(worker_results), final_path)
+                except Exception as merge_exc:
+                    # openpyxl merge failed — most likely keep_vba=True did
+                    # not survive the round-trip on this workbook's macro
+                    # project. Fall back to a VBA-side merge that uses Excel
+                    # COM (which handles .xlsm natively) to stamp converged
+                    # column values from peer workers into the master.
+                    log.warning(
+                        "  openpyxl merge failed (%s) — trying VBA-helper "
+                        "fallback via Excel COM", merge_exc,
+                    )
+                    others_paths = [
                         Path(worker_results[wid].get("saved_to", ""))
                         for wid in worker_results
                         if wid != master_worker_id
                         and worker_results[wid].get("saved_to")
-                    ],
-                    final_path=final_path,
-                    partitions=partitions,
-                    master_worker_id=master_worker_id,
-                )
-                saved_to = str(final_path)
-                log.info("  Merged %d worker output(s) into %s",
-                         len(worker_results), final_path)
-            except Exception as merge_exc:
-                # openpyxl merge failed — most likely keep_vba=True did
-                # not survive the round-trip on this workbook's macro
-                # project. Fall back to a VBA-side merge that uses Excel
-                # COM (which handles .xlsm natively) to stamp converged
-                # column values from peer workers into the master.
-                log.warning(
-                    "  openpyxl merge failed (%s) — trying VBA-helper "
-                    "fallback via Excel COM", merge_exc,
-                )
-                others_paths = [
-                    Path(worker_results[wid].get("saved_to", ""))
-                    for wid in worker_results
-                    if wid != master_worker_id
-                    and worker_results[wid].get("saved_to")
-                ]
-                try:
-                    _merge_via_vba_fallback(
-                        master_src=Path(master_src),
-                        others=others_paths,
-                        final_path=final_path,
-                        partitions=partitions,
-                        worker_results=worker_results,
-                        master_worker_id=master_worker_id,
-                    )
-                    saved_to = str(final_path)
-                    log.info(
-                        "  VBA-helper fallback succeeded: merged %d output(s) into %s",
-                        len(worker_results), final_path,
-                    )
-                except Exception as vba_exc:
-                    log.warning(
-                        "  VBA-helper fallback also failed (%s) — copying "
-                        "master worker's output as-is. Per-project columns "
-                        "owned by other workers will reflect their PRE-solve "
-                        "values; consult the per-worker _SOLVED.xlsm files "
-                        "in %s for forensic recovery.",
-                        vba_exc, parent_tmp,
-                    )
-                    with contextlib.suppress(Exception):
-                        shutil.copy2(master_src, final_path)
+                    ]
+                    try:
+                        _merge_via_vba_fallback(
+                            master_src=Path(master_src),
+                            others=others_paths,
+                            final_path=final_path,
+                            partitions=partitions,
+                            worker_results=worker_results,
+                            master_worker_id=master_worker_id,
+                        )
                         saved_to = str(final_path)
-                    # Force run-level error so the user knows the merged
-                    # file is not authoritative and so parent_tmp is
-                    # preserved for forensics (see cleanup gate below).
-                    worker_errors.append(
-                        "merge fell back to master-only — per-project "
-                        "columns owned by non-master workers reflect "
-                        "PRE-solve values, not converged values"
+                        merge_path = "vba_fallback"
+                        log.info(
+                            "  VBA-helper fallback succeeded: merged %d output(s) into %s",
+                            len(worker_results), final_path,
+                        )
+                    except Exception as vba_exc:
+                        log.warning(
+                            "  VBA-helper fallback also failed (%s) — copying "
+                            "master worker's output as-is. Per-project columns "
+                            "owned by other workers will reflect their PRE-solve "
+                            "values; consult the per-worker _SOLVED.xlsm files "
+                            "in %s for forensic recovery.",
+                            vba_exc, parent_tmp,
+                        )
+                        with contextlib.suppress(Exception):
+                            shutil.copy2(master_src, final_path)
+                            saved_to = str(final_path)
+                            merge_path = "copy_master"
+                        # Force run-level error so the user knows the merged
+                        # file is not authoritative and so parent_tmp is
+                        # preserved for forensics (see cleanup gate below).
+                        worker_errors.append(
+                            "merge fell back to master-only — per-project "
+                            "columns owned by non-master workers reflect "
+                            "PRE-solve values, not converged values"
+                        )
+
+                # Post-merge sanity gate. Re-open the merged file and
+                # confirm the hard-stamped convergence cells match what
+                # each worker reported. If they don't, the merge silently
+                # corrupted data and we must surface that as an error so
+                # the user doesn't ship a file with wrong NPP / FMV /
+                # Dev Fee in some columns. Skip the gate when we already
+                # know the merge fell back to master-only — its mismatches
+                # are expected and would just spam the log.
+                if saved_to and merge_path in ("openpyxl", "vba_fallback"):
+                    mismatches = _verify_merged_file(
+                        final_path=Path(saved_to),
+                        worker_results=worker_results,
+                        partitions=partitions,
                     )
-    else:
-        # No worker produced a saved, converged output — nothing to merge.
-        # Surface this clearly so the orchestrator marks the run as error
-        # and keeps parent_tmp for forensics.
-        log.error(
-            "  No worker produced a converged _SOLVED.xlsm — skipping merge. "
-            "Worker outcomes: %s",
-            {wid: r.get("status") for wid, r in worker_results.items()},
-        )
-        worker_errors.append(
-            "no converged worker output to merge — all workers errored or "
-            "produced no saved file"
-        )
+                    if mismatches:
+                        log.error(
+                            "  Post-merge verification: %d cell mismatch(es) "
+                            "between merged file and worker reports",
+                            len(mismatches),
+                        )
+                        for m in mismatches[:10]:
+                            log.error("    %s", m)
+                        if len(mismatches) > 10:
+                            log.error("    ... (%d more)", len(mismatches) - 10)
+                        worker_errors.append(
+                            f"merged file failed sanity gate "
+                            f"({len(mismatches)} cell mismatch(es)) — "
+                            f"per-worker outputs in {parent_tmp} are authoritative"
+                        )
+                    else:
+                        log.info("  Post-merge verification: OK")
+        else:
+            # No worker produced a saved, converged output — nothing to merge.
+            # Surface this clearly so the orchestrator marks the run as error
+            # and keeps parent_tmp for forensics.
+            log.error(
+                "  No worker produced a converged _SOLVED.xlsm — skipping merge. "
+                "Worker outcomes: %s",
+                {wid: r.get("status") for wid, r in worker_results.items()},
+            )
+            worker_errors.append(
+                "no converged worker output to merge — all workers errored or "
+                "produced no saved file"
+            )
+
+    finally:
+        # Always tear down workers and the helper threads, including on
+        # KeyboardInterrupt or any unhandled exception during merge. Order
+        # matters: kill workers first so their final stderr writes have
+        # a chance to land before the tailer stops.
+        for wid, p, _cfg, _res, _out, _err in procs:
+            if p.poll() is None:
+                log.warning(
+                    "  Cleanup: terminating worker %d (pid=%d) and its "
+                    "Excel children", wid, p.pid,
+                )
+                _kill_worker_excel_children(p.pid)
+                with contextlib.suppress(Exception):
+                    p.terminate()
+                with contextlib.suppress(Exception):
+                    p.wait(timeout=5)
+                if p.poll() is None:
+                    with contextlib.suppress(Exception):
+                        p.kill()
+        if progress is not None:
+            with contextlib.suppress(Exception):
+                progress.stop(join_timeout=5.0)
+        if aggregator is not None:
+            with contextlib.suppress(Exception):
+                aggregator.stop(join_timeout=5.0)
 
     # Cleanup worker temp dirs (keep parent tmp_dir only if a worker errored
     # — useful for forensics; otherwise drop everything).
@@ -506,13 +606,19 @@ def run_parallel(
             float(w.get(key, 0) or 0) for w in worker_results.values()
         )
 
-    # Stop the progress tailer and status aggregator before returning so
-    # the final solver_status.json reflects the terminal state and any
-    # remaining tail lines are forwarded. Daemon threads, so a join
-    # failure won't block the process — but in normal flow they exit
-    # within poll_interval.
-    progress.stop(join_timeout=2.0)
-    aggregator.stop(join_timeout=2.0)
+    # Estimated sequential time = sum of every project's solve_seconds
+    # (from VBA's __SolverResults!M, surfaced as meta["solve_seconds"]).
+    # Comparing the parallel wall time to this gives the actual speedup,
+    # which is more useful than "elapsed vs. previous run" since project
+    # mix differs across runs.
+    estimated_sequential = 0.0
+    for wresult in worker_results.values():
+        for pr in wresult.get("project_results", []):
+            meta = pr.get("meta") or {}
+            try:
+                estimated_sequential += float(meta.get("solve_seconds") or 0.0)
+            except (TypeError, ValueError):
+                pass
 
     return {
         "status": batch_status,
@@ -528,7 +634,126 @@ def run_parallel(
         "solver_heartbeat": None,
         "validation": None,
         "workers_used": n,
+        "merge_path": merge_path,
+        "estimated_sequential_sec": round(estimated_sequential, 2),
     }
+
+
+def _verify_merged_file(
+    *,
+    final_path: Path,
+    worker_results: dict[int, dict],
+    partitions: list[list[SolveTask]],
+    abs_tol: float = 0.01,
+) -> list[str]:
+    """Re-open the merged xlsm and assert the hard-stamped convergence
+    cells match what each worker reported.
+
+    Returns a list of mismatch strings (empty list = clean merge).
+
+    Why this exists: every merge path (openpyxl AND VBA-helper) iterates
+    per-project, copying convergence values from peer worker files into
+    the master. A silent failure inside that loop — wrong column letter,
+    swallowed COM exception, peer file corrupted — would leave the merged
+    file with PRE-solve values in some columns and the user would only
+    notice when an IC memo derived from the file produced wrong numbers.
+    Better to surface the inconsistency at run-end and force the user to
+    consult the per-worker outputs.
+
+    Tolerance defaults to $0.01/W since the cells are hard-stamped exact
+    floats (cell-self-assign in VBA), but we leave a small slack for any
+    openpyxl serialization rounding.
+    """
+    import openpyxl
+    from openpyxl.utils import column_index_from_string
+
+    HARD_STAMPED_ROWS = (31, 32, 33, 37, 38, 39)
+    mismatches: list[str] = []
+
+    try:
+        wb = openpyxl.load_workbook(
+            str(final_path), data_only=True, read_only=True, keep_vba=True,
+        )
+    except Exception as exc:
+        return [f"merged file unreadable: {exc}"]
+
+    try:
+        if "Project Inputs" not in wb.sheetnames:
+            return ["merged file has no 'Project Inputs' sheet"]
+        ws = wb["Project Inputs"]
+
+        # Build name -> result lookup. Worker results carry project_name;
+        # we use that to find the worker's solved_values dict for each
+        # task. Duplicate names across LLCs are unlikely at the per-worker
+        # slice level (round-robin partition spreads them), but we log a
+        # warning if we hit one rather than picking arbitrarily.
+        name_to_result: dict[str, dict] = {}
+        for wresult in worker_results.values():
+            for pr in wresult.get("project_results", []):
+                pname = pr.get("project_name")
+                if not pname:
+                    continue
+                if pname in name_to_result:
+                    log.warning(
+                        "  Verify: duplicate project_name %r across workers; "
+                        "verification may be ambiguous", pname,
+                    )
+                name_to_result[pname] = pr
+
+        for tasks_slice in partitions:
+            for task in tasks_slice:
+                pr = name_to_result.get(task.project_name)
+                if pr is None:
+                    continue
+                # Only verify converged projects. Non-converged projects
+                # legitimately have stale or missing values in the worker
+                # report, so a mismatch there is meaningless noise.
+                if pr.get("status") != "converged":
+                    continue
+                sv = pr.get("solved_values", {})
+                col_idx = column_index_from_string(task.project_col_letter)
+                for row in HARD_STAMPED_ROWS:
+                    expected = sv.get(
+                        f"Project Inputs!{task.project_col_letter}{row}"
+                    )
+                    if expected is None:
+                        continue
+                    try:
+                        expected_f = float(expected)
+                    except (TypeError, ValueError):
+                        continue
+                    actual = ws.cell(row=row, column=col_idx).value
+                    if actual is None:
+                        mismatches.append(
+                            f"{task.project_name} "
+                            f"{task.project_col_letter}{row}: "
+                            f"merged value missing (None); "
+                            f"expected {expected_f:.4f}"
+                        )
+                        continue
+                    try:
+                        actual_f = float(actual)
+                    except (TypeError, ValueError):
+                        mismatches.append(
+                            f"{task.project_name} "
+                            f"{task.project_col_letter}{row}: "
+                            f"merged value not numeric ({actual!r}); "
+                            f"expected {expected_f:.4f}"
+                        )
+                        continue
+                    if abs(actual_f - expected_f) > abs_tol:
+                        mismatches.append(
+                            f"{task.project_name} "
+                            f"{task.project_col_letter}{row}: "
+                            f"merged={actual_f:.4f} vs "
+                            f"worker-reported={expected_f:.4f} "
+                            f"(diff={actual_f - expected_f:+.4f})"
+                        )
+    finally:
+        with contextlib.suppress(Exception):
+            wb.close()
+
+    return mismatches
 
 
 def _merge_solved_workbooks(

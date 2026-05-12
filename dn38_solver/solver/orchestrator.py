@@ -299,6 +299,29 @@ def solve_all(
             strip_sheets=strip_sheets,
             excel_threads_per_worker=excel_threads_per_worker,
         )
+        # Persist per-project checkpoints for the parallel path. The chunked
+        # single-worker path uses an in-flight checkpoint_callback; parallel
+        # workers can't share the parent's SQLite connection across processes,
+        # so we batch-write here after run_parallel returns. Restores the
+        # documented `--show-checkpoints <batch_id>` forensics path which
+        # would otherwise show empty for any parallel run.
+        for raw in batch_result.get("project_results", []):
+            project_obj = project_lookup.get(raw.get("project_name"))
+            if project_obj is None:
+                continue
+            partial = _parse_project_result(project_obj, raw)
+            try:
+                save_project_checkpoint(
+                    conn,
+                    batch_id=batch_id,
+                    workbook_name=workbook_path.name,
+                    project=partial,
+                )
+            except Exception as cp_exc:
+                log.warning(
+                    "Parallel checkpoint write failed for %s: %s",
+                    project_obj.name, cp_exc,
+                )
     else:
         batch_result = run_direct(
             workbook_path=str(workbook_path),
@@ -471,9 +494,48 @@ def solve_all(
     log.info("=" * 60)
     log.info("  COMPLETE - %d project(s) in %.1fs (COM: %.1fs)",
              len(project_results), total_time, batch_result.get("duration_sec", 0))
+
+    # Parallel-mode signals: speedup vs estimated sequential and the merge
+    # path that produced the canonical _SOLVED.xlsm. Both are no-ops in
+    # single-worker mode (run_direct doesn't return them).
+    if workers > 1:
+        est_seq = batch_result.get("estimated_sequential_sec")
+        if est_seq and total_time > 0:
+            speedup = est_seq / total_time
+            log.info(
+                "  Parallel speedup: %.2fx (%.1fs parallel vs %.1fs estimated sequential)",
+                speedup, total_time, est_seq,
+            )
+        merge_path = batch_result.get("merge_path")
+        if merge_path == "openpyxl":
+            log.info("  Merge path: openpyxl (per-project columns authoritative)")
+        elif merge_path == "vba_fallback":
+            log.warning(
+                "  Merge path: VBA-helper fallback used \u2014 openpyxl could not "
+                "round-trip the macro project. File is correct; flag if recurring."
+            )
+        elif merge_path == "copy_master":
+            log.error(
+                "  Merge path: copy_master fallback \u2014 only worker-0's columns "
+                "are converged. Consult per-worker outputs in the temp dir."
+            )
+
     if batch_result.get("saved_to"):
         log.info("  Solved workbook: %s", batch_result["saved_to"])
     log.info("  Run id=%d | Status: %s", row_id, record.status)
+
+    # Convergence-tier rollup so the user sees at a glance how many
+    # projects hit strict vs relaxed vs no convergence \u2014 one number per
+    # tier rather than scanning the per-project table.
+    tier_counts: dict[str, int] = {"strict": 0, "relaxed": 0, "none": 0}
+    for r in project_results:
+        tier_counts[r.convergence_tier] = tier_counts.get(r.convergence_tier, 0) + 1
+    log.info(
+        "  Convergence: %d strict / %d relaxed / %d none (of %d total)",
+        tier_counts["strict"], tier_counts["relaxed"], tier_counts["none"],
+        len(project_results),
+    )
+
     log.info("=" * 60)
     log.info("  %-28s %10s %10s %10s %8s %12s",
              "Project", "NPP $/W", "Dev Fee", "FMV", "DSCR", "Status")

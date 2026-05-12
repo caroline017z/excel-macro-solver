@@ -35,8 +35,22 @@ def _phase_rank(phase: str) -> int:
         return -1  # unknown phases (e.g., "error") sort first
 
 
-def _aggregate(payloads: list[dict], workbook_path: str) -> dict:
-    """Merge a list of worker status payloads into one aggregate."""
+def _aggregate(
+    payloads: list[dict],
+    workbook_path: str,
+    *,
+    expected_worker_count: int | None = None,
+) -> dict:
+    """Merge a list of worker status payloads into one aggregate.
+
+    `expected_worker_count` is the number of workers the parent spawned.
+    When provided, we refuse to roll up to "complete" until that many
+    workers have actually written their terminal status — otherwise a
+    slow-to-start worker (still importing pythoncom, opening Excel) gets
+    dropped from the rollup and the dashboard prematurely shows the run
+    as done. Without this guard, the user sees "complete" while one
+    worker is still busy solving.
+    """
     if not payloads:
         return {
             "phase": "opening",
@@ -53,6 +67,16 @@ def _aggregate(payloads: list[dict], workbook_path: str) -> dict:
         # Least-completed phase wins
         phases = [p.get("phase", "opening") for p in payloads]
         overall_phase = min(phases, key=_phase_rank)
+        # Don't roll up to "complete" until every expected worker has
+        # actually reported. Missing payloads here mean a worker hasn't
+        # written its first status yet (still in subprocess startup) —
+        # downgrading to "opening" keeps the dashboard honest.
+        if (
+            overall_phase == "complete"
+            and expected_worker_count is not None
+            and len(payloads) < expected_worker_count
+        ):
+            overall_phase = "opening"
 
     merged_projects: list[dict] = []
     for p in payloads:
@@ -127,12 +151,22 @@ class StatusAggregator(threading.Thread):
         output_path: Path,
         workbook_path: str,
         poll_interval: float = 1.0,
+        expected_worker_count: int | None = None,
     ) -> None:
         super().__init__(daemon=True, name="StatusAggregator")
         self._paths = list(worker_status_paths)
         self._out = output_path
         self._wb_path = workbook_path
         self._interval = poll_interval
+        # Default to len(worker_status_paths): the parent passes one path
+        # per worker it spawned, so this is the right baseline. Callers
+        # can override (e.g., when one worker had no tasks and didn't get
+        # a status path).
+        self._expected_workers = (
+            expected_worker_count
+            if expected_worker_count is not None
+            else len(worker_status_paths)
+        )
         self._stop_evt = threading.Event()
 
     def run(self) -> None:
@@ -152,7 +186,10 @@ class StatusAggregator(threading.Thread):
                 # Worker hasn't written its first status yet, or is mid-write
                 # (the worker's _StatusWriter uses atomic-swap so this is rare)
                 continue
-        agg = _aggregate(payloads, self._wb_path)
+        agg = _aggregate(
+            payloads, self._wb_path,
+            expected_worker_count=self._expected_workers,
+        )
         _atomic_write_json(self._out, agg)
 
     def stop(self, *, join_timeout: float = 5.0) -> None:
