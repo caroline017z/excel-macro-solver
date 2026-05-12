@@ -58,7 +58,7 @@ def main() -> int:
 
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception as exc:
+    except (OSError, json.JSONDecodeError) as exc:
         sys.stderr.write(f"Worker failed to read config: {exc}\n")
         return 2
 
@@ -145,7 +145,11 @@ def main() -> int:
             timeout_sec=int(config.get("timeout_sec", 3600)),
             use_chunked=bool(config.get("use_chunked", True)),
             checkpoint_callback=None,  # parent does checkpoint aggregation
-            save_solved=True,
+            # save_solved must reflect the parent's intent — defaults
+            # True so existing solo-worker calls keep producing
+            # _SOLVED.xlsm; parallel runs forward the parent's
+            # save_solved kwarg via config.
+            save_solved=bool(config.get("save_solved", True)),
             skip_output_recalc=bool(config.get("skip_output_recalc", False)),
             strip_sheets=tuple(config.get("strip_sheets", [])),
             output_path=config["output_path"],
