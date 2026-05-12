@@ -142,6 +142,9 @@ def run_direct(
     save_solved: bool = True,
     skip_output_recalc: bool = False,
     strip_sheets: tuple[str, ...] = (),
+    output_path: str | None = None,
+    status_path: Path | None = None,
+    excel_threads: int | None = None,
 ) -> dict:
     """Open Excel, run SolveHeadless, read results, close. All in-process.
 
@@ -177,6 +180,20 @@ def run_direct(
     is untouched (direct_runner always operates on a tempfile copy).
     Deletion is more aggressive than skip_output_recalc — only safe when
     no core-sheet formula references the deleted sheets.
+
+    `output_path` overrides the default `<workbook>_SOLVED.xlsm` location.
+    Used by the parallel runner so each worker saves to its own temp dir
+    instead of all workers racing on the same path next to the source.
+
+    `status_path` overrides the default solver_status.json location. Used
+    by the parallel runner so each worker writes its own status file
+    (solver_status_w{id}.json) instead of multiple workers stomping on
+    the canonical one.
+
+    `excel_threads` caps Excel's MultiThreadedCalculation.ThreadCount.
+    Default None uses Excel's default (= Environment.ProcessorCount). Set
+    to cpu_count // workers in parallel mode so N workers don't oversubscribe
+    the CPU (4 workers × 8 threads = 32 OS threads competing).
     """
     import pythoncom
     import win32com.client
@@ -270,6 +287,25 @@ def run_direct(
         excel.ScreenUpdating = False
         excel.EnableEvents = False
 
+        # Cap multi-threaded calc threads if requested. In parallel mode
+        # we want each Excel instance to use fewer threads so N workers
+        # don't oversubscribe the CPU (4 workers × default 8 threads = 32
+        # OS threads thrashing). Single-process runs leave it at Excel's
+        # default (= cpu_count) for max single-instance throughput.
+        if excel_threads is not None and excel_threads > 0:
+            try:
+                excel.MultiThreadedCalculation.Enabled = True
+                excel.MultiThreadedCalculation.ThreadCount = excel_threads
+                log.info(
+                    "  MultiThreadedCalculation.ThreadCount capped at %d",
+                    excel_threads,
+                )
+            except Exception as mtc_exc:
+                log.warning(
+                    "Could not cap MultiThreadedCalculation threads (%s)",
+                    mtc_exc,
+                )
+
         # Normalize task payloads once so the per-project loop is branch-free.
         norm_tasks = [_norm_task(t) for t in tasks]
         proj_names = [nt.name for nt in norm_tasks]
@@ -278,6 +314,7 @@ def run_direct(
             workbook_path=workbook_path,
             proj_names=proj_names,
             start=start,
+            path=status_path if status_path is not None else STATUS_FILE,
         )
         status.update("opening", per_project_status="pending")
 
@@ -472,9 +509,12 @@ def run_direct(
         # multi-hour solve doesn't vanish without a trail.
         saved_to = None
         if save_solved:
-            wb_path = Path(workbook_path)
-            solved_name = wb_path.stem + "_SOLVED" + wb_path.suffix
-            solved_path = wb_path.parent / solved_name
+            if output_path is not None:
+                solved_path = Path(output_path)
+            else:
+                wb_path = Path(workbook_path)
+                solved_name = wb_path.stem + "_SOLVED" + wb_path.suffix
+                solved_path = wb_path.parent / solved_name
             try:
                 wb.SaveAs(str(solved_path))
                 saved_to = str(solved_path)

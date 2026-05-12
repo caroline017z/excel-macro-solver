@@ -208,6 +208,19 @@ def main() -> None:
     )
     parser.set_defaults(skip_output_recalc=False)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel Excel worker processes (default: 1, "
+            "single-process). Each worker opens its own Excel instance "
+            "against its own temp copy and solves a round-robin slice "
+            "of projects. Forces --chunked when > 1. Timeout is per-worker, "
+            "not portfolio-wide. Capped at 8. Recommended: 2-4 for cold "
+            "portfolios on a typical laptop (each Excel uses ~1-2GB RAM)."
+        ),
+    )
+    parser.add_argument(
         "--strip-sheets",
         default="",
         help=(
@@ -248,17 +261,25 @@ def main() -> None:
         s.strip() for s in args.strip_sheets.split(",") if s.strip()
     )
 
+    # --workers > 1 forces --chunked. Single-shot SolveHeadless across
+    # multiple workers makes no sense (each worker runs one macro call
+    # for its entire slice; we want per-project granularity for parallel).
+    use_chunked = args.chunked or (args.workers > 1)
+    if args.workers > 1 and not args.chunked:
+        print("Note: --workers > 1 implies --chunked", file=sys.stderr)
+
     record = solve_all(
         workbook_path,
         batch_id=args.batch_id,
         dry_run=args.dry_run,
         timeout_sec=args.timeout,
         strict_validation=args.strict_validation,
-        use_chunked=args.chunked,
+        use_chunked=use_chunked,
         allow_relaxed=args.allow_relaxed,
         save_solved=args.save_solved,
         skip_output_recalc=args.skip_output_recalc,
         strip_sheets=strip_sheets,
+        workers=args.workers,
     )
 
     # Exit code: 0 if converged or dry-run; 1 otherwise.
