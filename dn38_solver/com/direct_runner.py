@@ -140,6 +140,8 @@ def run_direct(
     use_chunked: bool = False,
     checkpoint_callback: Callable[[object, dict], None] | None = None,
     save_solved: bool = True,
+    skip_output_recalc: bool = False,
+    strip_sheets: tuple[str, ...] = (),
 ) -> dict:
     """Open Excel, run SolveHeadless, read results, close. All in-process.
 
@@ -161,6 +163,20 @@ def run_direct(
     When `save_solved` is False, the `<workbook>_SOLVED.xlsm` SaveAs at
     end of run is skipped. Useful for fast iteration on Box-mounted
     workbooks where the save is a nontrivial fixed cost.
+
+    When `skip_output_recalc` is True, VBA skips CalcOutputSheetsHL at
+    finalize — the 7 downstream output sheets (Portfolio, AT Returns_WIP,
+    Corp Model Output, Cust Prop, Dashboard, Table, Waterfall Sensitivity)
+    are left un-recalculated. Excel recalcs them lazily on next interactive
+    open. Saves 10-30s on workbooks with #REF!-heavy Dashboard / Waterfall.
+
+    `strip_sheets` is a tuple of sheet names to DELETE from the temp copy
+    via openpyxl before Excel opens it. Use to drop non-essential output
+    sheets (e.g. Dashboard with 50K #REF! cells) so SaveAs and the post-
+    export validation scan don't pay to serialize them. Original workbook
+    is untouched (direct_runner always operates on a tempfile copy).
+    Deletion is more aggressive than skip_output_recalc — only safe when
+    no core-sheet formula references the deleted sheets.
     """
     import pythoncom
     import win32com.client
@@ -169,6 +185,49 @@ def run_direct(
     tmp_dir = Path(tempfile.mkdtemp(prefix="38dn_com_"))
     temp_path = tmp_dir / Path(workbook_path).name
     shutil.copy2(workbook_path, str(temp_path))
+
+    # Optional: strip non-essential sheets from the temp copy before Excel
+    # opens it. Saves SaveAs time, post-export validation time, and removes
+    # the recalc cost for sheets the user doesn't review per solve. The
+    # original workbook on Box/OneDrive is unaffected — we always operate
+    # on a tempfile copy.
+    if strip_sheets:
+        # Hard guardrail: refuse to strip sheets the solver / deal team
+        # depend on every run. Even if the user passes one of these names,
+        # silently skip it and log a warning rather than corrupt the run.
+        _CRITICAL_SHEETS = {
+            "Dashboard", "Table", "PT Returns", "NPP Calc", "Appraisal",
+            "Perm Debt", "Tax Equity", "CL", "Project Inputs",
+        }
+        requested = list(strip_sheets)
+        rejected = [s for s in requested if s in _CRITICAL_SHEETS]
+        safe_to_strip = [s for s in requested if s not in _CRITICAL_SHEETS]
+        if rejected:
+            log.warning(
+                "Refusing to strip critical sheet(s): %s. These sheets "
+                "must recalc every run. Stripping ignored for these names.",
+                ", ".join(rejected),
+            )
+        if safe_to_strip:
+            try:
+                import openpyxl
+                wb_strip = openpyxl.load_workbook(str(temp_path), keep_vba=True)
+                removed = []
+                for sheet_name in safe_to_strip:
+                    if sheet_name in wb_strip.sheetnames:
+                        del wb_strip[sheet_name]
+                        removed.append(sheet_name)
+                if removed:
+                    wb_strip.save(str(temp_path))
+                    log.info("  Stripped %d sheet(s) from temp copy: %s",
+                             len(removed), ", ".join(removed))
+                wb_strip.close()
+            except Exception as strip_exc:
+                log.warning(
+                    "Sheet strip failed (%s) — proceeding with full workbook. "
+                    "Common cause: a core-sheet formula references the deleted "
+                    "sheet, which would create #REF! errors on save.", strip_exc,
+                )
 
     excel = None
     wb = None
@@ -232,6 +291,25 @@ def run_direct(
         log.info("  Opened in %.1fs", open_time)
 
         warmup_time = 0.0
+
+        # Propagate the skip-output-recalc flag to VBA before either macro
+        # path runs. Both single-shot SolveHeadless and chunked Finalize
+        # funnel through CalcOutputSheetsHL, which checks mSkipOutputRecalc
+        # at its top. Older workbooks without the setter silently ignore
+        # the call (the macro defaults to recalc, preserving prior behavior).
+        if skip_output_recalc:
+            try:
+                excel.Application.Run(
+                    f"'{wb.Name}'!SetSkipOutputRecalcHL",
+                    True,
+                )
+                log.info("  Output-sheet recalc disabled for this run")
+            except Exception as set_exc:
+                log.warning(
+                    "Could not set SkipOutputRecalc (%s) — older VBA module; "
+                    "output sheets will be recalculated as usual.",
+                    set_exc,
+                )
 
         # --- Run the VBA macro ---
         macro_used: str | None = None

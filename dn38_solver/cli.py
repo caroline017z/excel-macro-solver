@@ -193,6 +193,35 @@ def main() -> None:
     )
     parser.set_defaults(save_solved=True)
     parser.add_argument(
+        "--no-output-recalc",
+        dest="skip_output_recalc",
+        action="store_true",
+        help=(
+            "Skip the optional output-sheet recalc at finalize: Portfolio, "
+            "AT Returns_WIP, Corp Model Output, Cust Prop, Waterfall "
+            "Sensitivity. Dashboard and Table ALWAYS recalc regardless of "
+            "this flag (deal-summary surfaces). Core 13 sheets (Project "
+            "Inputs / PT Returns / NPP Calc / Appraisal / Perm Debt / Tax "
+            "Equity / CL / etc.) also always recalc during the solve loop. "
+            "Saves 10-30s per run on workbooks with heavy portfolio rollups."
+        ),
+    )
+    parser.set_defaults(skip_output_recalc=False)
+    parser.add_argument(
+        "--strip-sheets",
+        default="",
+        help=(
+            "Comma-separated list of sheet names to DELETE from the temp copy "
+            "before opening (e.g. 'Waterfall Sensitivity,AT Returns_WIP'). "
+            "Original workbook is never modified. NEVER strip critical "
+            "sheets: Dashboard, Table, PT Returns, NPP Calc, Appraisal, "
+            "Perm Debt, Tax Equity, CL, Project Inputs — these are required "
+            "every run and stripping them will produce wrong results or "
+            "#REF! errors. Safe candidates: Waterfall Sensitivity, "
+            "AT Returns_WIP, Corp Model Output, Cust Prop, Portfolio."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -215,6 +244,10 @@ def main() -> None:
         print(f"ERROR: Workbook not found: {workbook_path}")
         sys.exit(1)
 
+    strip_sheets = tuple(
+        s.strip() for s in args.strip_sheets.split(",") if s.strip()
+    )
+
     record = solve_all(
         workbook_path,
         batch_id=args.batch_id,
@@ -224,6 +257,8 @@ def main() -> None:
         use_chunked=args.chunked,
         allow_relaxed=args.allow_relaxed,
         save_solved=args.save_solved,
+        skip_output_recalc=args.skip_output_recalc,
+        strip_sheets=strip_sheets,
     )
 
     # Exit code: 0 if converged or dry-run; 1 otherwise.

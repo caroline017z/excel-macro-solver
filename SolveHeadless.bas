@@ -100,6 +100,13 @@ Private mCalcSecsNPP  As Double
 Private mCalcSecsAppr As Double
 Private mCalcSecsFull As Double
 
+' --- Output-sheet recalc toggle (Python-controllable) ---
+' When True, FinalizeSolveEnvHL / SolveHeadless skip CalcOutputSheetsHL,
+' leaving downstream sheets (Dashboard, Waterfall Sensitivity, etc.)
+' un-recalculated. Excel recalcs them lazily on next interactive open.
+' Default False preserves prior behavior.
+Private mSkipOutputRecalc As Boolean
+
 
 Private Function EnsureSolverResultsSheetHL() As Worksheet
     Dim ws As Worksheet
@@ -343,16 +350,53 @@ Private Sub EscalateCalcTierHL()
 End Sub
 
 Private Sub CalcOutputSheetsHL()
-    Dim vSheets As Variant
-    Dim vSh     As Variant
-    vSheets = Array("Portfolio", "AT Returns_WIP", "Corp Model Output", _
-                    "Cust Prop", "Dashboard", "Table", "Waterfall Sensitivity")
-    For Each vSh In vSheets
+    ' Output sheets split into two groups so the skip flag never starves
+    ' critical downstream tabs:
+    '
+    '   ALWAYS recalc: Dashboard, Table
+    '     -- summary surfaces the deal team relies on every run; per
+    '        Caroline's spec these must reflect the converged state.
+    '
+    '   SKIP-IF-FLAGGED: Portfolio, AT Returns_WIP, Corp Model Output,
+    '                    Cust Prop, Waterfall Sensitivity
+    '     -- portfolio rollups and scenario tabs that the team typically
+    '        inspects separately. Stale state here is acceptable for
+    '        speed; Excel recalcs lazily on next interactive open.
+    '
+    ' mSkipOutputRecalc=True only affects the second group. Set via
+    ' SetSkipOutputRecalcHL from Python before Init / SolveHeadless.
+
+    Dim vAlways As Variant
+    Dim vOptional As Variant
+    Dim vSh As Variant
+
+    vAlways = Array("Dashboard", "Table")
+    For Each vSh In vAlways
         On Error Resume Next
         Sheets(CStr(vSh)).EnableCalculation = True
         Sheets(CStr(vSh)).Calculate
         On Error GoTo 0
     Next
+
+    If mSkipOutputRecalc Then Exit Sub
+
+    vOptional = Array("Portfolio", "AT Returns_WIP", "Corp Model Output", _
+                      "Cust Prop", "Waterfall Sensitivity")
+    For Each vSh In vOptional
+        On Error Resume Next
+        Sheets(CStr(vSh)).EnableCalculation = True
+        Sheets(CStr(vSh)).Calculate
+        On Error GoTo 0
+    Next
+End Sub
+
+Public Sub SetSkipOutputRecalcHL(ByVal bSkip As Boolean)
+    ' Public setter for the output-sheet recalc toggle.
+    ' Python calls this via Application.Run before InitSolveEnvHL or
+    ' single-shot SolveHeadless. Both code paths funnel through
+    ' CalcOutputSheetsHL, so guarding there covers chunked and non-chunked
+    ' runs with one switch.
+    mSkipOutputRecalc = bSkip
 End Sub
 
 Private Sub DisableNonCoreSheets()
