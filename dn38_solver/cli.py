@@ -221,6 +221,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--excel-threads-per-worker",
+        type=int,
+        default=None,
+        help=(
+            "Override the per-worker Excel MultiThreadedCalculation.ThreadCount "
+            "in parallel mode. Default is max(2, min(4, cpu_count // (workers*3))). "
+            "Hard-capping low prevents thread oversubscription — empirically "
+            "cpu_count // workers (e.g., 12 threads × 2 workers on a 24-core "
+            "box) yields zero speedup vs single-worker because 24 calc threads "
+            "compete with OS/coordination overhead on the same 24 cores. "
+            "Excel multi-threaded calc has sharply diminishing returns past 4."
+        ),
+    )
+    parser.add_argument(
         "--strip-sheets",
         default="",
         help=(
@@ -280,6 +294,7 @@ def main() -> None:
         skip_output_recalc=args.skip_output_recalc,
         strip_sheets=strip_sheets,
         workers=args.workers,
+        excel_threads_per_worker=args.excel_threads_per_worker,
     )
 
     # Exit code: 0 if converged or dry-run; 1 otherwise.

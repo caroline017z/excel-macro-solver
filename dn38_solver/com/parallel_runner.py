@@ -138,6 +138,7 @@ def run_parallel(
     use_chunked: bool = True,
     skip_output_recalc: bool = False,
     strip_sheets: tuple[str, ...] = (),
+    excel_threads_per_worker: int | None = None,
 ) -> dict:
     """Spawn `workers` subprocess workers and merge their results.
 
@@ -155,10 +156,23 @@ def run_parallel(
     parent_tmp = Path(tempfile.mkdtemp(prefix="38dn_parallel_"))
 
     # Cap Excel threads per worker so N × Excel doesn't oversubscribe CPU.
+    # Validated empirically on SMP WalkTEST: cpu_count // n_workers (24/2=12)
+    # produced ZERO speedup vs single-worker because the 24 calc threads
+    # competed with the OS, pywin32, the aggregator, and the live-progress
+    # tailer for the same 24 cores. Excel's multi-threaded recalc has
+    # sharply diminishing returns past ~4 threads anyway, so the default
+    # is a conservative cap that leaves headroom for coordination overhead.
+    # User can override via the CLI flag if their workload differs.
     cpu = os.cpu_count() or 4
-    threads_per_worker = max(1, cpu // n)
+    if excel_threads_per_worker is not None and excel_threads_per_worker > 0:
+        threads_per_worker = excel_threads_per_worker
+    else:
+        # Default: 1/3 of available cores per worker, min 2, max 4.
+        # On a 24-core box with 2 workers: 4 + 4 = 8 calc threads, leaving
+        # 16 cores for OS / coordination / file I/O.
+        threads_per_worker = max(2, min(4, cpu // (n * 3)))
     log.info(
-        "  Parallel mode: %d workers × ~%d Excel threads each (cpu_count=%d)",
+        "  Parallel mode: %d workers × %d Excel threads each (cpu_count=%d)",
         n, threads_per_worker, cpu,
     )
 

@@ -776,6 +776,16 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' Re-running the macro re-overwrites with the new converged values.
     wsPI.Cells(37, colIdx).Value = rIRRLive.Value
     wsPI.Cells(31, colIdx).Value = rApprLive.Value
+    ' Row 33 (FMV Calculated) is a formula that depends on whichever
+    ' project F2 currently points at. In parallel-worker mode each worker
+    ' reads only its assigned columns post-solve via SwitchProjectAndRecalc,
+    ' but the FMV formula sometimes returns wrong values if dependencies
+    ' span unsolved-by-this-worker projects. Convert to a hard value at
+    ' solve-time when this project IS the active one and all its
+    ' upstream cells are converged. Cell-self-assign reads the calc'd
+    ' value (right side) and writes it as a constant (left side) — the
+    ' canonical VBA formula-to-value idiom.
+    wsPI.Cells(33, colIdx).Value = wsPI.Cells(33, colIdx).Value
 
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
@@ -1066,6 +1076,8 @@ Public Sub SolveHeadless()
         ' (direct_runner opens a temp copy); only _SOLVED.xlsm gets these.
         wsPI.Cells(37, colIdx).Value = rIRRLive.Value
         wsPI.Cells(31, colIdx).Value = rApprLive.Value
+        ' Row 33 (FMV) — same rationale as SolveOneProjectByColHL.
+        wsPI.Cells(33, colIdx).Value = wsPI.Cells(33, colIdx).Value
 
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)
