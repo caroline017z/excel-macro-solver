@@ -112,6 +112,7 @@ def solve_all(
     skip_output_recalc: bool = False,
     strip_sheets: tuple[str, ...] = (),
     workers: int = 1,
+    excel_threads_per_worker: int | None = None,
 ) -> RunRecord:
     """Main entry point for the Hybrid Shadow solver.
 
@@ -296,6 +297,7 @@ def solve_all(
             use_chunked=use_chunked,
             skip_output_recalc=skip_output_recalc,
             strip_sheets=strip_sheets,
+            excel_threads_per_worker=excel_threads_per_worker,
         )
     else:
         batch_result = run_direct(

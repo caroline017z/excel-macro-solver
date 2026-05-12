@@ -63,12 +63,35 @@ def main() -> int:
         return 2
 
     worker_id = config.get("worker_id", 0)
+    status_path = Path(config["status_path"])
     logging.basicConfig(
         level=logging.INFO,
         format=f"[w{worker_id}] %(message)s",
         stream=sys.stderr,
     )
     log = logging.getLogger(__name__)
+
+    def _write_terminal_status(phase: str, **extras: object) -> None:
+        """Write a final status JSON so the parent aggregator can tell
+        finished/errored from stalled-mid-solve. Without this, a worker
+        that segfaults or is OS-killed leaves the aggregator reporting
+        phase=solving forever.
+        """
+        try:
+            payload = {
+                "phase": phase,
+                "worker_id": worker_id,
+                "workbook": config.get("workbook_path", ""),
+                "total_projects": 0,
+                "projects": [],
+                "elapsed_sec": 0,
+            }
+            payload.update(extras)
+            tmp = status_path.with_suffix(status_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+            tmp.replace(status_path)
+        except Exception:
+            pass  # never let status-write failure mask the real outcome
 
     try:
         tasks_bytes = config["tasks_json"].encode("utf-8")
@@ -94,6 +117,13 @@ def main() -> int:
 
         result_path.write_text(json.dumps(result, default=str), encoding="utf-8")
         log.info("Worker %d wrote result (%s)", worker_id, result.get("status"))
+        # Write terminal status AFTER result.json so the parent can rely
+        # on phase=complete meaning "result.json is fully written."
+        _write_terminal_status(
+            "complete",
+            status=result.get("status"),
+            saved_to=result.get("saved_to"),
+        )
         return 0
 
     except Exception as exc:
@@ -111,6 +141,10 @@ def main() -> int:
         except Exception:
             pass
         log.exception("Worker %d crashed", worker_id)
+        _write_terminal_status(
+            "error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
         return 1
 
 

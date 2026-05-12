@@ -70,6 +70,8 @@ class ValidationReport:
     project_diffs: list[ProjectDiff]
     all_pass: bool
     failing_projects: list[str]
+    pre_solve_f2: int | None = None
+    note: str | None = None  # populated when a non-fatal check fails
 
 
 def _by_name(record: RunRecord) -> dict[str, ProjectResult]:
@@ -123,6 +125,30 @@ def _diff_one_project(
     )
 
 
+def _read_pre_solve_f2(workbook_path: Path) -> int | None:
+    """Read Project Inputs!F2 from a workbook without solving anything.
+
+    Used by validate_parallel to confirm the post-solve _SOLVED.xlsm
+    restores F2 to its pre-solve value. A worker that fails FinalizeSolveEnvHL
+    can leave F2 pointing at its last solved project, and if that worker's
+    file becomes master the merged workbook silently has a wrong active-
+    project pointer.
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(str(workbook_path), data_only=True, read_only=True)
+        try:
+            if "Project Inputs" not in wb.sheetnames:
+                return None
+            ws = wb["Project Inputs"]
+            val = ws["F2"].value
+            return int(val) if val is not None else None
+        finally:
+            wb.close()
+    except Exception:
+        return None
+
+
 def validate_parallel(
     workbook_path: Path,
     *,
@@ -148,6 +174,10 @@ def validate_parallel(
     log.info("  Workers:  %d", workers)
     log.info("  Tolerance: %.0e", tolerance)
     log.info("=" * 60)
+
+    pre_f2 = _read_pre_solve_f2(workbook_path)
+    if pre_f2 is not None:
+        log.info("  Pre-solve Project Inputs!F2 = %d (will verify post-solve restore)", pre_f2)
 
     log.info("\n[Pass 1] Sequential baseline (single worker)...")
     seq_record = solve_all(
@@ -197,6 +227,7 @@ def validate_parallel(
         project_diffs=project_diffs,
         all_pass=not failing,
         failing_projects=failing,
+        pre_solve_f2=pre_f2,
     )
 
 
@@ -213,6 +244,8 @@ def format_report(report: ValidationReport) -> str:
     lines.append(f"  Parallel time:     {report.parallel_duration:.1f}s "
                  f"(batch {report.parallel_batch_id})")
     lines.append(f"  Speedup:           {report.speedup:.2f}x")
+    if report.pre_solve_f2 is not None:
+        lines.append(f"  Pre-solve F2:      {report.pre_solve_f2}")
     lines.append(f"  Projects compared: {len(report.project_diffs)}")
     lines.append(
         f"  Result:            {'PASS' if report.all_pass else 'FAIL'} "

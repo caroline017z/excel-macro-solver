@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Sequence
@@ -47,6 +48,62 @@ log = logging.getLogger(__name__)
 # and consume all RAM. The Plan agent's analysis suggested cpu_count // 2
 # as a sane upper bound; 8 is a portable conservative cap.
 MAX_WORKERS = 8
+
+
+class _WorkerLogTailer(threading.Thread):
+    """Background thread that tails each worker's stderr.log and forwards
+    new lines to the parent log so the terminal isn't silent during long
+    cold solves.
+
+    Tracks per-file byte offsets so each line is forwarded exactly once.
+    Lines already carry the worker id via the `[wN]` prefix the worker
+    sets in `logging.basicConfig(format=...)`, so we don't re-decorate.
+    """
+
+    def __init__(
+        self,
+        *,
+        sources: list[tuple[int, Path]],
+        poll_interval: float = 2.0,
+    ) -> None:
+        super().__init__(daemon=True, name="WorkerLogTailer")
+        self._sources = list(sources)
+        self._interval = poll_interval
+        self._offsets: dict[Path, int] = {p: 0 for _, p in sources}
+        self._stop_evt = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_evt.is_set():
+            self._poll_once()
+            if self._stop_evt.wait(timeout=self._interval):
+                break
+        # Final flush so we don't miss the last few lines after stop
+        self._poll_once()
+
+    def _poll_once(self) -> None:
+        for _wid, path in self._sources:
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue
+            offset = self._offsets[path]
+            if size <= offset:
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read(size - offset)
+            except OSError:
+                continue
+            self._offsets[path] = size
+            text = chunk.decode("utf-8", errors="replace")
+            for line in text.splitlines():
+                if line.strip():
+                    log.info("  %s", line)
+
+    def stop(self, *, join_timeout: float = 5.0) -> None:
+        self._stop_evt.set()
+        self.join(timeout=join_timeout)
 
 
 def _partition_round_robin(
@@ -81,6 +138,7 @@ def run_parallel(
     use_chunked: bool = True,
     skip_output_recalc: bool = False,
     strip_sheets: tuple[str, ...] = (),
+    excel_threads_per_worker: int | None = None,
 ) -> dict:
     """Spawn `workers` subprocess workers and merge their results.
 
@@ -98,10 +156,23 @@ def run_parallel(
     parent_tmp = Path(tempfile.mkdtemp(prefix="38dn_parallel_"))
 
     # Cap Excel threads per worker so N × Excel doesn't oversubscribe CPU.
+    # Validated empirically on SMP WalkTEST: cpu_count // n_workers (24/2=12)
+    # produced ZERO speedup vs single-worker because the 24 calc threads
+    # competed with the OS, pywin32, the aggregator, and the live-progress
+    # tailer for the same 24 cores. Excel's multi-threaded recalc has
+    # sharply diminishing returns past ~4 threads anyway, so the default
+    # is a conservative cap that leaves headroom for coordination overhead.
+    # User can override via the CLI flag if their workload differs.
     cpu = os.cpu_count() or 4
-    threads_per_worker = max(1, cpu // n)
+    if excel_threads_per_worker is not None and excel_threads_per_worker > 0:
+        threads_per_worker = excel_threads_per_worker
+    else:
+        # Default: 1/3 of available cores per worker, min 2, max 4.
+        # On a 24-core box with 2 workers: 4 + 4 = 8 calc threads, leaving
+        # 16 cores for OS / coordination / file I/O.
+        threads_per_worker = max(2, min(4, cpu // (n * 3)))
     log.info(
-        "  Parallel mode: %d workers × ~%d Excel threads each (cpu_count=%d)",
+        "  Parallel mode: %d workers × %d Excel threads each (cpu_count=%d)",
         n, threads_per_worker, cpu,
     )
 
@@ -111,8 +182,14 @@ def run_parallel(
         ", ".join(f"w{i}={len(p)}" for i, p in enumerate(partitions)),
     )
 
-    # Spawn workers
-    procs: list[tuple[int, subprocess.Popen[bytes], Path, Path]] = []
+    # Spawn workers. Each worker's stdout/stderr is redirected to a file
+    # in its temp dir, NOT to a subprocess.PIPE — Windows anonymous pipes
+    # have a ~65KB buffer, and a long cold solve can easily emit more than
+    # that to stderr, deadlocking the worker (writes to a full pipe block
+    # until the parent reads, but proc.communicate() is what reads). Log
+    # files round-trip cleanly and let the parent tail them for live
+    # progress without any blocking risk.
+    procs: list[tuple[int, subprocess.Popen, Path, Path, Path, Path]] = []
     worker_status_paths: list[Path] = []
     for worker_id, slice_tasks in enumerate(partitions):
         if not slice_tasks:
@@ -142,7 +219,7 @@ def run_parallel(
         config_path.write_text(json.dumps(config), encoding="utf-8")
 
         cmd = [
-            sys.executable, "-m", "dn38_solver.com.worker",
+            sys.executable, "-u", "-m", "dn38_solver.com.worker",
             str(config_path), str(result_path),
         ]
         # CREATE_NO_WINDOW = 0x08000000 — suppress console flash for each
@@ -151,13 +228,23 @@ def run_parallel(
         if sys.platform == "win32":
             creationflags = 0x08000000
         log.info("  Spawning worker %d (%d projects)...", worker_id, len(slice_tasks))
+        # Open log files unbuffered (binary 'wb' with no flush deferral)
+        # so the parent's tailing thread sees worker writes immediately.
+        stdout_path = wdir / "stdout.log"
+        stderr_path = wdir / "stderr.log"
+        stdout_fh = open(stdout_path, "wb", buffering=0)
+        stderr_fh = open(stderr_path, "wb", buffering=0)
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
             creationflags=creationflags,
         )
-        procs.append((worker_id, proc, config_path, result_path))
+        # We keep handles open in the child; the parent doesn't write to
+        # them. Close our parent-side handles so we don't pin the inode.
+        stdout_fh.close()
+        stderr_fh.close()
+        procs.append((worker_id, proc, config_path, result_path, stdout_path, stderr_path))
 
     # Start the status aggregator. Each worker writes its own status JSON;
     # the aggregator merges them into the canonical `solver_status.json`
@@ -172,6 +259,16 @@ def run_parallel(
     )
     aggregator.start()
 
+    # Live-progress thread: tails each worker's stderr.log and forwards
+    # new lines to the parent log so the terminal isn't silent during
+    # a 10-20 minute cold solve. Without this the user sees nothing
+    # between "Spawning worker N" and "Worker N completed".
+    progress = _WorkerLogTailer(
+        sources=[(wid, err_path) for (wid, _, _, _, _, err_path) in procs],
+        poll_interval=2.0,
+    )
+    progress.start()
+
     # Wait for all workers. Per-worker timeout is the parent-level timeout
     # since each worker handles only its slice; the cap should be generous
     # enough that no worker hits it before its slice's COM session does.
@@ -179,10 +276,12 @@ def run_parallel(
     parent_timeout = max(timeout_sec, 60)
     deadline = time.time() + parent_timeout + 60  # +60s for cleanup grace
 
-    for worker_id, proc, config_path, result_path in procs:
+    for worker_id, proc, config_path, result_path, stdout_path, stderr_path in procs:
         remaining = max(1, int(deadline - time.time()))
         try:
-            stdout, stderr = proc.communicate(timeout=remaining)
+            # stdout/stderr are redirected to files, so communicate()
+            # blocks only on the process exit — no PIPE buffer to drain.
+            proc.communicate(timeout=remaining)
         except subprocess.TimeoutExpired:
             log.warning(
                 "  Worker %d timeout after %ds — terminating and reaping "
@@ -201,10 +300,18 @@ def run_parallel(
             }
             continue
 
-        if stderr:
-            # Forward worker stderr to parent log so users see worker output.
-            for line in stderr.decode("utf-8", errors="replace").splitlines():
-                log.info("  %s", line)
+        # Worker stderr is now in stderr_path and the live tailer has already
+        # forwarded it during the run. Drain any final lines for completeness.
+        with contextlib.suppress(OSError):
+            tail = stderr_path.read_text(encoding="utf-8", errors="replace")
+            # Only forward lines the tailer hasn't already printed; tailer
+            # tracks per-file byte offsets so we just print the recent tail
+            # as INFO if the worker errored, otherwise the lines were
+            # already streamed live.
+            if proc.returncode != 0 and tail.strip():
+                log.info("  --- worker %d stderr tail ---", worker_id)
+                for line in tail.splitlines()[-30:]:
+                    log.info("  %s", line)
 
         if proc.returncode != 0:
             log.error("  Worker %d exited with code %d", worker_id, proc.returncode)
@@ -399,9 +506,12 @@ def run_parallel(
             float(w.get(key, 0) or 0) for w in worker_results.values()
         )
 
-    # Stop the status aggregator before returning so the final solver_status.json
-    # reflects the terminal state. Daemon thread, so a join failure won't
-    # block the process — but in normal flow this exits within poll_interval.
+    # Stop the progress tailer and status aggregator before returning so
+    # the final solver_status.json reflects the terminal state and any
+    # remaining tail lines are forwarded. Daemon threads, so a join
+    # failure won't block the process — but in normal flow they exit
+    # within poll_interval.
+    progress.stop(join_timeout=2.0)
     aggregator.stop(join_timeout=2.0)
 
     return {
