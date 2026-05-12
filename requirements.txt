@@ -1,4 +1,5 @@
 pywin32>=306; platform_system == "Windows"
+psutil>=5.9.0
 msgspec>=0.18.0
 openpyxl>=3.1.0
 streamlit>=1.30.0

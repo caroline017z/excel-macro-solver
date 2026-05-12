@@ -62,10 +62,24 @@ CREATE TABLE IF NOT EXISTS _meta (
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    """Open (or create) the SQLite database with WAL mode."""
+    """Open (or create) the SQLite database with WAL mode.
+
+    PRAGMAs applied:
+    - journal_mode=WAL: allows concurrent readers + one writer without
+      file-locking the database for the whole transaction.
+    - busy_timeout=5000: when multiple worker processes write
+      checkpoints concurrently (planned in Issue #8), SQLite waits up
+      to 5s on a lock before raising `database is locked` instead of
+      failing immediately. 5s is well over typical write durations.
+    - synchronous=NORMAL: WAL-safe relaxation of fsync timing. ~2x
+      write throughput vs FULL with no durability risk in WAL mode
+      (recovery is still crash-safe).
+    """
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(_CREATE_RUNS)
     conn.execute(_CREATE_CHECKPOINTS)
     conn.execute(_CREATE_CHECKPOINTS_INDEX)
