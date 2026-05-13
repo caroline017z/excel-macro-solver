@@ -511,6 +511,58 @@ End Sub
 
 
 ' ==============================================================================
+'  PUBLIC: Snapshot the active project's per-column convergence cells as
+'  hard constants. Called by Python from the post-solve read pass, AFTER
+'  SwitchProjectAndRecalc has set F2 = this project's offset and refreshed
+'  the workbook state.
+'
+'  Stamps rows 31, 32, 33, 37, 38, 39 on Project Inputs at column `colIdx`,
+'  replacing each cell's IF(<col>2=$F$2, $F$<row>, <col><row>) circular-
+'  formula cache with the cell's current evaluated value.
+'
+'  Why not stamp inside SolveOneProjectByColHL: doing so captures a
+'  transient cross-project state because each project's solve modifies
+'  cells that NPP Calc!H453 (= F37) and Appraisal cells (= F31, F33)
+'  depend on. The "real" converged value for project N can only be read
+'  after ALL projects have solved AND F2 is set back to N. The worker's
+'  post-read pass does exactly that — stamping there pins the value the
+'  worker is about to report in solved_values, and the merged file's
+'  per-column cells then match the verifier's expectations.
+'
+'  Rows 31 (Live Appraisal IRR) and 37 (Live IRR) read from F31 / F37
+'  rather than self-assign because the per-column IF formula is a
+'  circular reference; reading the per-column cell would resolve to
+'  the cached side of the IF (= itself) instead of the F<row> side.
+'  Rows 32, 33, 38, 39 self-assign via HardStampNumericHL, which refuses
+'  to freeze Excel error values into the cell.
+' ==============================================================================
+Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)
+    If colIdx < PI_BASE_COL + 1 Or colIdx > PI_BASE_COL + COL_SCAN_LIMIT Then
+        Err.Raise 5, "StampActiveProjectColumnHL", _
+            "colIdx " & colIdx & " out of bounds [" & (PI_BASE_COL + 1) & _
+            ".." & (PI_BASE_COL + COL_SCAN_LIMIT) & "]"
+    End If
+
+    Dim wsPI As Worksheet
+    Set wsPI = ThisWorkbook.Sheets(SHT_PI)
+
+    ' Live IRR / Live Appraisal — read from F-column live cells, not self-
+    ' assign (the per-column IF is circular; self-assign returns the
+    ' cached side of the IF).
+    wsPI.Cells(37, colIdx).Value = wsPI.Range(PI_IRR_LIVE).Value
+    wsPI.Cells(31, colIdx).Value = wsPI.Range(PI_APPR_LIVE).Value
+
+    ' Dev Fee, NPP $/W (GoalSeek changing-cells, already numeric) and
+    ' FMV, NPP $ total (formulas) — self-assign via the IsError-guarded
+    ' helper.
+    HardStampNumericHL wsPI, 32, colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, 38, colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, 33, colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, 39, colIdx, "POSTREAD"
+End Sub
+
+
+' ==============================================================================
 '  PUBLIC: VBA-side merge helper for the parallel runner's fallback path.
 '
 '  When openpyxl-based merge (keep_vba=True round-trip) fails to preserve
@@ -819,35 +871,16 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
     dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
 
-    ' Snapshot the converged F37 / F31 directly into the project's row 37
-    ' and row 31 cache cells as HARD VALUES. The original IF-formula cache
-    ' (=IF(colN_2=$F$2, $F$37, colN_37)) was unreliable -- it latched
-    ' transients during phase-scoped recalcs. Hard values guarantee the
-    ' user-visible cells reflect the converged state. The source workbook
-    ' on Box / OneDrive is unaffected because direct_runner.run_direct
-    ' opens a temp copy; only the saved _SOLVED.xlsm gets the hard values.
-    ' Re-running the macro re-overwrites with the new converged values.
-    wsPI.Cells(37, colIdx).Value = rIRRLive.Value
-    wsPI.Cells(31, colIdx).Value = rApprLive.Value
-    ' Row 33 (FMV Calculated) is a formula that depends on whichever
-    ' project F2 currently points at. In parallel-worker mode each worker
-    ' reads only its assigned columns post-solve via SwitchProjectAndRecalc,
-    ' but the FMV formula sometimes returns wrong values if dependencies
-    ' span unsolved-by-this-worker projects. Convert to a hard value at
-    ' solve-time when this project IS the active one and all its
-    ' upstream cells are converged. HardStampNumericHL refuses to stamp
-    ' Excel error values so a mid-solve #DIV/0! doesn't get frozen into
-    ' the IC-facing column.
-    HardStampNumericHL wsPI, 33, colIdx, "SOPBC"
-    ' Rows 32 (Dev Fee), 38 (NPP $/W) are GoalSeek changing-cells, so
-    ' they hold numeric values already; the self-assign is a no-op
-    ' but cheap and keeps treatment uniform. Row 39 (NPP $) is typically
-    ' a formula like =N38*MWdc and may pick up cross-project state via
-    ' the MWdc lookup chain — explicitly hard-stamp to be safe. QA review
-    ' flagged these as exposed to the same class of bug FMV had.
-    HardStampNumericHL wsPI, 32, colIdx, "SOPBC"
-    HardStampNumericHL wsPI, 38, colIdx, "SOPBC"
-    HardStampNumericHL wsPI, 39, colIdx, "SOPBC"
+    ' NOTE: per-column hard-stamps for rows 31/32/33/37/38/39 USED to
+    ' happen here, but the values they captured were a transient cross-
+    ' project state — F37 / F31 / F33 / F39 depend on cell chains that
+    ' shift as subsequent projects' solves modify other columns. The
+    ' verifier (validation/post_merge.verify_merged_file) caught the
+    ' divergence on the SMP WalkTEST 2026-05-12 run. Stamps moved to
+    ' StampActiveProjectColumnHL which Python invokes from the post-
+    ' solve read pass, AFTER all projects have solved AND F2 is set
+    ' back to this project. That's the only moment the workbook is
+    ' simultaneously consistent for every project's column.
 
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
@@ -1132,20 +1165,12 @@ Public Sub SolveHeadless()
         dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
         dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
 
-        ' Snapshot the converged F37 / F31 directly into the project's row
-        ' 37 and row 31 cache cells as HARD VALUES. See SolveOneProjectByColHL
-        ' for the rationale. Source workbook on Box / OneDrive is unaffected
-        ' (direct_runner opens a temp copy); only _SOLVED.xlsm gets these.
-        wsPI.Cells(37, colIdx).Value = rIRRLive.Value
-        wsPI.Cells(31, colIdx).Value = rApprLive.Value
-        ' Rows 33 (FMV), 32 (Dev Fee), 38 (NPP $/W), 39 (NPP $) — same
-        ' rationale as SolveOneProjectByColHL. HardStampNumericHL refuses
-        ' to stamp Excel error values so a mid-solve #DIV/0! doesn't
-        ' freeze into the IC-facing column.
-        HardStampNumericHL wsPI, 33, colIdx, "SHmain"
-        HardStampNumericHL wsPI, 32, colIdx, "SHmain"
-        HardStampNumericHL wsPI, 38, colIdx, "SHmain"
-        HardStampNumericHL wsPI, 39, colIdx, "SHmain"
+        ' NOTE: per-column hard-stamps moved to StampActiveProjectColumnHL,
+        ' invoked by Python from the post-solve read pass. The in-loop
+        ' stamps captured a transient cross-project state that the post-
+        ' merge verifier flagged as wrong on the SMP WalkTEST 2026-05-12
+        ' run. See the matching comment in SolveOneProjectByColHL for
+        ' the full rationale.
 
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)

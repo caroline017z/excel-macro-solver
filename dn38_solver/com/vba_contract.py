@@ -77,6 +77,16 @@ SWITCH_PROJECT_AND_RECALC = VBASub(
     args=(("projOffset", "Integer"),),
 )
 
+# Snapshot the active project's per-column convergence cells (rows 31,
+# 32, 33, 37, 38, 39 on Project Inputs) as hard constants. Called by
+# Python from the post-solve read pass, AFTER SwitchProjectAndRecalc has
+# pinned F2 and refreshed the workbook. See the .bas Sub docstring for
+# why the stamp lives here rather than inside SolveOneProjectByColHL.
+STAMP_ACTIVE_PROJECT_COLUMN = VBASub(
+    name="StampActiveProjectColumnHL",
+    args=(("colIdx", "Integer"),),
+)
+
 
 # ---- Single-shot solve --------------------------------------------------
 
@@ -151,6 +161,7 @@ def vba_call_str(wb_name: str, sub: VBASub) -> str:
 ALL_PUBLIC_SUBS: tuple[VBASub, ...] = (
     SET_SKIP_OUTPUT_RECALC,
     SWITCH_PROJECT_AND_RECALC,
+    STAMP_ACTIVE_PROJECT_COLUMN,
     SOLVE_HEADLESS,
     INIT_SOLVE_ENV,
     SOLVE_ONE_PROJECT_BY_COL,
