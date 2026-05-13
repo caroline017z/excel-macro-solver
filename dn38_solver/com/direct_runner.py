@@ -25,6 +25,7 @@ from dn38_solver.com.vba_contract import (
     SET_SKIP_OUTPUT_RECALC,
     SOLVE_HEADLESS,
     SOLVE_ONE_PROJECT_BY_COL,
+    STAMP_ACTIVE_PROJECT_COLUMN,
     SWITCH_PROJECT_AND_RECALC,
     vba_call_str,
 )
@@ -466,6 +467,21 @@ def run_direct(
             if not switched_with_recalc:
                 with contextlib.suppress(Exception):
                     excel.CalculateFull()
+
+            # Stamp the active project's per-column convergence cells
+            # NOW, while F2 is pinned to this project and the workbook
+            # is in its post-all-solves consistent state. Replaces the
+            # in-solve hard-stamps that captured a transient cross-
+            # project state and produced merged-file values diverging
+            # from what we're about to read in the next loop. Skip on
+            # the legacy fallback path that doesn't have the helper.
+            if has_switch:
+                col_idx = nt.offset + BASE_COL
+                with contextlib.suppress(Exception):
+                    excel.Application.Run(
+                        vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
+                        int(col_idx),
+                    )
 
             # Read cells
             solved: dict[str, float | str | None] = {}
