@@ -119,8 +119,8 @@ APPRAISAL_CASHFLOW_ROWS = (155, 156, 157, 158, 159)
 # pre-flight can warn before the macro's chunked path resets out-of-range
 # values to seed values. If the .bas constants change, update these too —
 # there's no clean import path because the macro is not Python.
-NPP_BOUNDS = (-0.2, 0.8)         # NPP_MIN, NPP_MAX
-DEV_FEE_BOUNDS = (0.05, 0.5)     # DEV_FEE_MIN, DEV_FEE_MAX
+NPP_BOUNDS = (-0.2, 2.0)         # NPP_MIN, NPP_MAX (raised 2026-05-14 for Project Violet's utility-scale pricing range)
+DEV_FEE_BOUNDS = (0.05, 2.1)     # DEV_FEE_MIN, DEV_FEE_MAX (raised 2026-05-14 for Project Violet's utility-scale Dev Fees up to $2.65/W)
 PI_ROW_NPP = 38
 PI_ROW_DEV_FEE = 32
 PI_ROW_TOGGLE = 7

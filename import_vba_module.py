@@ -11,8 +11,10 @@ Usage:
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 BAS_FILE = Path(__file__).parent / "SolveHeadless.bas"
@@ -24,31 +26,89 @@ MODULE_NAME = "modSolveHeadless"
 # embedded in this workbook. Stable name = stable diagnostic code D17.
 BAS_HASH_PROP = "DN38_BAS_SHA256"
 
+_CUSTOM_XML_PATH = "docProps/custom.xml"
+_PROP_RE = re.compile(
+    r'(<property[^>]+name="' + BAS_HASH_PROP +
+    r'"[^>]*>\s*<vt:[^>]+>)([^<]*)(</vt:[^>]+>\s*</property>)',
+    re.IGNORECASE,
+)
+_PROPERTIES_CLOSE_RE = re.compile(r"</Properties>\s*$")
+_FMT_ID = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
+
 
 def _bas_sha256() -> str:
     return hashlib.sha256(BAS_FILE.read_bytes()).hexdigest()
 
 
-def _stamp_bas_hash(wb: object, hash_value: str) -> None:
-    """Write the .bas SHA256 into the workbook's custom doc properties.
+def _stamp_bas_hash_via_zip(wb_path: Path, hash_value: str) -> None:
+    """Write the .bas SHA256 into docProps/custom.xml via zip-level edit.
 
-    Replaces any prior stamp. Must be called BEFORE wb.SaveAs so the
-    property lands in the persisted file. Done via Excel COM (not
-    openpyxl) so we don't violate the openpyxl-xlsm save rule.
+    Runs AFTER Excel has saved + closed the file so we operate on the
+    serialized package directly. Replaces the prior COM-based stamp,
+    which had two failure modes: (1) the COM Add() positional-vs-keyword
+    arg mismatch, (2) Add() raising E_FAIL after a Delete() that left
+    the COM object in a transient state.
+
+    Three cases handled:
+      - Property already exists → update <vt:lpwstr> value in place
+      - custom.xml exists, no DN38_BAS_SHA256 property → append it
+      - custom.xml missing entirely → no-op (rare; would require
+        editing [Content_Types].xml + _rels too. The next preflight
+        will surface a "no stamp" warning, which is non-blocking.)
     """
-    cdp = wb.CustomDocumentProperties
-    # Delete prior stamp if present — CDPs have no upsert.
-    try:
-        cdp.Item(BAS_HASH_PROP).Delete()
-    except Exception:
-        pass
-    # Type=4 = msoPropertyTypeString. Value passed as keyword for clarity.
-    cdp.Add(
-        Name=BAS_HASH_PROP,
-        LinkToContent=False,
-        Type=4,
-        Value=hash_value,
-    )
+    # Read existing custom.xml if present.
+    existing: str | None = None
+    with zipfile.ZipFile(wb_path, "r") as zin:
+        if _CUSTOM_XML_PATH in zin.namelist():
+            existing = zin.read(_CUSTOM_XML_PATH).decode("utf-8")
+
+    if existing is None:
+        # Missing custom.xml is a rare case for our workbooks (Excel
+        # adds it for many features). Skipping stamp here keeps this
+        # helper simple; preflight surfaces "no stamp" as a warning.
+        print(
+            f"  WARNING: docProps/custom.xml not present in {wb_path.name}; "
+            f"skipping stamp. Preflight will surface this as a D17 warning."
+        )
+        return
+
+    if _PROP_RE.search(existing):
+        new_xml = _PROP_RE.sub(
+            lambda m: m.group(1) + hash_value + m.group(3),
+            existing,
+            count=1,
+        )
+    else:
+        # Append a new property. pid must be unique; pick max(existing) + 1.
+        pids = [int(p) for p in re.findall(r'pid="(\d+)"', existing)]
+        next_pid = (max(pids) + 1) if pids else 2
+        new_prop = (
+            f'<property fmtid="{_FMT_ID}" pid="{next_pid}" '
+            f'name="{BAS_HASH_PROP}">'
+            f'<vt:lpwstr>{hash_value}</vt:lpwstr>'
+            f'</property>'
+        )
+        new_xml = _PROPERTIES_CLOSE_RE.sub(
+            new_prop + "</Properties>", existing, count=1
+        )
+        if new_xml == existing:
+            # No closing tag found — malformed XML; bail rather than corrupt.
+            print(
+                f"  WARNING: could not locate </Properties> in custom.xml; "
+                f"stamp skipped."
+            )
+            return
+
+    # Rewrite the zip with the updated custom.xml.
+    tmp = wb_path.with_suffix(wb_path.suffix + ".stamp.tmp")
+    with zipfile.ZipFile(wb_path, "r") as zin:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == _CUSTOM_XML_PATH:
+                    zout.writestr(item, new_xml.encode("utf-8"))
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+    tmp.replace(wb_path)
 
 
 def _verify_macro_via_com(wb_path: Path) -> tuple[bool, int]:
@@ -143,17 +203,11 @@ def main() -> None:
 
         if found:
             print(f"  In-memory import OK: '{MODULE_NAME}' present in VBProject.")
-            # Stamp the .bas hash into a custom doc property so preflight
-            # can detect drift later (D17). Done here so the stamp lands
-            # in the same SaveAs that persists the macro import.
-            try:
-                hash_value = _bas_sha256()
-                _stamp_bas_hash(wb, hash_value)
-                print(f"  Stamped {BAS_HASH_PROP} = {hash_value[:12]}...")
-            except Exception as hash_exc:
-                # Non-fatal: import still works without the stamp. Preflight
-                # will surface a "no stamp" warning instead of a drift error.
-                print(f"  WARNING: Could not stamp {BAS_HASH_PROP}: {hash_exc}")
+            # The .bas hash stamp now happens AFTER Excel quits (zip-level
+            # rewrite of docProps/custom.xml) — see end of main(). The
+            # earlier COM-based stamp had two failure modes that left
+            # workbooks with stale stamps and tripped D17 errors on the
+            # next preflight.
             # Force the workbook dirty before Save. Without this, Excel can
             # decide our VBProject.Import didn't change "workbook content"
             # and skip re-serializing the VBA stream entirely — Save returns
@@ -218,6 +272,17 @@ def main() -> None:
         last_lines = n
         if ok:
             print(f"  SUCCESS: '{MODULE_NAME}' verified in saved xlsm ({n} lines).")
+            # Stamp the .bas hash into the saved file via zip-level edit.
+            # Runs after Excel has flushed and closed so we operate on the
+            # final serialized package — bypasses the COM Add() race that
+            # left workbooks with stale stamps tripping D17 errors.
+            try:
+                hash_value = _bas_sha256()
+                _stamp_bas_hash_via_zip(wb_path, hash_value)
+                print(f"  Stamped {BAS_HASH_PROP} = {hash_value[:12]}...")
+            except Exception as hash_exc:
+                # Non-fatal: import still works without the stamp.
+                print(f"  WARNING: Could not stamp {BAS_HASH_PROP}: {hash_exc}")
             return
         time.sleep(0.5)
 

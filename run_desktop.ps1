@@ -11,7 +11,7 @@ param(
     [int]$Workers = 1,
     [switch]$NoChunked,
     [switch]$StrictOnly,
-    [switch]$NoOutputRecalc,
+    [switch]$WithOutputRecalc,
     [string]$StripSheets = ""
 )
 
@@ -26,16 +26,23 @@ if (-not (Test-Path $Workbook)) {
 
 Set-Location $repo
 
-# Chunked + allow-relaxed are the right defaults for portfolio runs:
-#   --chunked       avoids the ~900s COM RPC ceiling on long cold solves
-#   --allow-relaxed counts +/-0.5pp equity hits as run-level converged
-# Pass -NoChunked / -StrictOnly to opt out.
+# Defaults for portfolio runs:
+#   --chunked            avoids the ~900s COM RPC ceiling on long cold solves
+#   --allow-relaxed      counts +/-0.5pp equity hits as run-level converged
+#   --no-output-recalc   skips Portfolio / AT Returns / Corp Model Output /
+#                        Cust Prop / Waterfall recalc on save. Dashboard +
+#                        Table still recalc. Made default 2026-05-14 after
+#                        Project Violet's full-output SaveAs killed Excel
+#                        with RPC unavailable after 38 min of solve. The
+#                        non-core sheets recalc lazily on next interactive
+#                        open, so no data is lost.
+# Pass -NoChunked / -StrictOnly / -WithOutputRecalc to opt out.
 $cliArgs = @($Workbook, "--timeout", $TimeoutSec)
-if (-not $NoChunked)    { $cliArgs += "--chunked" }
-if (-not $StrictOnly)   { $cliArgs += "--allow-relaxed" }
-if ($Workers -gt 1)     { $cliArgs += "--workers"; $cliArgs += $Workers }
-if ($NoOutputRecalc)    { $cliArgs += "--no-output-recalc" }
-if ($StripSheets)       { $cliArgs += "--strip-sheets"; $cliArgs += $StripSheets }
+if (-not $NoChunked)         { $cliArgs += "--chunked" }
+if (-not $StrictOnly)        { $cliArgs += "--allow-relaxed" }
+if (-not $WithOutputRecalc)  { $cliArgs += "--no-output-recalc" }
+if ($Workers -gt 1)          { $cliArgs += "--workers"; $cliArgs += $Workers }
+if ($StripSheets)            { $cliArgs += "--strip-sheets"; $cliArgs += $StripSheets }
 
 python -u -m dn38_solver.cli @cliArgs
 Read-Host "Done. Press Enter to close"

@@ -44,10 +44,10 @@ Private Const COL_SCAN_LIMIT    As Integer = 60
 ' and can diverge to absurd values (e.g. $12/W) when local slope is small.
 ' Out-of-range solves are snapped to the seed for the next retry.
 Private Const NPP_MIN           As Double = -0.2
-Private Const NPP_MAX           As Double = 0.8
+Private Const NPP_MAX           As Double = 2.0
 Private Const NPP_SEED          As Double = 0.2
 Private Const DEV_FEE_MIN       As Double = 0.05
-Private Const DEV_FEE_MAX       As Double = 0.5
+Private Const DEV_FEE_MAX       As Double = 2.1
 Private Const DEV_FEE_SEED      As Double = 0.2
 
 ' --- Sheet names ---
