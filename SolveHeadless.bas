@@ -699,11 +699,22 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     dSolveStart = Timer
     WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName
 
+    ' Per-step heartbeats. The cost is ~20 extra cell writes per project
+    ' (negligible vs the 60-200s solve time) and they pay for themselves
+    ' the first time a workbook fails — the last heartbeat in
+    ' __SolverResults!N1 names the exact line that threw. Promoted from
+    ' debug instrumentation on 2026-05-13 after they pinpointed an
+    ' openpyxl-save corruption issue on the RP Puma 2026.05.08 workbooks.
     ' Route OFFSET formulas to this project
+    WriteHeartbeatHL wsRes, "STEP1_F2_WRITE|" & projName
     wsPI.Range(PI_PROJ_INDEX).Value = projOffset
+    WriteHeartbeatHL wsRes, "STEP2_RESET_CALC_TIER"
     ResetCalcTierHL
+    WriteHeartbeatHL wsRes, "STEP3_RESET_PHASE_TELEMETRY"
     ResetPhaseTelemetryHL
+    WriteHeartbeatHL wsRes, "STEP4_CALC_FULL_PRE_LOOP"
     CalcForPhase PHASE_FULL
+    WriteHeartbeatHL wsRes, "STEP5_RANGE_SETUP"
 
     Dim rHoldCo     As Range
     Dim rEquity     As Range
@@ -728,12 +739,14 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     Set rApprLive = wsPI.Range(PI_APPR_LIVE)
     Set rWACCTgt = wsPI.Range(PI_WACC_TARGET)
     Set rDevFee = wsPI.Cells(PI_ROW_DEV_FEE, colIdx)
+    WriteHeartbeatHL wsRes, "STEP6_PRE_SEED"
 
     ' Pre-seed only if cell is blank. Do NOT clamp by bounds --
     ' SolveMinEquityWithHoldCo trusts GoalSeek, and clamping legitimate
     ' answers to the seed prevents Appraisal from ever converging.
     If rNPP.Value = "" Then rNPP.Value = NPP_SEED
     If rDevFee.Value = "" Then rDevFee.Value = DEV_FEE_SEED
+    WriteHeartbeatHL wsRes, "STEP7_PRE_LOOP_INIT"
 
     Dim bConverged  As Boolean
     Dim bColdMode   As Boolean
@@ -760,19 +773,26 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     iActualIters = 0
 
     For iIter = 1 To MAX_ITER
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_START"
         If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then
             iActualIters = iIter - 1
             Exit For
         End If
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_HOLDCO_OFF"
         rHoldCo.Value = 0
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_CALC1"
         CalcForPhase PHASE_FULL
 
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_GS_DSCR"
         bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
         If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
         If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_CALC2"
         CalcForPhase PHASE_DSCR
 
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_HOLDCO_ON"
         rHoldCo.Value = 1
+        WriteHeartbeatHL wsRes, "ITER_" & iIter & "_CALC3"
         CalcForPhase PHASE_FULL
 
         dPrevNPP = -999#
@@ -781,10 +801,14 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         For iInner = 1 To iGSRetry
             If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then Exit For
 
+            WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_GS_NPP"
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
+            WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_CALC_NPP"
             CalcForPhase PHASE_NPP
 
+            WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_GS_APPR"
             bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
+            WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_CALC_APPR"
             CalcForPhase PHASE_APPR
 
             dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
