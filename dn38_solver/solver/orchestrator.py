@@ -26,6 +26,11 @@ from dn38_solver.config import (
 )
 from dn38_solver.convert import safe_float
 from dn38_solver.shadow.reader import WorkbookReader
+from dn38_solver.shadow.preflight import (
+    apply_auto_fixes,
+    format_preflight_report,
+    run_preflight,
+)
 from dn38_solver.shadow.validation import (
     format_validation_report,
     scan_workbook_errors,
@@ -119,6 +124,8 @@ def solve_all(
     dry_run: bool = False,
     timeout_sec: int = 600,
     strict_validation: bool = False,
+    strict_preflight: bool = False,
+    auto_fix: bool = False,
     use_chunked: bool = False,
     allow_relaxed: bool = False,
     save_solved: bool = True,
@@ -167,15 +174,80 @@ def solve_all(
     log.info("  Batch: %s", batch_id)
     log.info("=" * 60)
 
-    # Phase 0: Pre-flight formula-error scan on the input workbook.
-    # Cheap (~1s on the IL pricing model) and catches a class of broken
-    # inputs before we pay the COM startup + multi-minute solve cost.
-    log.info("[Phase 0] Pre-flight formula-error scan...")
-    pre_validation = scan_workbook_errors(workbook_path)
-    log.info("  %s", format_validation_report(pre_validation, "Input"))
+    # Phase 0: Bank-grade pre-flight pass.
+    # Three categories of checks (calc props / structure / critical-path
+    # errors / input bounds). Cheap (~2-3s on a 13MB IL pricing model)
+    # vs the multi-minute COM cost we'd otherwise burn on a workbook that
+    # can't converge. Errors abort the run unconditionally; warnings abort
+    # only with --strict-preflight. --auto-fix patches fixable findings
+    # into a sibling _FIXED.xlsm and proceeds against the patched copy.
+    log.info("[Phase 0] Pre-flight checks...")
+    preflight = run_preflight(workbook_path)
+    log.info("\n%s", format_preflight_report(preflight))
+
+    # Auto-fix path: write _FIXED.xlsm and re-run preflight against it.
+    # Preserves the original file path in the run record so the audit
+    # trail names the source workbook, not the patched copy.
+    original_workbook_path = workbook_path
+    if auto_fix and preflight.auto_fixable:
+        fixed_path = workbook_path.with_name(
+            workbook_path.stem + "_FIXED" + workbook_path.suffix
+        )
+        log.info(
+            "  Auto-fix: applying %d fixable finding(s) -> %s",
+            len(preflight.auto_fixable), fixed_path.name,
+        )
+        fixed_path, applied_codes = apply_auto_fixes(
+            workbook_path, fixed_path, preflight.findings
+        )
+        log.info("  Auto-fix: applied codes %s", applied_codes)
+        workbook_path = fixed_path  # swap to the fixed copy for the solve
+        preflight = run_preflight(workbook_path)
+        log.info("\n%s", format_preflight_report(preflight))
+
+    # Bank-grade gate: errors always block. Warnings block only if
+    # --strict-preflight. The legacy --strict-validation flag continues
+    # to gate on the formula-error scan only (back-compat); --strict-
+    # preflight is the new comprehensive gate.
+    if preflight.errors:
+        codes = ", ".join(f.code for f in preflight.errors)
+        return RunRecord(
+            workbook_name=original_workbook_path.name,
+            run_timestamp=now_iso(),
+            batch_id=batch_id,
+            solver_mode="hybrid_shadow",
+            projects=(),
+            total_duration_sec=time.time() - start,
+            status=SolveStatus.ERROR.value,
+            error=(
+                f"Pre-flight FAILED: {len(preflight.errors)} blocking error(s) "
+                f"({codes}). See preflight report above for remediation."
+            ),
+        )
+    if strict_preflight and preflight.warnings:
+        codes = ", ".join(f.code for f in preflight.warnings)
+        return RunRecord(
+            workbook_name=original_workbook_path.name,
+            run_timestamp=now_iso(),
+            batch_id=batch_id,
+            solver_mode="hybrid_shadow",
+            projects=(),
+            total_duration_sec=time.time() - start,
+            status=SolveStatus.ERROR.value,
+            error=(
+                f"Pre-flight strict mode: {len(preflight.warnings)} warning(s) "
+                f"treated as failure ({codes}). Run without --strict-preflight "
+                f"to proceed past warnings."
+            ),
+        )
+
+    # Back-compat: --strict-validation still gates on the bare formula
+    # scan. Kept alongside the new preflight gate so existing CI/scripts
+    # don't break.
+    pre_validation = preflight.error_scan
     if not pre_validation.ok and strict_validation:
         return RunRecord(
-            workbook_name=workbook_path.name,
+            workbook_name=original_workbook_path.name,
             run_timestamp=now_iso(),
             batch_id=batch_id,
             solver_mode="hybrid_shadow",

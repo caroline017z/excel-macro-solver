@@ -161,7 +161,33 @@ def main() -> None:
         help=(
             "Treat formula errors (#REF!, #DIV/0!, etc.) in the input "
             "workbook or the saved _SOLVED.xlsx as a run failure. Default "
-            "is to log them as warnings and proceed."
+            "is to log them as warnings and proceed. Legacy flag kept for "
+            "back-compat; use --strict-preflight for the comprehensive "
+            "pre-flight gate."
+        ),
+    )
+    parser.add_argument(
+        "--strict-preflight",
+        action="store_true",
+        help=(
+            "In addition to the always-on error gate, treat pre-flight "
+            "warnings (calcMode != manual, fullCalcOnLoad off, NPP "
+            "out-of-range, etc.) as run failures. Recommended for "
+            "production / unattended runs where any anomaly should halt "
+            "before paying COM startup cost."
+        ),
+    )
+    parser.add_argument(
+        "--auto-fix",
+        action="store_true",
+        help=(
+            "Patch auto-fixable pre-flight findings into a sibling "
+            "<workbook>_FIXED.xlsm copy and proceed against the patched "
+            "file. Original workbook is never modified. Only A1 "
+            "(missing iterateDelta) is auto-fixable today; structural "
+            "issues require manual remediation. Off by default — bank-"
+            "grade default is to surface and halt rather than silently "
+            "mutate the input."
         ),
     )
     parser.add_argument(
@@ -288,6 +314,8 @@ def main() -> None:
         dry_run=args.dry_run,
         timeout_sec=args.timeout,
         strict_validation=args.strict_validation,
+        strict_preflight=args.strict_preflight,
+        auto_fix=args.auto_fix,
         use_chunked=use_chunked,
         allow_relaxed=args.allow_relaxed,
         save_solved=args.save_solved,

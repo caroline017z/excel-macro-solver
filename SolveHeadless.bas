@@ -641,6 +641,15 @@ Public Sub InitSolveEnvHL()
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
+    ' Force iterative calc on regardless of workbook XML state. The IL TEST
+    ' 2026-05-13 regression came from a workbook saved with iterateDelta
+    ' missing from <calcPr/>; we don't want a future regression on the
+    ' Iteration flag itself to silently break the row 31 self-circular
+    ' per-column hard-stamps. Belt-and-suspenders: workbook says iterate=
+    ' True, AND macro asserts it before any solve runs. SetGoalSeekPrecision
+    ' below pins MaxChange to 0.00001 (tighter than the 0.0001 used by
+    ' the working SMP / RP Puma models).
+    Application.Iteration = True
     SetGoalSeekPrecisionHL
     ResetCalcTierHL
     DisableNonCoreSheets
@@ -949,6 +958,9 @@ Public Sub SolveHeadless()
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
+    ' Force iterative calc on regardless of workbook XML state (see the
+    ' matching comment in InitSolveEnvHL for full rationale).
+    Application.Iteration = True
     SetGoalSeekPrecisionHL
     ResetCalcTierHL
     DisableNonCoreSheets

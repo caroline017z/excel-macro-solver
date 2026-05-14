@@ -413,6 +413,62 @@ Outstanding integration opportunities after this pass:
 | `dn38_solver/reporting/export_xlsx.py` | Branded summary .xlsx | Working |
 | `dn38_solver/dashboard/tracker.py` | Streamlit progress tracker | Framework only |
 | `dn38_solver/cli.py` | CLI entry point | Working |
+| `dn38_solver/shadow/preflight.py` | Bank-grade pre-flight checks (calc props / structure / errors / bounds) | Working |
 | `run_portfolio_test.py` | 8-project integration test | Working |
 | `extract_vba.py` | Extracts VBA source from workbooks | Working |
 | `vba_source/` | Extracted VBA from original workbook | Reference |
+| `tests/test_preflight.py` | Unit + integration tests for pre-flight checks | Working |
+
+---
+
+## Pre-flight Error Codes
+
+The solver runs a Phase 0 pre-flight pass before any COM startup. Errors abort the run; warnings are surfaced but proceed unless `--strict-preflight` is set. `--auto-fix` patches fixable issues into a sibling `_FIXED.xlsm` copy and proceeds against that file.
+
+### A — Workbook calculation properties
+
+| Code | Severity | Issue | Why it matters | Manual fix | `--auto-fix`? |
+|---|---|---|---|---|---|
+| **A1** | error | `iterateDelta` missing or > 0.0001 in `<calcPr/>` | Iterative calc engine exits before circular references settle. Row 31 self-circular formulas may not stabilize. | Excel: File > Options > Formulas > Maximum Change = 0.0001. Save. | ✅ Yes — patches `xl/workbook.xml` |
+| **A2** | error | `iterate=False` (iterative calc disabled) | Row 31 self-circular `=IF(H2=$F$2,$F$31,H31)` cells become #REF! errors. Per-project hard-stamps fail. | Excel: File > Options > Formulas > Enable iterative calculation (checked). Save. | ❌ Risky to flip without model audit |
+| **A3** | warning | `calcMode != "manual"` | Excel may trigger background recalcs during the macro, racing with the macro's own targeted .Calculate calls. | Excel: Formulas tab > Calculation Options > Manual. Save. | ❌ |
+| **A4** | warning | `fullCalcOnLoad=False` | Cached values may not reflect current formulas. Pre-flight error scans become unreliable. | Open in Excel, F9 to force full recalc, save. | ❌ |
+
+### B — Workbook structure
+
+| Code | Severity | Issue | Why it matters | Manual fix | `--auto-fix`? |
+|---|---|---|---|---|---|
+| **B5** | error | Required sheet missing | Macro fails with VBA "Subscript out of range" mid-run. Required: Project Inputs, Appraisal, NPP Calc, Operations, PT Returns, Tax Equity, Perm Debt, CL, Capex, Rate Curves, Global. | Restore the missing sheet(s) from a baseline pricing model. | ❌ |
+| **B7** | error | Required Project Inputs cell missing or empty | Macro reads/writes these every iteration. Empty value → wrong results or VBA error. Required: F2, F30, F31, F32, F36, F37. | Restore the cell from a baseline model. | ❌ |
+| **B8** | error | Workbook structure or critical sheet protected | Macro adds the `__SolverResults` telemetry sheet at startup; protection blocks. Per-sheet protection blocks writes to Project Inputs / Appraisal / NPP Calc. | Excel: Review tab > Protect/Unprotect. | ❌ |
+| **B9** | error | No active project (row 7 = 1 in any project col H..S) | Solver exits immediately with "No active projects found". | Set row 7 to 1 for the project columns to solve. | ❌ |
+
+### C — Critical-path cached errors
+
+| Code | Severity | Issue | Why it matters | Manual fix | `--auto-fix`? |
+|---|---|---|---|---|---|
+| **C10** | error | Cached `#VALUE!` / `#DIV/0!` / `#REF!` on Project Inputs F30:S39 | Macro reads these rows for the GoalSeek target/changing cells and per-project hard-stamps. Errors corrupt the convergence loop. | Trace the precedent chain in Excel. Common causes: missing rate curves, broken named ranges, deleted source rows. | ❌ |
+| **C11** | error | Cached error on Appraisal rows 155-159 (cash flow rows) | Cash flow row 159 = SUM(155:158) feeds the XIRR readout at H161. Errors propagate to H161 and corrupt the GoalSeek target. | Trace precedents. Often missing inputs in PI row 32 (Dev Fee), row 11 (System Size), or rate curve gaps. | ❌ |
+| **C12** | error | Cached error on Appraisal!H161 (Live Appraisal IRR XIRR readout) | F31 = Appraisal!H161 is the GoalSeek target. An error here means GoalSeek has no valid value to drive. | Fix upstream errors first (likely C11), then F9 to force full recalc. | ❌ |
+
+### D — Embedded VBA macro version
+
+| Code | Severity | Issue | Why it matters | Manual fix | `--auto-fix`? |
+|---|---|---|---|---|---|
+| **D15** | error | Embedded macro is missing required functions (or `xl/vbaProject.bin` doesn't exist) | The orchestrator calls these functions via `Application.Run`. Missing functions either fail silently (On Error Resume Next) or raise a VBA error mid-solve. **Confirmed root cause of the IL TEST 2026-05-13 regression** — that workbook had a 627-line outdated macro vs the 1220-line current. | Run: `python import_vba_module.py "C:\path\to\workbook.xlsm"` | ❌ Requires Excel COM |
+| **D16** | warning | Workbook contains stale leftover macro modules (e.g. `Module2_Optimized*`) | Indicates the workbook has been through several macro-import cycles without cleanup. Stale modules don't break the solve but may shadow current function names or hold references to obsolete cells. | Excel: Alt+F11 → right-click each stale module → Remove. Decline export prompt. | ❌ |
+
+### E — Input range checks against macro bounds
+
+| Code | Severity | Issue | Why it matters | Manual fix | `--auto-fix`? |
+|---|---|---|---|---|---|
+| **E13** | warning | Pre-solve Dev Fee outside `[$0.05..$0.50/W]` on active project columns | The chunked solve path resets out-of-range Dev Fees to $0.20 at iteration 0 and after every inner GoalSeek call. Some models recover (SMP); others get trapped at the seed (IL TEST 2026-05-13). Worth investigating if convergence fails. | Manually set Dev Fee within bounds (risky if Dev Fee is a deal input), OR raise `DEV_FEE_MAX` in `SolveHeadless.bas` line 50 and re-import the macro. | ❌ |
+| **E14** | warning | Pre-solve NPP outside `[-$0.20..$0.80/W]` on active project columns | Macro resets to NPP_SEED ($0.20) at iteration 0. NPP is solved within the inner loop (driven by Equity IRR GoalSeek), so a bad seed is usually recoverable. | If recurring across the deal pipeline, raise `NPP_MIN/MAX` in `SolveHeadless.bas`. | ❌ |
+
+### Operational notes
+
+- **Default behavior:** errors abort with exit code 1; warnings logged but proceed; auto-fix off.
+- **`--strict-preflight`:** treats warnings as errors. Recommended for unattended / CI runs.
+- **`--auto-fix`:** writes `<workbook>_FIXED.xlsm` and proceeds against the patched file. Original file untouched. Today only A1 is auto-fixable.
+- **Audit trail:** the run record's `workbook_name` always references the original file path, even after auto-fix.
+- **Cost:** pre-flight runs in ~2-3 seconds on a 13MB pricing model — negligible vs. the multi-minute COM cost it can save.
