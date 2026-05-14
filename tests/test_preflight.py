@@ -416,3 +416,105 @@ def test_real_smp_passes_preflight():
             "SMP fixture failed preflight unexpectedly:\n"
             + format_preflight_report(result)
         )
+
+
+# --- D17 macro hash drift ------------------------------------------------
+
+import zipfile
+from dn38_solver.shadow.preflight import (
+    BAS_HASH_PROP,
+    _current_bas_sha256,
+)
+
+
+def _baseline_xlsm(tmp_path: Path, name: str = "macro.xlsm") -> Path:
+    """Create a baseline .xlsm-named file (synthetic; no real vbaProject).
+
+    D15 will fire ("no VBA project") but D17 logic still runs against the
+    docProps/custom.xml read path, which is what these tests target. We
+    filter by code so the D15 noise doesn't mask the assertion.
+    """
+    path = _baseline_workbook(tmp_path, name=name.replace(".xlsm", ".xlsx"))
+    xlsm_path = path.with_suffix(".xlsm")
+    path.rename(xlsm_path)
+    return xlsm_path
+
+
+def _inject_bas_hash_stamp(xlsm_path: Path, hash_value: str) -> None:
+    """Add docProps/custom.xml with a DN38_BAS_SHA256 property.
+
+    Mirrors what Excel COM CustomDocumentProperties.Add would write. Done
+    by rewriting the zip rather than via openpyxl to avoid the openpyxl-
+    xlsm save round-trip pattern (which is exactly what the rule under
+    test forbids).
+    """
+    custom_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Properties xmlns='
+        '"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+        'xmlns:vt='
+        '"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        f'<property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="2" '
+        f'name="{BAS_HASH_PROP}">'
+        f'<vt:lpwstr>{hash_value}</vt:lpwstr>'
+        '</property>'
+        '</Properties>'
+    )
+    # zipfile doesn't have an in-place edit primitive; rewrite the archive
+    # with the new part appended (overwriting any prior copy).
+    tmp_out = xlsm_path.with_suffix(".xlsm.tmp")
+    with zipfile.ZipFile(xlsm_path, "r") as zin:
+        with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == "docProps/custom.xml":
+                    continue
+                zout.writestr(item, zin.read(item.filename))
+            zout.writestr("docProps/custom.xml", custom_xml)
+    tmp_out.replace(xlsm_path)
+
+
+class TestMacroHashDrift:
+    def test_no_stamp_produces_d17_warning(self, tmp_path):
+        # Skip when the repo doesn't have SolveHeadless.bas (defensive —
+        # the .bas should always be present in a working tree, but tests
+        # shouldn't crash a stripped checkout).
+        if _current_bas_sha256() is None:
+            pytest.skip("SolveHeadless.bas not in repo")
+        path = _baseline_xlsm(tmp_path)
+        result = run_preflight(path)
+        d17 = [f for f in result.findings if f.code == "D17"]
+        assert len(d17) == 1
+        assert d17[0].severity == "warning"
+        assert "no" in d17[0].message.lower() or "stamp" in d17[0].message.lower()
+
+    def test_matching_stamp_no_d17_finding(self, tmp_path):
+        current = _current_bas_sha256()
+        if current is None:
+            pytest.skip("SolveHeadless.bas not in repo")
+        path = _baseline_xlsm(tmp_path)
+        _inject_bas_hash_stamp(path, current)
+        result = run_preflight(path)
+        d17 = [f for f in result.findings if f.code == "D17"]
+        assert d17 == [], (
+            f"Expected no D17 finding when hash matches; got: {d17}"
+        )
+
+    def test_mismatched_stamp_produces_d17_error(self, tmp_path):
+        if _current_bas_sha256() is None:
+            pytest.skip("SolveHeadless.bas not in repo")
+        path = _baseline_xlsm(tmp_path)
+        # Plant a hash that definitely won't match the real .bas
+        _inject_bas_hash_stamp(path, "0" * 64)
+        result = run_preflight(path)
+        d17 = [f for f in result.findings if f.code == "D17"]
+        assert len(d17) == 1
+        assert d17[0].severity == "error"
+        assert "does not match" in d17[0].message
+
+    def test_xlsx_skips_macro_hash_check(self, tmp_path):
+        # .xlsx is macro-free by spec — D17 must not fire on it even
+        # without a stamp, otherwise every non-macro test workbook would
+        # surface a spurious warning.
+        path = _baseline_workbook(tmp_path)  # .xlsx
+        result = run_preflight(path)
+        assert not any(f.code == "D17" for f in result.findings)

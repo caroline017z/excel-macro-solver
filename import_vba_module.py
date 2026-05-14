@@ -10,12 +10,45 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
 import sys
 import time
 from pathlib import Path
 
 BAS_FILE = Path(__file__).parent / "SolveHeadless.bas"
 MODULE_NAME = "modSolveHeadless"
+
+# Custom document property name used to stamp the imported .bas hash.
+# Read by dn38_solver.shadow.preflight.check_macro_hash to detect drift
+# between the repo's current SolveHeadless.bas and what's actually
+# embedded in this workbook. Stable name = stable diagnostic code D17.
+BAS_HASH_PROP = "DN38_BAS_SHA256"
+
+
+def _bas_sha256() -> str:
+    return hashlib.sha256(BAS_FILE.read_bytes()).hexdigest()
+
+
+def _stamp_bas_hash(wb: object, hash_value: str) -> None:
+    """Write the .bas SHA256 into the workbook's custom doc properties.
+
+    Replaces any prior stamp. Must be called BEFORE wb.SaveAs so the
+    property lands in the persisted file. Done via Excel COM (not
+    openpyxl) so we don't violate the openpyxl-xlsm save rule.
+    """
+    cdp = wb.CustomDocumentProperties
+    # Delete prior stamp if present — CDPs have no upsert.
+    try:
+        cdp.Item(BAS_HASH_PROP).Delete()
+    except Exception:
+        pass
+    # Type=4 = msoPropertyTypeString. Value passed as keyword for clarity.
+    cdp.Add(
+        Name=BAS_HASH_PROP,
+        LinkToContent=False,
+        Type=4,
+        Value=hash_value,
+    )
 
 
 def _verify_macro_via_com(wb_path: Path) -> tuple[bool, int]:
@@ -110,6 +143,17 @@ def main() -> None:
 
         if found:
             print(f"  In-memory import OK: '{MODULE_NAME}' present in VBProject.")
+            # Stamp the .bas hash into a custom doc property so preflight
+            # can detect drift later (D17). Done here so the stamp lands
+            # in the same SaveAs that persists the macro import.
+            try:
+                hash_value = _bas_sha256()
+                _stamp_bas_hash(wb, hash_value)
+                print(f"  Stamped {BAS_HASH_PROP} = {hash_value[:12]}...")
+            except Exception as hash_exc:
+                # Non-fatal: import still works without the stamp. Preflight
+                # will surface a "no stamp" warning instead of a drift error.
+                print(f"  WARNING: Could not stamp {BAS_HASH_PROP}: {hash_exc}")
             # Force the workbook dirty before Save. Without this, Excel can
             # decide our VBProject.Import didn't change "workbook content"
             # and skip re-serializing the VBA stream entirely — Save returns

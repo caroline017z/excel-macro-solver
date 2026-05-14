@@ -19,6 +19,11 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple
 
+from dn38_solver.com.auto_recovery import (
+    AutoRecoveryUnavailable,
+    with_recovery,
+)
+from dn38_solver.com.hresult import decode_com_error, format_decoded
 from dn38_solver.com.vba_contract import (
     FINALIZE_SOLVE_ENV,
     INIT_SOLVE_ENV,
@@ -241,6 +246,20 @@ def run_direct(
                 ", ".join(rejected),
             )
         if safe_to_strip:
+            # KNOWN-RISKY PATTERN: openpyxl save on an .xlsm pre-solve. Per
+            # the 2026-05-13 RP Puma incident, this can corrupt workbook
+            # state (data validation extLst, calcChain, cond formatting)
+            # in ways the macro tolerates for direct writes but rejects
+            # during the first GoalSeek call. Mitigated downstream by
+            # auto-recovery (com.auto_recovery.with_recovery): if the
+            # solve throws an auto-recoverable HRESULT, recovery re-runs
+            # import_vba_module.py whose Excel COM SaveAs fully rewrites
+            # the file and clears the corruption.
+            #
+            # DO NOT add new openpyxl.save() sites on .xlsm files. Use
+            # dn38_solver.com.com_edit.edit_xlsm instead — it routes the
+            # mutation through Excel COM SaveAs (FileFormat=52), which
+            # has been verified not to corrupt state.
             try:
                 import openpyxl
                 wb_strip = openpyxl.load_workbook(str(temp_path), keep_vba=True)
@@ -387,6 +406,93 @@ def run_direct(
             )
         else:
             macro_used, has_switch, macro_error = _run_single_shot(excel, wb)
+
+        # Auto-recovery: a generic VBA error inside Application.Run
+        # (e.g. 0x80048028) almost always means the workbook's state is
+        # stale relative to the embedded macro — typically because an
+        # openpyxl save or another non-Excel writer touched the .xlsm
+        # since the last macro import. The 2026-05-13 RP Puma incident
+        # showed a single fresh `import_vba_module.py` pass fully rewrote
+        # the file via Excel COM SaveAs and cleared the corruption. Wrap
+        # that recovery as a one-shot retry here.
+        if (
+            use_chunked
+            and macro_error
+            and decode_com_error(macro_error).auto_recoverable
+        ):
+            decoded = decode_com_error(macro_error)
+            log.warning(
+                "  Macro failed with an auto-recoverable error. Attempting "
+                "recovery (re-import + retry once).\n%s",
+                format_decoded(decoded),
+            )
+            status.update(
+                "recovering",
+                per_project_status="recovering",
+                macro_used=macro_used,
+                recovery_reason=decoded.summary,
+            )
+
+            retry_used: list = [macro_used]
+            retry_has_switch: list = [has_switch]
+            retry_error: list = [macro_error]
+
+            def _close_wb() -> None:
+                nonlocal wb
+                if wb is not None:
+                    with contextlib.suppress(Exception):
+                        wb.Close(SaveChanges=False)
+                    wb = None
+
+            def _reopen_wb() -> None:
+                nonlocal wb
+                wb = excel.Workbooks.Open(
+                    str(temp_path),
+                    ReadOnly=False,
+                    UpdateLinks=0,
+                )
+                if skip_output_recalc:
+                    with contextlib.suppress(Exception):
+                        excel.Application.Run(
+                            vba_call_str(wb.Name, SET_SKIP_OUTPUT_RECALC),
+                            True,
+                        )
+
+            def _retry() -> None:
+                used, switch, err = _run_chunked(
+                    excel, wb, norm_tasks, original_f2, status,
+                    checkpoint_callback=checkpoint_callback,
+                )
+                retry_used[0] = used
+                retry_has_switch[0] = switch
+                retry_error[0] = err
+                if err:
+                    raise RuntimeError(err)
+
+            try:
+                recovered = with_recovery(
+                    workbook_path=temp_path,
+                    close_open_handle=_close_wb,
+                    reopen_handle=_reopen_wb,
+                    retry_callable=_retry,
+                    already_recovered=False,
+                )
+            except AutoRecoveryUnavailable as ar_exc:
+                log.warning("  Auto-recovery unavailable: %s", ar_exc)
+                recovered = False
+
+            if recovered:
+                macro_used = retry_used[0]
+                has_switch = retry_has_switch[0]
+                macro_error = None
+            else:
+                # Surface the post-recovery error so the operator knows
+                # this wasn't a first-pass failure. Keep the original
+                # decoded hint visible upstream.
+                macro_error = (
+                    f"auto-recovery did not converge — original: {macro_error} "
+                    f"| retry: {retry_error[0]}"
+                )
 
         solve_time = time.time() - t0
         log.info("  Macro '%s' completed in %.1fs", macro_used, solve_time)

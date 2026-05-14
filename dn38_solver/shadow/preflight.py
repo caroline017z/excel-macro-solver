@@ -55,6 +55,7 @@ in the log but proceed unless --strict-preflight is set.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import shutil
@@ -155,6 +156,21 @@ STALE_MACRO_MODULES = (
     "Module2_Optimized",
     "Module3",
     "Module4",
+)
+
+# Custom-doc-property name and source .bas path for the D17 hash drift
+# check. import_vba_module.py stamps the SHA256 of SolveHeadless.bas into
+# this property on every successful import; check_macro_hash re-reads it
+# and compares against the current repo .bas. Mismatch = re-import is
+# required. Stronger guard than the function-presence scan in D15: a .bas
+# can carry all required function NAMES but have updated bodies that the
+# orchestrator depends on (e.g., changed loop bounds, new heartbeat
+# emits). Hash equality is the only reliable drift signal.
+BAS_HASH_PROP = "DN38_BAS_SHA256"
+_REPO_BAS_PATH = Path(__file__).parent.parent.parent / "SolveHeadless.bas"
+_BAS_HASH_RE = re.compile(
+    r'<property[^>]+name="' + BAS_HASH_PROP + r'"[^>]*>\s*<vt:[^>]+>([0-9a-fA-F]+)</vt:',
+    re.IGNORECASE,
 )
 
 
@@ -642,6 +658,107 @@ def check_macro_version(workbook_path: Path) -> list[PreflightFinding]:
     return findings
 
 
+def _current_bas_sha256() -> str | None:
+    """Return SHA256 of the repo's current SolveHeadless.bas, or None if
+    the file is missing (developer working tree only — preflight should
+    skip the drift check rather than fail loudly)."""
+    if not _REPO_BAS_PATH.exists():
+        return None
+    return hashlib.sha256(_REPO_BAS_PATH.read_bytes()).hexdigest()
+
+
+def _read_stamped_bas_hash(workbook_path: Path) -> str | None:
+    """Pull DN38_BAS_SHA256 out of docProps/custom.xml via zip-level read.
+
+    Avoids the openpyxl save round-trip (which would violate the openpyxl-
+    xlsm save rule even on a read-then-close pattern, since openpyxl's
+    `read_only=True` skips custom properties entirely and a normal load
+    can mutate workbook state on close). Returns None when the property
+    is absent or the file has no custom.xml at all.
+    """
+    try:
+        with zipfile.ZipFile(workbook_path, "r") as z:
+            try:
+                xml = z.read("docProps/custom.xml").decode("utf-8")
+            except KeyError:
+                return None
+    except (zipfile.BadZipFile, OSError):
+        return None
+    m = _BAS_HASH_RE.search(xml)
+    return m.group(1) if m else None
+
+
+def check_macro_hash(workbook_path: Path) -> list[PreflightFinding]:
+    """D17: embedded macro hash must match the current SolveHeadless.bas.
+
+    Compares the SHA256 stamped by import_vba_module.py against a fresh
+    hash of the repo's .bas file. Cheap (~5ms) and catches drift that the
+    function-name scan in D15 misses — most .bas updates preserve marker
+    function names while changing implementation, so D15 would pass while
+    a critical body change goes undetected.
+
+    Semantics:
+      - .bas missing in repo:  skip silently (orchestrator can still run)
+      - .xlsx workbook:        skip (.xlsx has no macros by spec)
+      - no stamp on workbook:  warning (workbook predates the stamp
+                               convention; can't verify either way)
+      - stamp ≠ current:       error (definite drift; re-import required)
+    """
+    findings: list[PreflightFinding] = []
+    if workbook_path.suffix.lower() != ".xlsm":
+        return findings
+    current = _current_bas_sha256()
+    if current is None:
+        # Repo working tree without the source .bas. Don't blame the
+        # workbook for a developer-environment issue.
+        return findings
+    stamped = _read_stamped_bas_hash(workbook_path)
+    if stamped is None:
+        findings.append(PreflightFinding(
+            code="D17",
+            severity="warning",
+            location="docProps/custom.xml",
+            message=(
+                f"workbook has no {BAS_HASH_PROP} stamp — cannot verify "
+                f"the embedded macro matches the current SolveHeadless.bas"
+            ),
+            impact=(
+                "Without a stamp, drift between the repo .bas and the "
+                "embedded macro is invisible. Macro drift is the #1 cause "
+                "of cryptic solve failures."
+            ),
+            remediation=(
+                f"Re-import the macro once to plant the stamp: "
+                f'python import_vba_module.py "{workbook_path}"'
+            ),
+            auto_fixable=False,
+        ))
+        return findings
+    if stamped.lower() != current.lower():
+        findings.append(PreflightFinding(
+            code="D17",
+            severity="error",
+            location="docProps/custom.xml",
+            message=(
+                f"embedded macro hash {stamped[:12]}... does not match "
+                f"current SolveHeadless.bas {current[:12]}..."
+            ),
+            impact=(
+                "The .bas in the repo has changed since this workbook was "
+                "last re-imported. Body changes that don't add or remove "
+                "function names are invisible to D15 but still break the "
+                "orchestrator's assumptions (loop bounds, heartbeat keys, "
+                "error handling). Re-import before solving."
+            ),
+            remediation=(
+                f'Re-import the macro: python import_vba_module.py '
+                f'"{workbook_path}"'
+            ),
+            auto_fixable=False,
+        ))
+    return findings
+
+
 def check_input_bounds(wb: openpyxl.Workbook) -> list[PreflightFinding]:
     """E13/E14: pre-solve Dev Fee / NPP per project must be within the
     chunked entry point's hardcoded bounds, else the macro resets them
@@ -765,10 +882,14 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
             error_scan=error_scan,
         )
 
-    # D-tier runs first (cheap zip-level read of vbaProject.bin) before
-    # paying the openpyxl load cost. Catches outdated-macro workbooks
-    # that would also tend to trip downstream checks confusingly.
+    # D-tier runs first (cheap zip-level reads of vbaProject.bin and
+    # docProps/custom.xml) before paying the openpyxl load cost. Catches
+    # outdated-macro workbooks that would also tend to trip downstream
+    # checks confusingly. D17 (hash drift) is the strongest signal; D15
+    # (function presence) is its fallback for workbooks predating the
+    # stamp convention.
     findings.extend(check_macro_version(p))
+    findings.extend(check_macro_hash(p))
 
     # Two passes: formulas (calc props live here) + cached values (for C-checks)
     wb_f = openpyxl.load_workbook(str(p), data_only=False, keep_vba=True, read_only=False)

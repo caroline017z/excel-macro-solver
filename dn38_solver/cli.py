@@ -14,6 +14,10 @@ import sys
 from pathlib import Path
 
 from dn38_solver.config import DEFAULT_WORKBOOK, OUTPUT_ROWS
+from dn38_solver.shadow.preflight import (
+    format_preflight_report,
+    run_preflight,
+)
 from dn38_solver.solver.orchestrator import solve_all
 from dn38_solver.storage.database import (
     get_checkpointed_projects,
@@ -123,6 +127,18 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Read workbook and list projects without solving",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "Run pre-flight checks against the workbook and exit. No COM "
+            "startup, no macro execution. Surfaces calc-property issues, "
+            "missing sheets/cells, embedded-macro version drift, and "
+            "input-bound violations. Use to vet a counterparty workbook "
+            "in seconds before paying multi-minute solve cost. Exit 0 if "
+            "all checks pass, 1 if any error-tier finding."
+        ),
     )
     parser.add_argument(
         "--history",
@@ -296,6 +312,14 @@ def main() -> None:
     if not workbook_path.exists():
         print(f"ERROR: Workbook not found: {workbook_path}")
         sys.exit(1)
+
+    if args.diagnose:
+        # No COM, no macro — just the static pre-flight pass. Faster than
+        # any solver entry point and safe to run on a workbook that's
+        # currently open in Excel (read-only openpyxl path).
+        result = run_preflight(workbook_path)
+        print(format_preflight_report(result))
+        sys.exit(0 if result.ok else 1)
 
     strip_sheets = tuple(
         s.strip() for s in args.strip_sheets.split(",") if s.strip()
