@@ -223,6 +223,13 @@ def merge_via_vba_fallback(
             log.error("  VBA merge precondition failed: %s", verify_exc)
             raise
 
+        # Track every stamp failure and every project skipped due to missing
+        # peer data. ANY of these means the merged file would silently ship
+        # with $0 or stale values for those columns — that is an IC-facing
+        # data-integrity event, not a "warn and continue" event.
+        stamp_failures: list[tuple[int, str, str]] = []
+        skipped_missing: list[tuple[int, str, list[str]]] = []
+
         for other_path in others:
             if not other_path.exists():
                 continue
@@ -254,26 +261,60 @@ def merge_via_vba_fallback(
                 live_irr = ws_pi_other.cell(row=37, column=col_idx).value
                 appr_live = ws_pi_other.cell(row=31, column=col_idx).value
                 npp_total = ws_pi_other.cell(row=39, column=col_idx).value
-                # Pass zeros for cells the peer didn't populate so the VBA
-                # Sub doesn't trip on Variant/Empty across the COM boundary
+
+                # Skip the entire row if ANY of the six values is missing.
+                # Coercing None → 0.0 (prior behavior) silently writes a $0
+                # Dev Fee or $0 NPP into the merged file, which downstream
+                # IC summaries don't distinguish from a real zero.
+                missing = [
+                    name for name, val in (
+                        ("npp", npp), ("dev_fee", dev_fee), ("fmv", fmv),
+                        ("live_irr", live_irr), ("appr_live", appr_live),
+                        ("npp_total", npp_total),
+                    ) if val is None
+                ]
+                if missing:
+                    log.error(
+                        "  SKIP merge for col %d (%s): peer missing %s",
+                        col_idx, task.project_name, missing,
+                    )
+                    skipped_missing.append((col_idx, task.project_name, missing))
+                    continue
+
                 try:
                     excel.Application.Run(
                         vba_call_str(wb.Name, STAMP_CONVERGED_VALUES),
                         int(col_idx),
-                        float(npp or 0),
-                        float(dev_fee or 0),
-                        float(fmv or 0),
-                        float(live_irr or 0),
-                        float(appr_live or 0),
-                        float(npp_total or 0),
+                        float(npp), float(dev_fee), float(fmv),
+                        float(live_irr), float(appr_live), float(npp_total),
                     )
                 except Exception as stamp_exc:
-                    log.warning(
+                    log.error(
                         "  %s failed for col %d (%s): %s",
                         STAMP_CONVERGED_VALUES.name,
                         col_idx, task.project_name, stamp_exc,
                     )
+                    stamp_failures.append(
+                        (col_idx, task.project_name, str(stamp_exc))
+                    )
             wb_other.close()
+
+        # Any stamp failure or missing-data skip means the workbook in
+        # memory is NOT a complete merge. Save under a .MERGE_FAILED.xlsm
+        # name so the file is forensically recoverable but unmistakably
+        # not authoritative, and raise so the caller falls through to a
+        # safer fallback (e.g. copy_master) instead of treating this as
+        # a successful merge.
+        if stamp_failures or skipped_missing:
+            failed_path = final_path.with_suffix(".MERGE_FAILED.xlsm")
+            wb.SaveAs(str(failed_path), FileFormat=52)
+            raise RuntimeError(
+                f"VBA merge incomplete: {len(stamp_failures)} stamp failure(s), "
+                f"{len(skipped_missing)} project(s) skipped for missing peer data. "
+                f"Forensic copy saved to {failed_path.name}. "
+                "Caller should fall through to copy_master to avoid shipping "
+                "a partial-merge .xlsm."
+            )
 
         # SaveAs to final canonical path with explicit FileFormat=52
         # (xlOpenXMLWorkbookMacroEnabled) so the VBA project survives.

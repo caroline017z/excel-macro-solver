@@ -166,12 +166,12 @@ class TestInputBounds:
     def test_e13_dev_fee_above_max(self, tmp_path):
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
-        wb["Project Inputs"]["H32"] = 2.40  # the IL TEST Cloverland value
+        wb["Project Inputs"]["H32"] = 6.00  # above DEV_FEE_MAX=5.5 (raised 2026-05-15)
         wb.save(path)
         result = run_preflight(path)
         e13 = [f for f in result.findings if f.code == "E13"]
         assert len(e13) == 1
-        assert "2.40" in e13[0].message
+        assert "6.00" in e13[0].message
         # E13 is a warning, not a blocking error — SMP empirically converges
         # with E13 firing, so we only flag it as worth investigating.
         assert e13[0].severity == "warning"
@@ -187,7 +187,7 @@ class TestInputBounds:
     def test_e14_npp_above_max(self, tmp_path):
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
-        wb["Project Inputs"]["H38"] = 1.50  # > NPP_MAX = 0.8
+        wb["Project Inputs"]["H38"] = 2.50  # > NPP_MAX = 2.0 (raised 2026-05-14)
         wb.save(path)
         result = run_preflight(path)
         e14 = [f for f in result.findings if f.code == "E14"]
@@ -358,7 +358,7 @@ class TestReport:
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
         wb.calculation.iterateDelta = None
-        wb["Project Inputs"]["H32"] = 5.0
+        wb["Project Inputs"]["H32"] = 6.0  # > DEV_FEE_MAX = 5.5 (raised 2026-05-15)
         wb.save(path)
         result = run_preflight(path)
         text = format_preflight_report(result)

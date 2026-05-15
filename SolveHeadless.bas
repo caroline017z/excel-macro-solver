@@ -546,6 +546,17 @@ Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)
     Dim wsPI As Worksheet
     Set wsPI = ThisWorkbook.Sheets(SHT_PI)
 
+    ' Force full propagation BEFORE reading row 31/37. The caller's
+    ' SwitchProjectAndRecalc uses tier-1 CalcSheetsAll which doesn't
+    ' reliably mark cross-sheet OFFSET-via-F2 dependencies dirty under
+    ' xlCalculationManual + multi-threaded calc (same reason the solve
+    ' loop runs CalculateFull at line 821 before declaring convergence).
+    ' Without this, the hard-stamp could pin a stale prior-project IRR
+    ' value into this column — invisible until the merged file diverges
+    ' from the worker's reported solved_values. ~3-10s per project in
+    ' the read pass; eliminates the entire stale-stamp race class.
+    Application.CalculateFull
+
     ' Live IRR / Live Appraisal — read from F-column live cells, not self-
     ' assign (the per-column IF is circular; self-assign returns the
     ' cached side of the IF).
@@ -685,6 +696,7 @@ End Sub
 Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
                                         ByVal projName As String, _
                                         ByVal resultsRow As Integer) As Long
+    On Error GoTo ProjErr
     Dim wsPI As Worksheet
     Dim wsPT As Worksheet
     Dim wsRes As Worksheet
@@ -698,6 +710,16 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     Dim dSolveStart As Double
     dSolveStart = Timer
     WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName
+
+    ' Save HoldCo state at entry so the error path can restore it. The
+    ' iter loop toggles HoldCo 0→1 within each iIter; an error fired with
+    ' HoldCo=0 would leave the workbook in an inconsistent capital
+    ' structure state for subsequent project solves until the next iter's
+    ' HoldCo cycle. Restoring on error eliminates that cross-project
+    ' bleed (P0-1 from 2026-05-15 reliability review).
+    Dim lOriginalHoldCo As Long
+    lOriginalHoldCo = CLng(wsPT.Range(PT_HOLDCO_ONOFF).Value)
+    If lOriginalHoldCo <> 0 And lOriginalHoldCo <> 1 Then lOriginalHoldCo = 1
 
     ' Per-step heartbeats. The cost is ~20 extra cell writes per project
     ' (negligible vs the 60-200s solve time) and they pay for themselves
@@ -941,6 +963,29 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & projName
 
     SolveOneProjectByColHL = IIf(bConverged, 1, 0)
+    Exit Function
+
+ProjErr:
+    ' Capture error details before any cleanup that could clobber Err.
+    Dim lErrNum As Long
+    Dim sErrDesc As String
+    lErrNum = Err.Number
+    sErrDesc = Err.Description
+    On Error Resume Next
+    ' Restore HoldCo so subsequent projects don't inherit a 0 state from
+    ' a partial solve. wsPT may be Nothing if Set failed above; guard.
+    If Not wsPT Is Nothing Then
+        wsPT.Range(PT_HOLDCO_ONOFF).Value = lOriginalHoldCo
+    End If
+    If Not wsRes Is Nothing Then
+        WriteHeartbeatHL wsRes, _
+            "PROJ_ERR|" & projName & "|err=" & lErrNum & "|" & sErrDesc
+    End If
+    On Error GoTo 0
+    ' Re-raise so Python's COM caller sees the failure and can decide
+    ' whether to retry, recover, or abort the worker.
+    Err.Raise lErrNum, _
+        "SolveOneProjectByColHL:" & projName, sErrDesc
 End Function
 
 
@@ -962,6 +1007,14 @@ Public Sub SolveHeadless()
     ' --- Save original F2 for restore ---
     Dim lngOriginalF2 As Long
     lngOriginalF2 = CLng(wsPI.Range(PI_PROJ_INDEX).Value)
+
+    ' --- Save original HoldCo for restore on error ---
+    ' Capital structure state must be restored if mid-portfolio error
+    ' aborts the loop with HoldCo=0; otherwise the workbook saves with
+    ' an inconsistent debt-stack state across projects (P0-1 from review).
+    Dim lngOriginalHoldCo As Long
+    lngOriginalHoldCo = CLng(wsPT.Range(PT_HOLDCO_ONOFF).Value)
+    If lngOriginalHoldCo <> 0 And lngOriginalHoldCo <> 1 Then lngOriginalHoldCo = 1
 
     ' --- Scan row 7 for toggled-on projects ---
     Dim arrCols(1 To 60)  As Integer
@@ -1251,6 +1304,9 @@ Public Sub SolveHeadless()
 ErrHandler:
     On Error Resume Next
     wsPI.Range(PI_PROJ_INDEX).Value = lngOriginalF2
+    ' Restore HoldCo so a partial-portfolio failure doesn't leave the
+    ' workbook with HoldCo=0 across already-solved projects.
+    wsPT.Range(PT_HOLDCO_ONOFF).Value = lngOriginalHoldCo
     CalcModelCoreHL
     EnableAllSheets
     RestoreGoalSeekDefaultsHL

@@ -579,13 +579,20 @@ def run_direct(
             # project state and produced merged-file values diverging
             # from what we're about to read in the next loop. Skip on
             # the legacy fallback path that doesn't have the helper.
+            #
+            # NEVER suppress this exception. A silent stamp failure
+            # leaves the per-column cell as a circular IF formula that
+            # openpyxl-merge can read as stale or None — exactly the
+            # silent data-corruption mode the post-merge verifier was
+            # built to catch but won't always catch (P1-5 from review).
+            # Surface the failure as a worker-level error so the parent
+            # can decide whether to retry or abort.
             if has_switch:
                 col_idx = nt.offset + BASE_COL
-                with contextlib.suppress(Exception):
-                    excel.Application.Run(
-                        vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
-                        int(col_idx),
-                    )
+                excel.Application.Run(
+                    vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
+                    int(col_idx),
+                )
 
             # Read cells
             solved: dict[str, float | str | None] = {}

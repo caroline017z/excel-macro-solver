@@ -107,9 +107,9 @@ INIT_SOLVE_ENV = VBASub(name="InitSolveEnvHL")
 SOLVE_ONE_PROJECT_BY_COL = VBASub(
     name="SolveOneProjectByColHL",
     args=(
-        ("projOffset", "Integer"),
-        ("projName",   "String"),
         ("colIdx",     "Integer"),
+        ("projName",   "String"),
+        ("resultsRow", "Integer"),
     ),
 )
 
