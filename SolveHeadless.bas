@@ -785,6 +785,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
         WriteHeartbeatHL wsRes, "ITER_" & iIter & "_GS_DSCR"
         bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
+        If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_DSCR|iter=" & iIter
         If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
         If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
         WriteHeartbeatHL wsRes, "ITER_" & iIter & "_CALC2"
@@ -803,11 +804,13 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_GS_NPP"
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
+            If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_NPP|iter=" & iIter & "|inner=" & iInner
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_CALC_NPP"
             CalcForPhase PHASE_NPP
 
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_GS_APPR"
             bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
+            If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_APPR|iter=" & iIter & "|inner=" & iInner
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_CALC_APPR"
             CalcForPhase PHASE_APPR
 
@@ -1080,6 +1083,7 @@ Public Sub SolveHeadless()
 
             ' Step 2: GoalSeek Min Equity = 10% (changes DSCR Multiple)
             bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
+            If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_DSCR|" & arrNames(i) & "|iter=" & iIter
             If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
             If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
             CalcForPhase PHASE_DSCR
@@ -1098,9 +1102,11 @@ Public Sub SolveHeadless()
                 If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then Exit For
 
                 bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
+                If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_NPP|" & arrNames(i) & "|iter=" & iIter & "|inner=" & iInner
                 CalcForPhase PHASE_NPP
 
                 bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
+                If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_APPR|" & arrNames(i) & "|iter=" & iIter & "|inner=" & iInner
                 CalcForPhase PHASE_APPR
 
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
