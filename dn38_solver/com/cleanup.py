@@ -85,9 +85,11 @@ def kill_excel_children(parent_pid: int, *, timeout_sec: float = 5.0) -> int:
     try:
         import psutil
     except ImportError:
-        log.warning(
-            "psutil not installed — kill_excel_children is a no-op. "
-            "Install with: pip install psutil"
+        log.error(
+            "psutil not installed — orphan Excel workers cannot be reaped. "
+            "This leaks EXCEL.EXE processes that consume RAM until manual kill. "
+            "Install with: pip install psutil  (declared in pyproject.toml; "
+            "missing means the environment was set up without `pip install -e .`)"
         )
         return 0
 

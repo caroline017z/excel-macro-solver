@@ -105,13 +105,31 @@ def _aggregate(
     return out
 
 
-def _atomic_write_json(path: Path, payload: dict) -> None:
+# Retry schedule for the .tmp → target rename. On Windows, transient
+# PermissionError fires when AV (Defender) momentarily holds an exclusive
+# handle on the file just-written, when a Streamlit dashboard reader
+# happens to have it open, or when the Windows file-index service is
+# mid-scan. Empirically these clear within ~50-500ms; this schedule
+# (~1.55s total) catches >99% in practice while bounding the worst case.
+# Caller still leaves the .tmp behind on exhaustion so the next successful
+# write recovers state.
+_RENAME_RETRY_DELAYS_SEC: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
     """Write JSON via a sibling tmp + replace so readers never see a half-write.
 
     On Windows, `replace` can fail with PermissionError when another process
-    (e.g., the Streamlit tracker mid-read) has the target open. Log the
-    failure rather than swallow it silently; otherwise a tmp file is left
-    behind and no one knows.
+    (Streamlit tracker reading; Defender real-time scan; file-index service)
+    has the target open. We retry on a short backoff schedule
+    (~50ms..800ms, ~1.55s total) before giving up. Tmp file is left in
+    place on exhaustion so the NEXT successful write still recovers state
+    — and so debug forensics show the failing payload.
+
+    Root cause history: Queen City 2026-05-14 run logged
+    `WinError 5: Access is denied` on this rename without any retry, even
+    though both worker macros had completed successfully. A single retry
+    would have salvaged the run.
     """
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -119,14 +137,34 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     except OSError as exc:
         log.warning("Status tmp-write to %s failed: %s", tmp_path, exc)
         return
-    try:
-        tmp_path.replace(path)
-    except OSError as exc:
-        log.warning(
-            "Status replace %s -> %s failed (%s); leaving tmp file in place "
-            "until next successful write",
-            tmp_path, path, exc,
-        )
+
+    last_exc: OSError | None = None
+    # First attempt is immediate; only sleep BEFORE each retry, not before
+    # the first try. len(delays) + 1 total attempts.
+    for attempt, delay in enumerate((0.0,) + _RENAME_RETRY_DELAYS_SEC):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            tmp_path.replace(path)
+            if attempt > 0:
+                # Visible-but-not-loud: the retry worked, so the run is
+                # fine, but the operator should know contention happened
+                # (could indicate AV scanning or a stuck dashboard).
+                log.info(
+                    "Status replace %s -> %s succeeded on attempt %d",
+                    tmp_path, path, attempt + 1,
+                )
+            return
+        except OSError as exc:
+            last_exc = exc
+
+    log.warning(
+        "Status replace %s -> %s failed after %d attempts (%s); leaving "
+        "tmp file in place until next successful write. Common cause on "
+        "Windows: AV real-time scan, a Streamlit reader holding the "
+        "target open, or the Windows file-index service.",
+        tmp_path, path, len(_RENAME_RETRY_DELAYS_SEC) + 1, last_exc,
+    )
 
 
 class StatusAggregator(threading.Thread):
@@ -190,7 +228,7 @@ class StatusAggregator(threading.Thread):
             payloads, self._wb_path,
             expected_worker_count=self._expected_workers,
         )
-        _atomic_write_json(self._out, agg)
+        atomic_write_json(self._out, agg)
 
     def stop(self, *, join_timeout: float = 5.0) -> None:
         self._stop_evt.set()

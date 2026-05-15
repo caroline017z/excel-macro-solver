@@ -43,6 +43,7 @@ from pathlib import Path
 import msgspec
 
 from dn38_solver.com.direct_runner import run_direct
+from dn38_solver.com.status_aggregator import atomic_write_json
 from dn38_solver.types import SolveTask
 
 
@@ -118,20 +119,21 @@ def main() -> int:
             payload["worker_id"] = worker_id
             payload.update(extras)
 
-            tmp = status_path.with_suffix(status_path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
-            tmp.replace(status_path)
+            # Shared retry helper: tolerates transient Windows
+            # PermissionError on the .tmp -> target rename without
+            # losing the terminal-phase update.
+            atomic_write_json(status_path, payload)
         except Exception:
             pass  # never let status-write failure mask the real outcome
 
     def _atomic_write_result(payload: dict) -> None:
         """Write result.json via tmp + replace so a parent reading mid-write
-        (or a SIGTERM during the write) never sees a half-written file. Same
-        idiom as `_StatusWriter` and `_atomic_write_json` elsewhere.
+        (or a SIGTERM during the write) never sees a half-written file.
+        Critical path: if this silently fails, the parent records the worker
+        as 'error' and discards otherwise-valid results. Uses the shared
+        retry helper rather than a one-shot replace.
         """
-        tmp = result_path.with_suffix(result_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
-        tmp.replace(result_path)
+        atomic_write_json(result_path, payload)
 
     try:
         tasks_bytes = config["tasks_json"].encode("utf-8")

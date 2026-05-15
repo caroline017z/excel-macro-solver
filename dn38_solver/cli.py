@@ -159,11 +159,16 @@ def main() -> None:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=1800,
+        default=3600,
         help=(
-            "Solver macro timeout threshold in seconds (default: 1800). "
-            "Real portfolios run 700-1200s on the chunked path; the threshold "
-            "fires the run-level error status post-hoc, not an in-flight cancel."
+            "Per-worker solver macro timeout threshold in seconds (default: 3600). "
+            "Heuristic: ~150s/project on the chunked path including warm-up + "
+            "per-project recalc, so 1 hr covers up to ~24 projects per worker "
+            "with margin. The old 1800s default tripped on real 13-project "
+            "portfolios (Queen City 2026-05-14 incident: worker 0 hit 1859s "
+            "mid-Wheeler, parent killed both workers, all results discarded). "
+            "Threshold fires the run-level error status post-hoc, not an "
+            "in-flight cancel."
         ),
     )
     parser.add_argument(
@@ -312,6 +317,26 @@ def main() -> None:
     if not workbook_path.exists():
         print(f"ERROR: Workbook not found: {workbook_path}")
         sys.exit(1)
+
+    # Fail fast on missing psutil when we'll actually need it for child
+    # cleanup. Without psutil, kill_excel_children is a no-op (logs an
+    # error, returns 0) and orphan EXCEL.EXE workers survive every crash.
+    # Skip the check for --diagnose/--history/--show-checkpoints paths
+    # since those never spawn workers.
+    if not args.diagnose:
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            print(
+                "ERROR: psutil is not installed but is required to reap "
+                "orphan Excel worker processes after timeouts/crashes.\n"
+                "Without it, every failed run leaks one or more EXCEL.EXE "
+                "processes that consume RAM until you kill them manually.\n\n"
+                "Fix: pip install psutil   (or: pip install -e . from the "
+                "repo root — psutil is declared in pyproject.toml dependencies)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     if args.diagnose:
         # No COM, no macro — just the static pre-flight pass. Faster than

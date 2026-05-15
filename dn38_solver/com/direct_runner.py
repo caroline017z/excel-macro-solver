@@ -24,6 +24,7 @@ from dn38_solver.com.auto_recovery import (
     with_recovery,
 )
 from dn38_solver.com.hresult import decode_com_error, format_decoded
+from dn38_solver.com.status_aggregator import atomic_write_json
 from dn38_solver.com.vba_contract import (
     FINALIZE_SOLVE_ENV,
     INIT_SOLVE_ENV,
@@ -139,15 +140,12 @@ class _StatusWriter:
         if self._worker_id is not None:
             payload["worker_id"] = self._worker_id
         payload.update(extras)
-        try:
-            # Atomic swap so a Streamlit reader can never observe a half-
-            # written JSON. tmp file lives next to the target so .replace()
-            # stays on the same filesystem.
-            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp_path.write_text(json.dumps(payload, default=str))
-            tmp_path.replace(self._path)
-        except OSError:
-            pass
+        # Atomic swap with bounded retry so a transient Windows
+        # PermissionError (AV scan, dashboard reader, file-index service)
+        # doesn't drop a status update silently. Helper retries on a
+        # short backoff schedule and logs only on final failure — quiet
+        # in the common case, loud when something is genuinely stuck.
+        atomic_write_json(self._path, payload)
 
 
 def run_direct(
