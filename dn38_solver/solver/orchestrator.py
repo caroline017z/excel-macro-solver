@@ -185,9 +185,17 @@ def solve_all(
     preflight = run_preflight(workbook_path)
     log.info("\n%s", format_preflight_report(preflight))
 
-    # Auto-fix path: write _FIXED.xlsm and re-run preflight against it.
+    # Auto-fix path: write _FIXED.xlsm and resume against it.
     # Preserves the original file path in the run record so the audit
     # trail names the source workbook, not the patched copy.
+    #
+    # We DO NOT re-run the full preflight on the fixed file. The fixed
+    # file differs from the source ONLY in the calcPr/iterateDelta XML
+    # attribute (the sole auto-fixable finding today, A1). No other
+    # finding depends on that attribute, so re-running preflight would
+    # produce identical findings minus A1 — at a cost of 4 openpyxl
+    # loads of a 13MB xlsm (~10 min). Instead, filter A1 (and any other
+    # applied codes) out of the existing result and proceed.
     original_workbook_path = workbook_path
     if auto_fix and preflight.auto_fixable:
         fixed_path = workbook_path.with_name(
@@ -202,7 +210,13 @@ def solve_all(
         )
         log.info("  Auto-fix: applied codes %s", applied_codes)
         workbook_path = fixed_path  # swap to the fixed copy for the solve
-        preflight = run_preflight(workbook_path)
+
+        applied_set = set(applied_codes)
+        preflight = type(preflight)(
+            workbook_path=str(fixed_path),
+            findings=tuple(f for f in preflight.findings if f.code not in applied_set),
+            error_scan=preflight.error_scan,
+        )
         log.info("\n%s", format_preflight_report(preflight))
 
     # Bank-grade gate: errors always block. Warnings block only if

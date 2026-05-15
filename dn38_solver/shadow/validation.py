@@ -111,21 +111,25 @@ def scan_workbook_errors(path: Path | str) -> WorkbookValidation:
     finally:
         wb_vals.close()
 
-    # Formula count — second pass only if useful for context.
+    # Formula count — only run when errors were found, since it's an
+    # expensive second openpyxl pass (3-5 min on a 13MB xlsm) used only
+    # as the triage denominator in the report. On clean workbooks (the
+    # common case) skipping this saves ~half the scan time.
     formula_count = 0
-    try:
-        wb_formulas = openpyxl.load_workbook(str(p), data_only=False, read_only=True)
+    if total_errors > 0:
         try:
-            for sheet_name in wb_formulas.sheetnames:
-                ws = wb_formulas[sheet_name]
-                for row in ws.iter_rows(values_only=True):
-                    for val in row:
-                        if isinstance(val, str) and val.startswith("="):
-                            formula_count += 1
-        finally:
-            wb_formulas.close()
-    except Exception as exc:
-        log.debug("Formula count pass failed (non-fatal): %s", exc)
+            wb_formulas = openpyxl.load_workbook(str(p), data_only=False, read_only=True)
+            try:
+                for sheet_name in wb_formulas.sheetnames:
+                    ws = wb_formulas[sheet_name]
+                    for row in ws.iter_rows(values_only=True):
+                        for val in row:
+                            if isinstance(val, str) and val.startswith("="):
+                                formula_count += 1
+            finally:
+                wb_formulas.close()
+        except Exception as exc:
+            log.debug("Formula count pass failed (non-fatal): %s", exc)
 
     summary = {
         tok: ErrorTypeDetail(
