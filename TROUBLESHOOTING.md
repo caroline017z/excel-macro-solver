@@ -19,6 +19,9 @@ to the linked section. Background sits at the bottom in §10.
 | Pre-flight `B5`–`B9` — structure / cells / protection                    | §5 Pre-flight: structure                 |
 | Pre-flight `C10`–`C12` — cached formula errors on critical cells         | §6 Pre-flight: critical-path errors      |
 | Pre-flight `E13`/`E14` — Dev Fee or NPP out of bounds                    | §7 Pre-flight: input bounds              |
+| Pre-flight `E15a` — RC sub-block has `Custom` toggle + empty Rate Name   | §7.1 Pre-flight: RC config audit         |
+| Pre-flight `E15b` — RC source mode mismatched across active projects     | §7.1 Pre-flight: RC config audit         |
+| Solver converged but Dev Fees look ~3-5× too high; DSCRs ~1.02x          | §7.1 Pre-flight: RC config audit         |
 | `(-2147023174, 'RPC server unavailable')` — Excel died                   | §8 Excel process failures                |
 | `(-2147417848, 'object disconnected')` — Excel exited mid-call           | §8 Excel process failures                |
 | Solver runs to completion but projects show `not_converged`              | §9 Convergence quality                   |
@@ -146,6 +149,37 @@ has nothing valid to drive — every iteration sees the same broken target.
 Utility-scale solar deals can carry natural Dev Fees of $1.50–$2.50/W, which
 trip E13. The chunked path resets out-of-range values to seed at iteration
 0; some models recover (SMP), others get trapped (IL TEST 2026-05-13).
+
+---
+
+## 7.1 Pre-flight: RC config audit (E15)
+
+Added 2026-05-15 after Queen City MD shipped $4.30-$5.34/W Dev Fees on 6 of
+13 projects (vs $1.49-$2.02/W on the other 7). Same workbook, same EPC, same
+IX — the only material input difference was that cols O-T had Rate Component
+5 with `Toggle="Custom"` and an empty Rate Name, while cols H-N had RC5
+`Toggle="Generic"` with a populated 5.5% / 2.5% escalator / 35yr term
+merchant rate.
+
+The macro converged correctly given the inputs. The Appraisal IRR = WACC
+GoalSeek can land on any Dev Fee that satisfies the equation; with one
+revenue stream zeroed out, it inflated Dev Fee to compensate. The output
+was mathematically valid but economically nonsensical.
+
+| Code  | Severity | What it means |
+|-------|----------|---------------|
+| E15a  | warning  | One or more RC sub-blocks have `Toggle="Custom"` but the Rate Name cell is empty. Almost always means the Custom rate rows in the Rate Curves tab are also empty — that revenue component contributes zero, and the model compensates elsewhere. |
+| E15b  | warning  | The same RC slot (e.g. RC5) has different `Toggle` values across active projects in one workbook (some Generic, some Custom). CAN be intentional (one project on a bespoke tariff) but warrants explicit operator confirmation. |
+
+**Remediation when E15a fires:** for each flagged RC, either flip the Toggle
+to `Generic` and populate the Generic rate row, OR keep `Custom` and populate
+both the Rate Name AND the per-project rate vector in the Rate Curves tab.
+Re-run the full RC1-RC6 audit (active state + term length across equity /
+debt / appraisal) before solving — Caroline's [revenue-component-audit]
+memory has the full checklist.
+
+**Do NOT `--allow-relaxed` past E15 warnings without confirming the inputs.**
+The macro will converge — that's the trap. Convergence is not validation.
 
 ---
 

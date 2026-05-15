@@ -124,7 +124,20 @@ DEV_FEE_BOUNDS = (0.05, 5.5)     # DEV_FEE_MIN, DEV_FEE_MAX (raised 2026-05-15 f
 PI_ROW_NPP = 38
 PI_ROW_DEV_FEE = 32
 PI_ROW_TOGGLE = 7
-PI_PROJECT_COL_RANGE = ("H", "S")  # 8..19, project columns
+PI_PROJECT_COL_RANGE = ("H", "BG")  # H..BG = 8..59, mirrors SolveHeadless COL_SCAN_LIMIT=60.
+# Originally ("H", "S") which silently truncated to 12 columns — caused Queen City
+# 2026-05-15 to miss Wheeler (col T) entirely in E13/E15. The actual project loop
+# in PI extends as far as macro COL_SCAN_LIMIT; preflight had a narrower view.
+# Inactive columns past the last toggled-on project are no-ops (row 7 != 1).
+
+# Rate Component sub-block layout in Project Inputs. Six RCs, one block each.
+# Per Caroline's devengine-model-map: PI sub-blocks at 157/167/177/187/197/207.
+# Within each block: +1 = Rate Name, +2 = Custom/Generic toggle, +5 = Term.
+# The check below uses Rate Name (base+1) and Toggle (base+2) to detect the
+# Queen City 2026-05-15 failure mode: a project with Toggle="Custom" but
+# Rate Name empty leaves a $0.055/kWh merchant-rate revenue stream unfunded,
+# which the model compensates for with an inflated Dev Fee at solve time.
+RC_BLOCK_BASES = (157, 167, 177, 187, 197, 207)  # RC1..RC6
 
 # Marker function names that must exist in the embedded macro for the
 # CURRENT orchestrator to drive the workbook correctly. Each is an entry
@@ -852,6 +865,156 @@ def check_input_bounds(wb: openpyxl.Workbook) -> list[PreflightFinding]:
     return findings
 
 
+def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]:
+    """E15: Rate Component source-mode consistency check.
+
+    Caroline's RC audit memory (feedback_revenue_component_audit) documents
+    the failure mode: a project column with an RC sub-block Toggle set to
+    "Custom" but an empty Rate Name effectively zeros out a revenue stream
+    that the corresponding "Generic" row would have produced. The Appraisal
+    GoalSeek then converges to an inflated Dev Fee to make IRR=WACC hold,
+    producing a mathematically valid but economically nonsensical result.
+
+    Concrete: Queen City 2026-05-15 cols H-N (Bair-Jestes) had RC5 Toggle=
+    "Generic" with Rate Name="Merchant Rate" / Generic Rate=5.5% / Escalator=
+    2.5% / Term=35yr — a real revenue stream — and converged to Dev Fees
+    of $1.49-$1.96/W. Cols O-T (Schafer-Wheeler) had RC5 Toggle="Custom"
+    with empty Rate Name and converged to $4.30-$5.34/W Dev Fees. Same
+    deal, same EPC, same IX — the only material input difference was the
+    RC5 sub-block configuration.
+
+    Two flag categories:
+      E15a — Custom-with-empty-name: Toggle="Custom" but Rate Name is None
+             or whitespace. Almost always a misconfiguration (intentional
+             custom rates would have a name). Severity: warning.
+      E15b — Cross-project mismatch: same RC slot has different Toggle
+             values across toggled-on projects in the same workbook. Can
+             be intentional (e.g., one project sourced from a custom
+             tariff schedule) but warrants explicit operator confirmation
+             before solving. Severity: warning.
+
+    Both are warnings, not errors, because the underlying configurations
+    CAN be intentional. Caller decides via --strict-preflight whether to
+    halt on warnings.
+    """
+    findings: list[PreflightFinding] = []
+    if "Project Inputs" not in wb.sheetnames:
+        return findings
+    ws = wb["Project Inputs"]
+
+    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
+    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
+
+    # Collect (rc_idx, col_letter, toggle, rate_name) for every active project
+    # × every RC. Used for both checks below.
+    per_project_rc: list[tuple[int, str, object, object]] = []
+    active_cols: list[int] = []
+    for col in range(start_col, end_col + 1):
+        toggle = ws.cell(row=PI_ROW_TOGGLE, column=col).value
+        if toggle != 1:
+            continue
+        active_cols.append(col)
+        col_letter = ws.cell(row=PI_ROW_DEV_FEE, column=col).coordinate.rstrip("0123456789")
+        for rc_idx, base in enumerate(RC_BLOCK_BASES, start=1):
+            rate_name = ws.cell(row=base + 1, column=col).value
+            rc_toggle = ws.cell(row=base + 2, column=col).value
+            per_project_rc.append((rc_idx, col_letter, rc_toggle, rate_name))
+
+    if not active_cols:
+        return findings  # no projects to check; covered by B9
+
+    # E15a — Custom with empty Rate Name
+    misconfigured: list[tuple[int, str]] = []
+    for rc_idx, col_letter, rc_toggle, rate_name in per_project_rc:
+        if rc_toggle != "Custom":
+            continue
+        if rate_name is None or not str(rate_name).strip():
+            misconfigured.append((rc_idx, col_letter))
+
+    if misconfigured:
+        # Group by RC for a tighter message
+        by_rc: dict[int, list[str]] = {}
+        for rc_idx, col_letter in misconfigured:
+            by_rc.setdefault(rc_idx, []).append(col_letter)
+        details = "; ".join(
+            f"RC{rc_idx} on cols [{', '.join(cols)}]"
+            for rc_idx, cols in sorted(by_rc.items())
+        )
+        findings.append(PreflightFinding(
+            code="E15a",
+            severity="warning",
+            location="Project Inputs Rate Component sub-blocks",
+            message=(
+                f"{len(misconfigured)} RC sub-block(s) have Toggle='Custom' "
+                f"but empty Rate Name: {details}"
+            ),
+            impact=(
+                "A Custom toggle without a Rate Name effectively zeros out "
+                "that revenue stream — the corresponding Custom rate rows in "
+                "the Rate Curves tab are likely empty too. The Appraisal "
+                "GoalSeek will compensate by inflating Dev Fee until IRR=WACC "
+                "still holds, producing an economically nonsensical solution "
+                "(e.g., Queen City 2026-05-15: $4-5/W Dev Fees on the 6 "
+                "projects with RC5 Custom + empty Name). The macro will "
+                "converge — but to the wrong equilibrium."
+            ),
+            remediation=(
+                "For each flagged RC: either (1) flip Toggle to 'Generic' "
+                "and populate the Generic rate row in Project Inputs, or "
+                "(2) keep 'Custom' but populate Rate Name AND the per-project "
+                "rate vector in the Rate Curves tab for that project column. "
+                "Re-run the RC audit (RC1-RC6 active state + term length) "
+                "across equity/debt/appraisal before solving."
+            ),
+            auto_fixable=False,
+        ))
+
+    # E15b — Cross-project toggle mismatch (same RC, different mode across cols)
+    mismatched_rcs: list[tuple[int, dict[str, list[str]]]] = []
+    for rc_idx in range(1, 7):
+        by_toggle: dict[str, list[str]] = {}
+        for r, col_letter, rc_toggle, _ in per_project_rc:
+            if r != rc_idx:
+                continue
+            key = str(rc_toggle) if rc_toggle is not None else "(none)"
+            by_toggle.setdefault(key, []).append(col_letter)
+        if len(by_toggle) > 1:
+            mismatched_rcs.append((rc_idx, by_toggle))
+
+    if mismatched_rcs:
+        lines = []
+        for rc_idx, by_toggle in mismatched_rcs:
+            parts = "; ".join(
+                f"{mode}=[{', '.join(cols)}]"
+                for mode, cols in sorted(by_toggle.items())
+            )
+            lines.append(f"RC{rc_idx}: {parts}")
+        findings.append(PreflightFinding(
+            code="E15b",
+            severity="warning",
+            location="Project Inputs Rate Component sub-blocks",
+            message=(
+                f"{len(mismatched_rcs)} Rate Component(s) have mixed source "
+                f"modes across active projects: " + " | ".join(lines)
+            ),
+            impact=(
+                "Mixed Generic/Custom modes across projects in the same "
+                "workbook CAN be intentional (one project has a bespoke "
+                "tariff, others use the default curve), but the pattern "
+                "frequently signals a half-applied edit. Combined with "
+                "E15a, this is the Queen City 2026-05-15 failure mode."
+            ),
+            remediation=(
+                "Confirm whether the mixed configuration is intentional. "
+                "If not, flip the outlier projects to match the majority "
+                "mode and verify the Rate Curves tab populates correctly."
+            ),
+            auto_fixable=False,
+        ))
+
+    return findings
+
+
 def run_preflight(workbook_path: Path | str) -> PreflightResult:
     """Run the full pre-flight pass against `workbook_path`.
 
@@ -904,6 +1067,7 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
         findings.extend(check_workbook_protection(wb_f))
         findings.extend(check_active_projects(wb_f))
         findings.extend(check_input_bounds(wb_f))
+        findings.extend(check_rate_component_config(wb_f))
     finally:
         wb_f.close()
 

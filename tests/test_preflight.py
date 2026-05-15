@@ -194,6 +194,61 @@ class TestInputBounds:
         assert len(e14) == 1
         assert e14[0].severity == "warning"
 
+    def test_e15a_custom_with_empty_rate_name(self, tmp_path):
+        """E15a fires when RC sub-block Toggle='Custom' but Rate Name is empty.
+
+        Reproduces Queen City 2026-05-15 failure mode where cols O-T had RC5
+        Toggle='Custom' with no Rate Name, producing $4-5/W Dev Fees instead
+        of the expected $1.50-$2.00/W.
+        """
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # RC5 PI sub-block base = 197 → Rate Name=198, Toggle=199
+        ws["H198"] = None         # empty Rate Name
+        ws["H199"] = "Custom"     # Custom toggle
+        wb.save(path)
+
+        result = run_preflight(path)
+        e15a = [f for f in result.findings if f.code == "E15a"]
+        assert len(e15a) == 1, f"expected E15a; got: {[f.code for f in result.findings]}"
+        assert "RC5" in e15a[0].message
+        assert e15a[0].severity == "warning"
+
+    def test_e15b_mixed_modes_across_projects(self, tmp_path):
+        """E15b fires when same RC has different Toggle values across active
+        projects in the same workbook (Queen City pattern: RC5 = Generic on
+        H-N, Custom on O-T)."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Add a second active project at col I with mismatched RC5 toggle.
+        ws["I4"] = "P2"
+        ws["I7"] = 1
+        ws["I32"] = 0.30
+        ws["I38"] = 0.50
+        # RC5: H=Generic with name, I=Custom with name (both populated, just mixed)
+        ws["H198"] = "Merchant Rate"
+        ws["H199"] = "Generic"
+        ws["I198"] = "Custom Tariff"
+        ws["I199"] = "Custom"
+        wb.save(path)
+
+        result = run_preflight(path)
+        e15b = [f for f in result.findings if f.code == "E15b"]
+        assert len(e15b) == 1, f"expected E15b; got: {[f.code for f in result.findings]}"
+        assert "RC5" in e15b[0].message
+
+    def test_e15_clean_workbook(self, tmp_path):
+        """Baseline workbook (no RC sub-blocks populated) doesn't trip E15."""
+        path = _baseline_workbook(tmp_path)
+        result = run_preflight(path)
+        codes = {f.code for f in result.findings}
+        # All RC toggles are None on baseline → not "Custom" → no E15a.
+        # All projects have identical (None) toggle → no E15b.
+        assert "E15a" not in codes
+        assert "E15b" not in codes
+
     def test_inactive_projects_ignored(self, tmp_path):
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
