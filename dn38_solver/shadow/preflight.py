@@ -942,7 +942,7 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
         )
         findings.append(PreflightFinding(
             code="E15a",
-            severity="warning",
+            severity="error",
             location="Project Inputs Rate Component sub-blocks",
             message=(
                 f"{len(misconfigured)} RC sub-block(s) have Toggle='Custom' "

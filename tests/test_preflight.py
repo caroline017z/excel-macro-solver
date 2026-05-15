@@ -213,7 +213,11 @@ class TestInputBounds:
         e15a = [f for f in result.findings if f.code == "E15a"]
         assert len(e15a) == 1, f"expected E15a; got: {[f.code for f in result.findings]}"
         assert "RC5" in e15a[0].message
-        assert e15a[0].severity == "warning"
+        # E15a is severity=error because Queen City 2026-05-15 shipped wrong-
+        # but-valid Dev Fees ($4-5/W vs expected $1.50-$2.00/W) when E15 didn't
+        # exist; the macro converges mathematically, just to nonsensical values.
+        # Operator must explicitly fix the config or override to proceed.
+        assert e15a[0].severity == "error"
 
     def test_e15b_mixed_modes_across_projects(self, tmp_path):
         """E15b fires when same RC has different Toggle values across active
