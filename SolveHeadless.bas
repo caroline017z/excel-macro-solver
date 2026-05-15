@@ -47,7 +47,7 @@ Private Const NPP_MIN           As Double = -0.2
 Private Const NPP_MAX           As Double = 2.0
 Private Const NPP_SEED          As Double = 0.2
 Private Const DEV_FEE_MIN       As Double = 0.05
-Private Const DEV_FEE_MAX       As Double = 2.1
+Private Const DEV_FEE_MAX       As Double = 5.5
 Private Const DEV_FEE_SEED      As Double = 0.2
 
 ' --- Sheet names ---
@@ -1060,13 +1060,13 @@ Public Sub SolveHeadless()
         dPrevEqPct = -999
         iActualIters = 0
 
-        ' Pre-seed if prior project left wild values in this column
-        If rNPP.Value = "" Or rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then
-            rNPP.Value = NPP_SEED
-        End If
-        If rDevFee.Value = "" Or rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then
-            rDevFee.Value = DEV_FEE_SEED
-        End If
+        ' Pre-seed only if cell is blank. Do NOT clamp by bounds — clamping
+        ' legitimate GoalSeek answers prevents Appraisal from converging when
+        ' the deal-side Dev Fee genuinely lies outside [DEV_FEE_MIN, DEV_FEE_MAX].
+        ' Bounds are sanity checks surfaced by preflight E13/E14, not constraints.
+        ' Matches SolveOneProjectByColHL's pattern (lines 747-748).
+        If rNPP.Value = "" Then rNPP.Value = NPP_SEED
+        If rDevFee.Value = "" Then rDevFee.Value = DEV_FEE_SEED
 
         For iIter = 1 To MAX_ITER
             If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then
@@ -1098,11 +1098,9 @@ Public Sub SolveHeadless()
                 If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then Exit For
 
                 bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
-                If rNPP.Value < NPP_MIN Or rNPP.Value > NPP_MAX Then rNPP.Value = NPP_SEED
                 CalcForPhase PHASE_NPP
 
                 bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
-                If rDevFee.Value < DEV_FEE_MIN Or rDevFee.Value > DEV_FEE_MAX Then rDevFee.Value = DEV_FEE_SEED
                 CalcForPhase PHASE_APPR
 
                 dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)

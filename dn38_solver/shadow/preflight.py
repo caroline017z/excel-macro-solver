@@ -120,7 +120,7 @@ APPRAISAL_CASHFLOW_ROWS = (155, 156, 157, 158, 159)
 # values to seed values. If the .bas constants change, update these too —
 # there's no clean import path because the macro is not Python.
 NPP_BOUNDS = (-0.2, 2.0)         # NPP_MIN, NPP_MAX (raised 2026-05-14 for Project Violet's utility-scale pricing range)
-DEV_FEE_BOUNDS = (0.05, 2.1)     # DEV_FEE_MIN, DEV_FEE_MAX (raised 2026-05-14 for Project Violet's utility-scale Dev Fees up to $2.65/W)
+DEV_FEE_BOUNDS = (0.05, 5.5)     # DEV_FEE_MIN, DEV_FEE_MAX (raised 2026-05-15 for MD Queen City portfolio's $4.46–$5.49/W Dev Fees)
 PI_ROW_NPP = 38
 PI_ROW_DEV_FEE = 32
 PI_ROW_TOGGLE = 7
@@ -760,9 +760,11 @@ def check_macro_hash(workbook_path: Path) -> list[PreflightFinding]:
 
 
 def check_input_bounds(wb: openpyxl.Workbook) -> list[PreflightFinding]:
-    """E13/E14: pre-solve Dev Fee / NPP per project must be within the
-    chunked entry point's hardcoded bounds, else the macro resets them
-    to seed at iteration 0 and GoalSeek bisects from a destroyed state.
+    """E13/E14: pre-solve Dev Fee / NPP per project flagged against the
+    macro's hardcoded sanity bounds. The non-chunked SolveHeadless entry
+    point resets out-of-range values to seed at iter 0 AND inside the
+    inner loop; the chunked SolveOneProjectByColHL only seeds blanks.
+    Either path benefits from a heads-up when inputs are unusual.
     """
     findings: list[PreflightFinding] = []
     if "Project Inputs" not in wb.sheetnames:
@@ -803,13 +805,15 @@ def check_input_bounds(wb: openpyxl.Workbook) -> list[PreflightFinding]:
                 f"on {len(out_of_band_dev_fee)} active project(s): {cells}"
             ),
             impact=(
-                "The chunked solve path resets these to DEV_FEE_SEED ($0.20) "
-                "at iteration 0 and after every inner GoalSeek call. Some "
-                "models (e.g. SMP Greenlee) recover and converge anyway; "
-                "others (e.g. IL TEST 2026-05-13) get trapped at the seed "
-                "and the run reports '0 iter / NOT CONVERGED'. Worth "
-                "investigating if convergence fails — but not always a "
-                "blocker on its own."
+                "Behavior depends on entry point. Chunked path "
+                "(SolveOneProjectByColHL, default for --chunked runs) only "
+                "seeds blanks — pre-existing out-of-range values are passed "
+                "through to GoalSeek untouched, so convergence is unaffected. "
+                "Non-chunked path (SolveHeadless) resets to DEV_FEE_SEED "
+                "($0.20) at iter 0 and on every inner GoalSeek if the value "
+                "drifts back out of range — which can trap legitimate "
+                "answers (e.g. IL TEST 2026-05-13: '0 iter / NOT CONVERGED'). "
+                "The bound is a sanity check, not a model constraint."
             ),
             remediation=(
                 "If the run fails to converge, two options: (1) Manually "
