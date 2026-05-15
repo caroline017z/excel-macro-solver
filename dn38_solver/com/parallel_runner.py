@@ -124,11 +124,30 @@ class _WorkerLogTailer(threading.Thread):
                     chunk = fh.read(size - offset)
             except OSError:
                 continue
-            self._offsets[path] = size
-            text = chunk.decode("utf-8", errors="replace")
+            # Decode UTF-8 then strip non-ASCII so the parent's stdout writer
+            # (cp1252 on Windows) can't crash mid-line on a stray Unicode char
+            # that would silence the rest of the worker's output. Replacement
+            # character (U+FFFD) is the specific failure mode from 2026-05-15.
+            text = (
+                chunk.decode("utf-8", errors="replace")
+                .encode("ascii", errors="replace")
+                .decode("ascii")
+            )
+            advanced = False
             for line in text.splitlines():
                 if line.strip():
-                    log.info("  %s", line)
+                    try:
+                        log.info("  %s", line)
+                    except Exception:
+                        # Belt-and-suspenders: even if a logging handler
+                        # somehow still chokes, don't drop the offset advance.
+                        pass
+                advanced = True
+            # Advance offset only AFTER the loop completes — if anything in
+            # the loop raised, we want the next poll to retry the same bytes
+            # rather than skip them silently.
+            if advanced:
+                self._offsets[path] = size
 
     def stop(self, *, join_timeout: float = 5.0) -> None:
         self._stop_evt.set()

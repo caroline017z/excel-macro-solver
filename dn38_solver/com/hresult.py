@@ -182,7 +182,13 @@ def format_decoded(d: DecodedComError) -> str:
     lines.append(f"    Likely:     {d.likely_cause}")
     lines.append(f"    Recovery:   {d.recovery}")
     if d.auto_recoverable:
+        # ASCII-only — this string flows through the worker's stderr (cp1252
+        # by default) and then through the parent's tailer, which decodes as
+        # UTF-8 with errors="replace". An em-dash here becomes U+FFFD on the
+        # round-trip and crashes the parent's stdout writer mid-tail, silencing
+        # ALL subsequent worker output (the 2026-05-15 SMP 50-min hang root
+        # cause). Stick to ASCII in operator-visible strings on this path.
         lines.append(
-            f"    Auto-recovery: ELIGIBLE — orchestrator will attempt re-import + retry once"
+            "    Auto-recovery: ELIGIBLE -- orchestrator will attempt re-import + retry once"
         )
     return "\n".join(lines)

@@ -553,9 +553,19 @@ Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)
     ' loop runs CalculateFull at line 821 before declaring convergence).
     ' Without this, the hard-stamp could pin a stale prior-project IRR
     ' value into this column — invisible until the merged file diverges
-    ' from the worker's reported solved_values. ~3-10s per project in
-    ' the read pass; eliminates the entire stale-stamp race class.
+    ' from the worker's reported solved_values.
+    '
+    ' Lower MaxIterations to 100 around this call. SetGoalSeekPrecisionHL
+    ' raised it to 1000 (GS_MAXITER_COLD) for the solve loop. At 1000
+    ' iterations a CalculateFull on a workbook with circular sticky-IF
+    ' cells in rows 31/37 + #DIV/0 propagation from a partially-populated
+    ' column can spin for minutes per call. Read-pass doesn't need that
+    ' resolution -- 100 iter is plenty for steady-state propagation.
+    Dim lSavedMaxIter As Long
+    lSavedMaxIter = Application.MaxIterations
+    Application.MaxIterations = 100
     Application.CalculateFull
+    Application.MaxIterations = lSavedMaxIter
 
     ' Live IRR / Live Appraisal — read from F-column live cells, not self-
     ' assign (the per-column IF is circular; self-assign returns the

@@ -580,14 +580,20 @@ def run_direct(
             # from what we're about to read in the next loop. Skip on
             # the legacy fallback path that doesn't have the helper.
             #
-            # NEVER suppress this exception. A silent stamp failure
-            # leaves the per-column cell as a circular IF formula that
-            # openpyxl-merge can read as stale or None — exactly the
-            # silent data-corruption mode the post-merge verifier was
-            # built to catch but won't always catch (P1-5 from review).
-            # Surface the failure as a worker-level error so the parent
-            # can decide whether to retry or abort.
-            if has_switch:
+            # SKIP if a macro_error already occurred earlier in the run.
+            # The 2026-05-15 SMP 50-min hang was the read pass calling
+            # StampActiveProjectColumnHL -> Application.CalculateFull on
+            # a workbook whose data state was corrupted by the failed
+            # solve, where the circular sticky-IF cells in rows 31/37
+            # interact with #DIV/0 propagation from the failed project
+            # to spin MaxIterations=1000 iterations per project per call.
+            # If we already know the solve broke, stamping per-project is
+            # meaningless anyway -- the values we'd read are unreliable.
+            #
+            # When stamping IS run, never suppress its exception: a silent
+            # stamp failure leaves the per-column cell as a circular IF
+            # formula that openpyxl-merge reads as stale or None.
+            if has_switch and not macro_error:
                 col_idx = nt.offset + BASE_COL
                 excel.Application.Run(
                     vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
