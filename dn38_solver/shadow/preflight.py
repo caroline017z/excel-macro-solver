@@ -1098,22 +1098,56 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
 
     Pure function. Never mutates the input file. Returns a PreflightResult
     with categorized findings; caller decides how to act on them.
+
+    Load-budget shape (Tranche 6.5 refactor):
+      1x value-pass load (data_only=True, read_only=True) — shared between
+        the cell-level error scan and the C-tier critical-path checks.
+      1x formula-pass load (data_only=False, keep_vba=True) — used by all
+        A/B/E-tier checks that need calc properties, structure, or non-
+        cached formula text.
+      0-1x conditional formula-pass load inside scan_workbook_errors only
+        if the value-pass actually found errors (formula-count denominator
+        for the triage report). The common clean-workbook case pays only
+        the first two loads.
+
+      Before: 3 full loads on clean workbook (scan value-pass + preflight
+      formula-pass + preflight value-pass) = ~6-9 min on a 13MB xlsm.
+      After: 2 loads = ~3-4 min. Doubles up under --auto-import-macro
+      because preflight runs twice; orchestrator skips the redundant second
+      preflight by re-checking only D15/D17 directly (see orchestrator).
     """
     p = Path(workbook_path)
     findings: list[PreflightFinding] = []
 
-    # Cell-level error scan (the existing validation module). Reused as
-    # both a standalone diagnostic and as the input to the C-tier checks.
-    error_scan = scan_workbook_errors(p)
+    # D-tier first (cheap zip-level reads of vbaProject.bin and docProps/
+    # custom.xml) before paying any openpyxl load cost. Catches outdated-
+    # macro workbooks that would also tend to trip downstream checks
+    # confusingly. D17 (hash drift) is the strongest signal; D15 (function
+    # presence) is its fallback for workbooks predating the stamp convention.
+    findings.extend(check_macro_version(p))
+    findings.extend(check_macro_hash(p))
 
-    if error_scan.status == "scan_failed":
-        # Can't open the file. Return a single error finding and bail —
-        # the per-check passes below all need an open workbook.
+    # Open the value-pass workbook ONCE. Shared between scan_workbook_errors
+    # (cell-level error scan) and check_critical_path_errors (C-tier).
+    # Failure to load here is fatal — bail with X0 + scan_failed validation.
+    try:
+        wb_v = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    except Exception as exc:
+        # Match the WorkbookValidation shape scan_workbook_errors would
+        # have returned, so downstream consumers (orchestrator's strict-
+        # validation gate) keep working unchanged.
+        error_scan = WorkbookValidation(
+            status="scan_failed",
+            total_errors=0,
+            total_formulas=0,
+            error_summary={},
+            error=f"Failed to load (values pass): {exc}",
+        )
         findings.append(PreflightFinding(
             code="X0",
             severity="error",
             location="workbook",
-            message=f"unable to open workbook: {error_scan.error}",
+            message=f"unable to open workbook: {exc}",
             impact="Pre-flight cannot proceed.",
             remediation=(
                 "Verify the file exists, is not currently open in another "
@@ -1127,30 +1161,29 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
             error_scan=error_scan,
         )
 
-    # D-tier runs first (cheap zip-level reads of vbaProject.bin and
-    # docProps/custom.xml) before paying the openpyxl load cost. Catches
-    # outdated-macro workbooks that would also tend to trip downstream
-    # checks confusingly. D17 (hash drift) is the strongest signal; D15
-    # (function presence) is its fallback for workbooks predating the
-    # stamp convention.
-    findings.extend(check_macro_version(p))
-    findings.extend(check_macro_hash(p))
-
-    # Two passes: formulas (calc props live here) + cached values (for C-checks)
-    wb_f = openpyxl.load_workbook(str(p), data_only=False, keep_vba=True, read_only=False)
     try:
-        findings.extend(check_calc_properties(wb_f))
-        findings.extend(check_required_sheets(wb_f))
-        findings.extend(check_required_cells(wb_f))
-        findings.extend(check_workbook_protection(wb_f))
-        findings.extend(check_active_projects(wb_f))
-        findings.extend(check_input_bounds(wb_f))
-        findings.extend(check_rate_component_config(wb_f))
-    finally:
-        wb_f.close()
+        # Cell-level error scan — reuses the open value-pass handle.
+        error_scan = scan_workbook_errors(p, wb_vals=wb_v)
 
-    wb_v = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-    try:
+        # Formula-pass load (single open, all formula-shape checks).
+        wb_f = openpyxl.load_workbook(
+            str(p), data_only=False, keep_vba=True, read_only=False,
+        )
+        try:
+            findings.extend(check_calc_properties(wb_f))
+            findings.extend(check_required_sheets(wb_f))
+            findings.extend(check_required_cells(wb_f))
+            findings.extend(check_workbook_protection(wb_f))
+            findings.extend(check_active_projects(wb_f))
+            findings.extend(check_input_bounds(wb_f))
+            findings.extend(check_rate_component_config(wb_f))
+        finally:
+            wb_f.close()
+
+        # C-tier reuses the same value-pass handle. Order matters: scan
+        # iterated every sheet via iter_rows already, but read_only ws.cell
+        # / ws[coord] access re-streams from the part on demand, so the
+        # specific-cell lookups here work after the full scan.
         findings.extend(check_critical_path_errors(wb_v, error_scan))
     finally:
         wb_v.close()

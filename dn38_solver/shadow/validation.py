@@ -56,7 +56,11 @@ class WorkbookValidation(msgspec.Struct, frozen=True, kw_only=True):
         return self.status == "success"
 
 
-def scan_workbook_errors(path: Path | str) -> WorkbookValidation:
+def scan_workbook_errors(
+    path: Path | str,
+    *,
+    wb_vals: openpyxl.Workbook | None = None,
+) -> WorkbookValidation:
     """Scan a workbook for cached Excel error tokens.
 
     Two passes over the file:
@@ -65,6 +69,13 @@ def scan_workbook_errors(path: Path | str) -> WorkbookValidation:
 
     Returns a WorkbookValidation. Never raises on per-cell decode issues;
     a top-level load failure produces status="scan_failed" with error msg.
+
+    `wb_vals` is an optional pre-loaded value-pass workbook handle. When
+    provided, this function skips its own openpyxl.load_workbook() call and
+    iterates the caller's handle instead — used by run_preflight to share
+    one workbook load across scan_workbook_errors + check_critical_path_-
+    errors (~3-5 min saved on a 13MB pricing model). Caller owns the
+    handle's lifecycle; this function never closes a handle it didn't open.
     """
     p = Path(path)
     if not p.exists():
@@ -80,16 +91,19 @@ def scan_workbook_errors(path: Path | str) -> WorkbookValidation:
     error_counts: dict[str, int] = {tok: 0 for tok in EXCEL_ERROR_TOKENS}
     total_errors = 0
 
-    try:
-        wb_vals = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-    except Exception as exc:
-        return WorkbookValidation(
-            status="scan_failed",
-            total_errors=0,
-            total_formulas=0,
-            error_summary={},
-            error=f"Failed to load (values pass): {exc}",
-        )
+    close_vals = False
+    if wb_vals is None:
+        try:
+            wb_vals = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+            close_vals = True
+        except Exception as exc:
+            return WorkbookValidation(
+                status="scan_failed",
+                total_errors=0,
+                total_formulas=0,
+                error_summary={},
+                error=f"Failed to load (values pass): {exc}",
+            )
 
     try:
         for sheet_name in wb_vals.sheetnames:
@@ -109,7 +123,8 @@ def scan_workbook_errors(path: Path | str) -> WorkbookValidation:
                             total_errors += 1
                             break
     finally:
-        wb_vals.close()
+        if close_vals:
+            wb_vals.close()
 
     # Formula count — only run when errors were found, since it's an
     # expensive second openpyxl pass (3-5 min on a 13MB xlsm) used only

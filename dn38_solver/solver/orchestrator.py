@@ -28,6 +28,8 @@ from dn38_solver.convert import safe_float
 from dn38_solver.shadow.reader import WorkbookReader
 from dn38_solver.shadow.preflight import (
     apply_auto_fixes,
+    check_macro_hash,
+    check_macro_version,
     format_preflight_report,
     run_preflight,
 )
@@ -211,8 +213,30 @@ def solve_all(
                 workbook_path.name,
             )
             reimport_macro_subprocess(workbook_path)
-            log.info("  Auto-import-macro: re-running pre-flight against updated workbook...")
-            preflight = run_preflight(workbook_path)
+            # Macro re-import only mutates xl/vbaProject.bin and docProps/
+            # custom.xml (the D15 function-presence target and the D17 hash
+            # stamp). Every other pre-flight finding (A/B/C/E tiers) is
+            # invariant under this mutation — the calcPr block, sheet
+            # structure, cell values, RC config, etc. cannot have changed.
+            # Re-running the full preflight here would burn another ~3-4
+            # min of openpyxl loading for guaranteed-identical results.
+            # Instead, re-check ONLY the D-tier (cheap zip-level reads,
+            # ~10ms) and filter the stale D-codes out of the existing
+            # preflight result. Same pattern Tranche 4 used for auto-fix's
+            # A1 re-check.
+            log.info("  Auto-import-macro: re-checking D15/D17 against updated workbook...")
+            new_d_findings: list = []
+            new_d_findings.extend(check_macro_version(workbook_path))
+            new_d_findings.extend(check_macro_hash(workbook_path))
+            d_tier_codes = {"D15", "D16", "D17"}
+            filtered = tuple(
+                f for f in preflight.findings if f.code not in d_tier_codes
+            )
+            preflight = type(preflight)(
+                workbook_path=preflight.workbook_path,
+                findings=filtered + tuple(new_d_findings),
+                error_scan=preflight.error_scan,
+            )
             log.info("\n%s", format_preflight_report(preflight))
         except AutoRecoveryUnavailable as ar_exc:
             log.error("  Auto-import-macro FAILED: %s", ar_exc)
