@@ -724,9 +724,9 @@ def run_parallel(
                     )
                     if mismatches:
                         log.error(
-                            "  ✗ POST-MERGE VERIFICATION FAILED: "
+                            "  [FAIL] POST-MERGE VERIFICATION FAILED: "
                             "%d cell mismatch(es) between merged file and "
-                            "worker reports. DO NOT SHIP %s — use the "
+                            "worker reports. DO NOT SHIP %s -- use the "
                             "per-worker outputs in %s instead.",
                             len(mismatches), saved_to, parent_tmp,
                         )
@@ -736,11 +736,11 @@ def run_parallel(
                             log.error("    ... (%d more)", len(mismatches) - 10)
                         worker_errors.append(
                             f"merged file failed sanity gate "
-                            f"({len(mismatches)} cell mismatch(es)) — "
+                            f"({len(mismatches)} cell mismatch(es)) -- "
                             f"per-worker outputs in {parent_tmp} are authoritative"
                         )
                     else:
-                        log.info("  ✓ Post-merge verification: OK")
+                        log.info("  [OK] Post-merge verification passed")
         elif save_solved:
             # No worker produced a saved, converged output — nothing to merge.
             # Surface this clearly so the orchestrator marks the run as error
