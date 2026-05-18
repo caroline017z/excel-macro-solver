@@ -721,6 +721,19 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     dSolveStart = Timer
     WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName & "|col=" & colIdx
 
+    ' Defensive initialization of lOriginalHoldCo BEFORE the early-skip
+    ' block below. If any line between here and the real HoldCo read
+    ' (further down) raises, ProjErr fires with lOriginalHoldCo
+    ' uninitialized — VBA Long defaults to 0, which is invalid HoldCo
+    ' state and would write through to PT_HOLDCO_ONOFF on the error-
+    ' restore path. Default to 1 (HoldCo ON, the post-solve steady
+    ' state in every documented TE structure). The "real" HoldCo read
+    ' further down overwrites this when reached; if the function exits
+    ' via early-skip, no restore happens anyway because no mutation
+    ' was attempted.
+    Dim lOriginalHoldCo As Long
+    lOriginalHoldCo = 1
+
     ' Pre-flight skip BEFORE the expensive F2 write + CalcForPhase PHASE_FULL
     ' below. The Tranche 7.1 fix moved the same checks here from after the
     ' recalc, but those late checks still paid the full pre-loop calc cost
@@ -803,7 +816,10 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' only used for restore-on-error and HoldCo=1 is the post-solve
     ' steady state in every documented TE structure. (2026-05-18 SMP
     ' post-mortem.)
-    Dim lOriginalHoldCo As Long
+    ' lOriginalHoldCo was defensively initialized to 1 at function entry
+    ' (Tranche 7.7); reassign here from the live cell when we reach this
+    ' point (post-skip, F2 is about to be written and the real
+    ' restore-on-error path is meaningful).
     Dim vHoldCoRaw As Variant
     vHoldCoRaw = wsPT.Range(PT_HOLDCO_ONOFF).Value
     If IsNumeric(vHoldCoRaw) Then

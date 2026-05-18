@@ -16,7 +16,13 @@ import msgspec
 # validates Literal values at decode time, so a SQLite row with a stale
 # tier string surfaces immediately rather than slipping through to the
 # rollup as a silently-mis-categorized row.
-ConvergenceTier = Literal["strict", "relaxed", "none", "not_attempted"]
+#
+# "skipped" was added in Tranche 7.6 for placeholder columns that the
+# VBA fast-skip bypasses (RC1 Generic + Rate=0, or MWdc=0). Distinct
+# from "not_attempted" (which means a worker crashed before reaching the
+# project) — skipped projects were *deliberately* bypassed pre-solve
+# and should not count against batch-level convergence rollup.
+ConvergenceTier = Literal["strict", "relaxed", "none", "not_attempted", "skipped"]
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +81,7 @@ class SolveStatus(str, enum.Enum):
     """Solve outcome — str enum for JSON serialization."""
     CONVERGED = "converged"
     NOT_CONVERGED = "not_converged"
+    SKIPPED = "skipped"           # Tranche 7.6: placeholder fast-skip path
     ERROR = "error"
     TIMEOUT = "timeout"
     DRY_RUN = "dry_run"
@@ -162,6 +169,8 @@ def convergence_label(p: ProjectResult) -> str:
         return "OK"
     if p.convergence_tier == "relaxed":
         return "OK*"
+    if p.convergence_tier == "skipped":
+        return "SKIP*"  # asterisk distinguishes deliberate skip from worker crash
     if p.convergence_tier == "not_attempted":
         return "SKIP"
     return "CHECK"

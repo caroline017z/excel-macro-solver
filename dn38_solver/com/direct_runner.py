@@ -141,6 +141,64 @@ def _capture_excel_proc(excel=None):
     return None
 
 
+def _call_with_timeout(
+    fn,
+    *,
+    timeout_sec: int,
+    excel_proc=None,
+    label: str = "COM-call",
+):
+    """Generic Win32-COM call watchdog. Same kill-escalation semantics
+    as `_run_macro_with_timeout` but for callables that aren't
+    `Application.Run` (e.g., `excel.CalculateFull`, `wb.Save`).
+
+    The watchdog escalates exactly like `_run_macro_with_timeout`:
+    psutil.kill, 3s poll, taskkill /F. Without a process handle the
+    timeout still raises but Excel won't be force-killed.
+    """
+    import threading
+    done = threading.Event()
+
+    def watchdog():
+        if not done.wait(timeout=timeout_sec):
+            log.error(
+                "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
+                label, timeout_sec,
+            )
+            if excel_proc is None:
+                return
+            try:
+                excel_proc.kill()
+            except Exception as kill_exc:
+                log.warning("  Excel psutil.kill failed: %s", kill_exc)
+            confirmed_dead = False
+            for _ in range(30):
+                try:
+                    if not excel_proc.is_running():
+                        confirmed_dead = True
+                        break
+                except Exception:
+                    break
+                time.sleep(0.1)
+            if confirmed_dead:
+                return
+            try:
+                import subprocess
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(excel_proc.pid)],
+                    capture_output=True, timeout=5, check=False,
+                )
+            except Exception as tk_exc:
+                log.error("  taskkill escalation failed: %s", tk_exc)
+
+    t = threading.Thread(target=watchdog, daemon=True, name=f"COM-WD-{label}")
+    t.start()
+    try:
+        return fn()
+    finally:
+        done.set()
+
+
 def _run_macro_with_timeout(
     excel: object,
     call_args: tuple,
@@ -543,6 +601,20 @@ def run_direct(
 
         warmup_time = 0.0
 
+        # Capture the Excel process handle as soon as the workbook is
+        # open. Moved here from after status.update (pre-Tranche 7.7) so
+        # the setup-call timeouts below (SET_SKIP_OUTPUT_RECALC) can
+        # benefit from the watchdog kill path too. None if psutil
+        # unavailable or both Hwnd-lookup and child-scan failed.
+        excel_proc = _capture_excel_proc(excel)
+        if excel_proc is None:
+            log.warning(
+                "  _capture_excel_proc returned None — per-call watchdog "
+                "will time out but cannot kill Excel. Hangs will leak."
+            )
+        else:
+            log.debug("  Captured Excel pid=%s for watchdog", excel_proc.pid)
+
         # Propagate the skip-output-recalc flag to VBA before either macro
         # path runs. Both single-shot SolveHeadless and chunked Finalize
         # funnel through CalcOutputSheetsHL, which checks mSkipOutputRecalc
@@ -550,9 +622,12 @@ def run_direct(
         # the call (the macro defaults to recalc, preserving prior behavior).
         if skip_output_recalc:
             try:
-                excel.Application.Run(
-                    vba_call_str(wb.Name, SET_SKIP_OUTPUT_RECALC),
-                    True,
+                _run_macro_with_timeout(
+                    excel,
+                    (vba_call_str(wb.Name, SET_SKIP_OUTPUT_RECALC), True),
+                    timeout_sec=120,  # setter is trivial; 2 min is generous
+                    excel_proc=excel_proc,
+                    label="SetSkipOutputRecalc",
                 )
                 log.info("  Output-sheet recalc disabled for this run")
             except Exception as set_exc:
@@ -576,20 +651,6 @@ def run_direct(
             macro_used="SolveHeadless",
             chunked=use_chunked,
         )
-
-        # Capture the Excel process handle now so the per-call timeout
-        # watchdog can hard-kill it on hang. None if psutil unavailable
-        # or both Hwnd-lookup and child-scan failed — watchdog still
-        # fires but can't enforce the kill (the timeout still raises,
-        # just leaves an orphan Excel for the reaper).
-        excel_proc = _capture_excel_proc(excel)
-        if excel_proc is None:
-            log.warning(
-                "  _capture_excel_proc returned None — per-call watchdog "
-                "will time out but cannot kill Excel. Hangs will leak."
-            )
-        else:
-            log.debug("  Captured Excel pid=%s for watchdog", excel_proc.pid)
 
         t0 = time.time()
         if use_chunked:
@@ -688,9 +749,12 @@ def run_direct(
                 )
                 if skip_output_recalc:
                     with contextlib.suppress(Exception):
-                        excel.Application.Run(
-                            vba_call_str(wb.Name, SET_SKIP_OUTPUT_RECALC),
-                            True,
+                        _run_macro_with_timeout(
+                            excel,
+                            (vba_call_str(wb.Name, SET_SKIP_OUTPUT_RECALC), True),
+                            timeout_sec=120,
+                            excel_proc=excel_proc,
+                            label="SetSkipOutputRecalc[recovery]",
                         )
 
             def _retry() -> None:
@@ -855,8 +919,19 @@ def run_direct(
                 _set_f2(wb, nt.idx_cell, nt.offset)
 
             if not switched_with_recalc:
+                # Bare CalculateFull() could hang 5-15 min on a workbook
+                # whose iterative calc was left in a non-converging state
+                # by the failed switch. Wrap in a short watchdog so the
+                # read-pass for a single project can't burn the wall
+                # clock — 60s is generous for a recalc that normally
+                # completes in 1-3s on this workbook size.
                 with contextlib.suppress(Exception):
-                    excel.CalculateFull()
+                    _call_with_timeout(
+                        excel.CalculateFull,
+                        timeout_sec=60,
+                        excel_proc=excel_proc,
+                        label=f"CalculateFull[fallback-recalc:{nt.name}]",
+                    )
 
             # Stamp the active project's per-column convergence cells
             # NOW, while F2 is pinned to this project and the workbook
@@ -957,12 +1032,22 @@ def run_direct(
         read_time = time.time() - t0
         log.debug("  Read %d project(s) in %.1fs", len(tasks), read_time)
 
-        # Restore original F2
+        # Restore original F2. Watchdog-wrapped: this is cleanup, but a
+        # silent hang here delays workbook close and the SaveAs that
+        # produces _SOLVED.xlsm. Pre-Tranche 7.7 the suppress() let a
+        # hang here add unbounded time to post-solve. 60s cap is
+        # generous — the call just resets F2 and recalcs.
         if norm_tasks and has_switch:
             with contextlib.suppress(Exception):
-                excel.Application.Run(
-                    vba_call_str(wb.Name, SWITCH_PROJECT_AND_RECALC),
-                    int(original_f2),
+                _run_macro_with_timeout(
+                    excel,
+                    (
+                        vba_call_str(wb.Name, SWITCH_PROJECT_AND_RECALC),
+                        int(original_f2),
+                    ),
+                    timeout_sec=60,
+                    excel_proc=excel_proc,
+                    label="SwitchProjectAndRecalc[restore-F2]",
                 )
 
         # Save solved workbook (opt-out via save_solved=False for fast
@@ -1180,7 +1265,21 @@ def _run_chunked(
     # we want the already-converged rows preserved.
     if start_idx == 0:
         try:
-            excel.Application.Run(vba_call_str(wb.Name, INIT_SOLVE_ENV))
+            # InitSolveEnvHL fires once at portfolio start to reset the
+            # __SolverResults sheet and prime calc tier state. If a prior
+            # run corrupted __SolverResults (e.g., partial write during a
+            # crash), Init can spin on the sheet teardown. Watchdog with
+            # the same per-call timeout as per-project solves prevents a
+            # silent 50-min hang at portfolio start — pre-Tranche 7.7
+            # this was the lone Application.Run on the chunked path that
+            # bypassed the watchdog.
+            _run_macro_with_timeout(
+                excel,
+                (vba_call_str(wb.Name, INIT_SOLVE_ENV),),
+                timeout_sec=per_call_timeout_sec,
+                excel_proc=excel_proc,
+                label="InitSolveEnvHL",
+            )
         except Exception as e:
             return macro_used, has_switch, f"InitSolveEnvHL failed: {e}", None
 

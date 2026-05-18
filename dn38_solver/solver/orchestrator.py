@@ -85,13 +85,21 @@ def _parse_project_result(
     # ConvergenceTier Literal validates at struct-construction time, so
     # pre-validate here against the same set rather than letting msgspec
     # raise inside ProjectResult().
-    _VALID_TIERS = {"strict", "relaxed", "none", "not_attempted"}
-    if raw.get("status") == "not_attempted":
+    _VALID_TIERS = {"strict", "relaxed", "none", "not_attempted", "skipped"}
+    raw_status = raw.get("status")
+    if raw_status == "not_attempted":
         # Worker crashed before reaching this project. Distinguish from
         # genuine non-convergence so the end-of-run rollup doesn't
         # overstate the failure rate (and so the speedup math can
         # exclude these from the wall-time-vs-sequential comparison).
         tier = "not_attempted"
+    elif raw_status == "skipped":
+        # Tranche 7.6: VBA fast-skip path bypassed this project pre-solve
+        # (placeholder column with no RC1 revenue, or MWdc=0). Distinct
+        # from not_attempted (which is a worker crash) — operator chose
+        # to leave these in the workbook but they have no real economics.
+        # Should not count against batch-level convergence rollup.
+        tier = "skipped"
     elif isinstance(tier_raw, str) and tier_raw in _VALID_TIERS:
         tier = tier_raw
     else:
@@ -624,8 +632,17 @@ def solve_all(
         # per-project ProjectResult.converged field stays strict-only --
         # downstream consumers reading individual records get the unchanged
         # strict semantics. Only the rolled-up run status is affected here.
+        #
+        # Tranche 7.6: skipped projects (VBA fast-skip for placeholders)
+        # are treated as run-level OK. A workbook with 5 real + 10
+        # placeholders should report run status = CONVERGED if all 5
+        # reals converged, not NOT_CONVERGED because the operator left
+        # placeholders in the column list. The operator already sees
+        # SKIP* labels in the per-project table.
         def _ok_at_run_level(pr: ProjectResult) -> bool:
             if pr.converged:
+                return True
+            if pr.convergence_tier == "skipped":
                 return True
             return allow_relaxed and pr.convergence_tier == "relaxed"
 

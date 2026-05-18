@@ -210,7 +210,17 @@ def verify_merged_file(
                 # false-positive "mismatches" per SMP run id=18.
                 meta = pr.get("meta") or {}
                 mode = meta.get("mode")
-                if isinstance(mode, str) and mode.startswith("skipped:"):
+                if isinstance(mode, str) and (
+                    mode.startswith("skipped:") or mode.startswith("stamp_skipped:")
+                ):
+                    # stamp_skipped:<context> is written by VBA's
+                    # HardStampNumericHL guard when a per-cell stamp
+                    # fails mid-project. The project's hard-stamped row
+                    # state is partial; verifying it against the worker
+                    # report would flag whichever cells the stamp
+                    # missed. Tranche 7.5 added the skipped:* check;
+                    # this completes the defense for the stamp-failure
+                    # branch (Agent A review #3).
                     continue
                 sv = pr.get("solved_values", {})
                 col_idx = column_index_from_string(task.project_col_letter)
