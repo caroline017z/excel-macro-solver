@@ -58,26 +58,75 @@ import os as _os
 DEFAULT_PER_CALL_TIMEOUT_SEC = int(_os.environ.get("DN38_PER_CALL_TIMEOUT_SEC", "600"))
 
 
-def _capture_excel_proc():
-    """Find the EXCEL.EXE child of the current Python process. Called once
-    after DispatchEx so the watchdog can hard-kill Excel by handle (not by
-    PID — psutil.Process is PID-reuse-safe via create_time pinning).
+def _capture_excel_proc(excel=None):
+    """Find the EXCEL.EXE process backing this COM session.
 
-    Returns a psutil.Process or None if psutil missing / no child found.
-    The watchdog falls back to a no-op kill if this returns None — the
-    timeout still raises, just without forcing Excel to disconnect.
+    Two-tier lookup:
+
+    1. **Hwnd path (preferred)** — query ``excel.Application.Hwnd`` and
+       resolve the owning PID via ``GetWindowThreadProcessId``. COM
+       activation typically spawns ``EXCEL.EXE /automation -Embedding``
+       detached from the caller (parent is svchost / DCOMLAUNCH), so the
+       child-process scan below returns ``None`` on most configurations.
+       The window handle is the only reliable bridge from the Dispatch
+       handle to a PID we can kill.
+
+    2. **Child-process scan (fallback)** — preserved for builds where
+       Hwnd is 0 (Excel still warming up) or psutil can't see the PID.
+
+    Returns a ``psutil.Process`` or ``None``. The watchdog falls back to
+    a no-op kill if this returns ``None`` — the timeout still raises,
+    just without forcing Excel to disconnect.
+
+    2026-05-18 SMP run id=17 post-mortem: the child-scan-only version
+    returned ``None`` on parallel workers because their Excel instances
+    were COM-activated, not subprocess-spawned. The 600s per-call
+    watchdog fired but had no kill handle, leaving Excel spinning 28+
+    minutes on a single placeholder project.
     """
     try:
         import psutil  # type: ignore
     except ImportError:
         return None
+
+    # Tier 1: Hwnd → PID via Win32. Allow up to 3s for the Excel window
+    # handle to appear after Dispatch (some configurations create it
+    # lazily on the first property access).
+    if excel is not None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            for _ in range(30):
+                try:
+                    hwnd = int(excel.Application.Hwnd)
+                except Exception:
+                    hwnd = 0
+                if hwnd:
+                    pid = wintypes.DWORD(0)
+                    user32.GetWindowThreadProcessId(
+                        wintypes.HWND(hwnd), ctypes.byref(pid)
+                    )
+                    if pid.value > 0:
+                        try:
+                            proc = psutil.Process(pid.value)
+                            if proc.name().lower() == "excel.exe":
+                                return proc
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    break  # got Hwnd but PID lookup failed — don't keep polling
+                time.sleep(0.1)
+        except Exception:
+            pass  # fall through to legacy child-scan
+
+    # Tier 2: legacy child-process scan. DispatchEx returns before
+    # Excel's child PID is necessarily registered as a descendant of
+    # the caller; allow up to 3s for the relationship to materialize.
+    # Worker startup is already 5-10s so this is in-noise.
     try:
         me = psutil.Process(_os.getpid())
     except Exception:
         return None
-    # DispatchEx returns before Excel's child PID is necessarily registered
-    # as a descendant of the caller; allow up to 3s for the relationship
-    # to materialize. Worker startup is already 5-10s so this is in-noise.
     for _ in range(30):
         try:
             for child in me.children(recursive=False):
@@ -125,11 +174,43 @@ def _run_macro_with_timeout(
                 "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
                 label, timeout_sec,
             )
-            if excel_proc is not None:
+            if excel_proc is None:
+                log.error(
+                    "  %s: no Excel proc handle captured -- watchdog cannot "
+                    "force COM to disconnect. Application.Run may hang "
+                    "indefinitely. Restart the worker to recover.",
+                    label,
+                )
+                return
+            # Tier 1: psutil kill (TerminateProcess via Win32).
+            try:
+                excel_proc.kill()
+            except Exception as kill_exc:
+                log.warning("  Excel psutil.kill failed: %s", kill_exc)
+            # Tier 2: confirm the kill landed; if Excel is still alive
+            # after 3s, escalate to a subprocess taskkill /F. psutil.kill
+            # has been observed to silently fail on Excel instances that
+            # are deep in a COM RPC call — taskkill via the OS scheduler
+            # gets a kill ticket that bypasses the COM busy state.
+            for _ in range(30):
                 try:
-                    excel_proc.kill()
-                except Exception as kill_exc:
-                    log.warning("  Excel kill failed: %s", kill_exc)
+                    if not excel_proc.is_running():
+                        return
+                except Exception:
+                    return  # process gone or unreadable — assume dead
+                time.sleep(0.1)
+            log.warning(
+                "  Excel pid=%s still alive after psutil.kill -- escalating "
+                "to taskkill /F", getattr(excel_proc, "pid", "?"),
+            )
+            try:
+                import subprocess
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(excel_proc.pid)],
+                    capture_output=True, timeout=5, check=False,
+                )
+            except Exception as tk_exc:
+                log.error("  taskkill escalation failed: %s", tk_exc)
 
     t = threading.Thread(target=watchdog, daemon=True, name=f"COM-WD-{label}")
     t.start()
@@ -486,10 +567,18 @@ def run_direct(
         )
 
         # Capture the Excel process handle now so the per-call timeout
-        # watchdog can hard-kill it on hang. None if psutil unavailable —
-        # watchdog still fires but can't enforce the kill (the timeout
-        # still raises, just leaves an orphan Excel for the reaper).
-        excel_proc = _capture_excel_proc()
+        # watchdog can hard-kill it on hang. None if psutil unavailable
+        # or both Hwnd-lookup and child-scan failed — watchdog still
+        # fires but can't enforce the kill (the timeout still raises,
+        # just leaves an orphan Excel for the reaper).
+        excel_proc = _capture_excel_proc(excel)
+        if excel_proc is None:
+            log.warning(
+                "  _capture_excel_proc returned None — per-call watchdog "
+                "will time out but cannot kill Excel. Hangs will leak."
+            )
+        else:
+            log.debug("  Captured Excel pid=%s for watchdog", excel_proc.pid)
 
         t0 = time.time()
         if use_chunked:
