@@ -212,6 +212,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--auto-import-macro",
+        action="store_true",
+        help=(
+            "If pre-flight surfaces D15 (missing macro functions) or D17 "
+            "(macro hash drift between repo .bas and workbook stamp), "
+            "automatically re-import SolveHeadless.bas into the source "
+            "workbook via Excel COM SaveAs (a destructive mutation — "
+            "writes vbaProject.bin and the DN38_BAS_SHA256 stamp on the "
+            "original file). Closes the UX gap where the operator would "
+            "otherwise need to shell out to import_vba_module.py manually. "
+            "Off by default — bank-grade default never mutates the input "
+            "without explicit consent."
+        ),
+    )
+    parser.add_argument(
         "--chunked",
         action="store_true",
         help=(
@@ -365,6 +380,7 @@ def main() -> None:
         strict_validation=args.strict_validation,
         strict_preflight=args.strict_preflight,
         auto_fix=args.auto_fix,
+        auto_import_macro=args.auto_import_macro,
         use_chunked=use_chunked,
         allow_relaxed=args.allow_relaxed,
         save_solved=args.save_solved,

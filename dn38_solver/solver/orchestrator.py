@@ -126,6 +126,7 @@ def solve_all(
     strict_validation: bool = False,
     strict_preflight: bool = False,
     auto_fix: bool = False,
+    auto_import_macro: bool = False,
     use_chunked: bool = False,
     allow_relaxed: bool = False,
     save_solved: bool = True,
@@ -184,6 +185,51 @@ def solve_all(
     log.info("[Phase 0] Pre-flight checks...")
     preflight = run_preflight(workbook_path)
     log.info("\n%s", format_preflight_report(preflight))
+
+    # Phase 0.5 — Auto-import macro (D15/D17 remediation).
+    # If pre-flight surfaces D15 (missing required Public Subs in the
+    # embedded macro) or D17 (hash drift between repo .bas and workbook
+    # stamp), AND the operator passed --auto-import-macro, run the macro
+    # import via Excel COM SaveAs subprocess and re-run preflight. This
+    # closes the UX gap where today's operator has to manually shell out
+    # to `python import_vba_module.py "<workbook>"` before every run on
+    # a stale workbook. Reactive recovery (post-COM-failure re-import)
+    # still works as a backstop for runtime drift.
+    macro_import_codes = {"D15", "D17"}
+    needs_macro_import = any(
+        f.code in macro_import_codes for f in preflight.findings
+    )
+    if auto_import_macro and needs_macro_import:
+        try:
+            from dn38_solver.com.auto_recovery import (
+                AutoRecoveryUnavailable,
+                reimport_macro_subprocess,
+            )
+            log.info(
+                "  Auto-import-macro: re-importing macro into %s "
+                "(D15/D17 fired in pre-flight)...",
+                workbook_path.name,
+            )
+            reimport_macro_subprocess(workbook_path)
+            log.info("  Auto-import-macro: re-running pre-flight against updated workbook...")
+            preflight = run_preflight(workbook_path)
+            log.info("\n%s", format_preflight_report(preflight))
+        except AutoRecoveryUnavailable as ar_exc:
+            log.error("  Auto-import-macro FAILED: %s", ar_exc)
+            return RunRecord(
+                workbook_name=workbook_path.name,
+                run_timestamp=now_iso(),
+                batch_id=batch_id,
+                solver_mode="hybrid_shadow",
+                projects=(),
+                total_duration_sec=time.time() - start,
+                status=SolveStatus.ERROR.value,
+                error=(
+                    f"Auto-import-macro failed: {ar_exc}. Close the workbook "
+                    "if open in Excel, verify Trust Center 'Trust access to "
+                    "the VBA project object model' is enabled, and retry."
+                ),
+            )
 
     # Auto-fix path: write _FIXED.xlsm and resume against it.
     # Preserves the original file path in the run record so the audit

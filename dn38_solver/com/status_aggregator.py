@@ -190,6 +190,7 @@ class StatusAggregator(threading.Thread):
         workbook_path: str,
         poll_interval: float = 1.0,
         expected_worker_count: int | None = None,
+        stall_threshold_sec: float = 600.0,
     ) -> None:
         super().__init__(daemon=True, name="StatusAggregator")
         self._paths = list(worker_status_paths)
@@ -206,6 +207,17 @@ class StatusAggregator(threading.Thread):
             else len(worker_status_paths)
         )
         self._stop_evt = threading.Event()
+        # Stall detection. Track each worker's last-observed elapsed_sec
+        # and the wall-clock time at which it last advanced. If it sits
+        # unchanged for STALL_THRESHOLD_SEC the aggregator logs a WARNING
+        # — this is the operator-visible signal that a worker is hung
+        # (Application.Run not returning, Excel grinding silently). The
+        # COM-side watchdog in direct_runner will kill Excel at
+        # DEFAULT_PER_CALL_TIMEOUT_SEC (600s), but if that mechanism is
+        # also broken, the stall detector here is the backstop.
+        self._last_elapsed: dict[int, tuple[float, float]] = {}  # wid -> (elapsed, wall_t)
+        self._stall_warned: set[int] = set()
+        self._stall_threshold_sec = float(stall_threshold_sec)
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
@@ -224,6 +236,40 @@ class StatusAggregator(threading.Thread):
                 # Worker hasn't written its first status yet, or is mid-write
                 # (the worker's _StatusWriter uses atomic-swap so this is rare)
                 continue
+
+        # Stall check — per-worker, per-poll. Compare each worker's current
+        # elapsed_sec against its last observation; if unchanged and the
+        # gap since last advance exceeds the threshold, emit one WARNING
+        # (deduped via _stall_warned) so the operator gets a clear signal
+        # the worker is hung rather than legitimately slow.
+        now_wall = time.time()
+        for p in payloads:
+            wid = p.get("worker_id")
+            phase = p.get("phase", "")
+            elapsed = float(p.get("elapsed_sec", 0) or 0)
+            if wid is None or phase not in ("solving", "reading"):
+                continue
+            prev = self._last_elapsed.get(wid)
+            if prev is None or elapsed > prev[0] + 0.001:
+                # advanced (or first observation) — reset stall tracker
+                self._last_elapsed[wid] = (elapsed, now_wall)
+                self._stall_warned.discard(wid)
+            else:
+                stalled_for = now_wall - prev[1]
+                if (
+                    stalled_for >= self._stall_threshold_sec
+                    and wid not in self._stall_warned
+                ):
+                    log.warning(
+                        "  Worker %d STALL detected: elapsed_sec stuck at "
+                        "%.1fs for %.0fs (project=%s, phase=%s). Excel may "
+                        "be hung; per-call watchdog should fire at %ds.",
+                        wid, elapsed, stalled_for,
+                        (p.get("current_project") or "?"), phase,
+                        600,  # DEFAULT_PER_CALL_TIMEOUT_SEC in direct_runner
+                    )
+                    self._stall_warned.add(wid)
+
         agg = _aggregate(
             payloads, self._wb_path,
             expected_worker_count=self._expected_workers,
