@@ -719,7 +719,72 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
 
     Dim dSolveStart As Double
     dSolveStart = Timer
-    WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName
+    WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName & "|col=" & colIdx
+
+    ' Pre-flight skip BEFORE the expensive F2 write + CalcForPhase PHASE_FULL
+    ' below. The Tranche 7.1 fix moved the same checks here from after the
+    ' recalc, but those late checks still paid the full pre-loop calc cost
+    ' (5-30 min per placeholder on a 13MB workbook with iterative calc).
+    '
+    ' 2026-05-18 SMP run id=17 post-mortem: Worker 1 skipped its 5
+    ' placeholders fast (iterative calc happened to settle quickly on its
+    ' first hit); Worker 0 stalled 28+ min on Project 8 — iterative calc
+    ' on the first placeholder it encountered (after 3 real solves left
+    ' state in a non-converging configuration) burned the full per-call
+    ' watchdog window. Asymmetric failure between identical workers on
+    ' byte-identical inputs proved the late placement was unsafe.
+    '
+    ' The skip metadata reads come from literal-input cells: row 11
+    ' (MWdc), row 159 (RC1 toggle), row 160 (RC1 Generic rate at COD).
+    ' These are populated directly by the operator / portfolio mapper —
+    ' never formulas — so reading them by direct column index before any
+    ' recalc is safe and deterministic.
+    Dim dEarlyMWdc As Double
+    dEarlyMWdc = 0
+    On Error Resume Next
+    dEarlyMWdc = CDbl(wsPI.Cells(11, colIdx).Value)
+    On Error GoTo ProjErr
+    If dEarlyMWdc <= 0 Then
+        wsRes.Cells(resultsRow, 1).Value = projOffset
+        wsRes.Cells(resultsRow, 2).Value = projName
+        wsRes.Cells(resultsRow, 9).Value = False
+        wsRes.Cells(resultsRow, 12).Value = "skipped:no_mwdc"
+        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
+        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+        wsRes.Cells(resultsRow, 20).Value = "skipped"
+        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|MWdc=0_or_invalid"
+        SolveOneProjectByColHL = 0
+        Exit Function
+    End If
+
+    ' Custom toggle path is NOT caught here — Custom rates source from
+    ' the Rate Curves tab vector, so a zero in row 160 means nothing for
+    ' them. E15a/E16 preflight catches Custom-with-empty-Name separately.
+    Dim vEarlyRC1Tog As Variant
+    Dim vEarlyRC1Rate As Variant
+    Dim bEarlyRC1Empty As Boolean
+    bEarlyRC1Empty = False
+    vEarlyRC1Tog = wsPI.Cells(159, colIdx).Value
+    vEarlyRC1Rate = wsPI.Cells(160, colIdx).Value
+    If CStr(vEarlyRC1Tog) = "Generic" Then
+        If IsNumeric(vEarlyRC1Rate) Then
+            If CDbl(vEarlyRC1Rate) = 0 Then bEarlyRC1Empty = True
+        ElseIf IsEmpty(vEarlyRC1Rate) Or IsNull(vEarlyRC1Rate) Then
+            bEarlyRC1Empty = True
+        End If
+    End If
+    If bEarlyRC1Empty Then
+        wsRes.Cells(resultsRow, 1).Value = projOffset
+        wsRes.Cells(resultsRow, 2).Value = projName
+        wsRes.Cells(resultsRow, 9).Value = False
+        wsRes.Cells(resultsRow, 12).Value = "skipped:no_rc1_revenue"
+        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
+        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+        wsRes.Cells(resultsRow, 20).Value = "skipped"
+        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|RC1_Generic_zero_rate"
+        SolveOneProjectByColHL = 0
+        Exit Function
+    End If
 
     ' Save HoldCo state at entry so the error path can restore it. The
     ' iter loop toggles HoldCo 0→1 within each iIter; an error fired with
@@ -763,77 +828,6 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ResetPhaseTelemetryHL
     WriteHeartbeatHL wsRes, "STEP4_CALC_FULL_PRE_LOOP"
     CalcForPhase PHASE_FULL
-
-    ' Pre-flight: skip placeholder / blank columns. Projects with row 4
-    ' name populated but MWdc=0 (e.g. "Project 7" through "Project 16"
-    ' template carry-overs) propagate #DIV/0 through the cap stack, which
-    ' causes rEquity.GoalSeek to RAISE 0x800a9c68 instead of returning
-    ' False — crashing the worker. Skipping cleanly here writes a
-    ' "skipped:no_mwdc" row to __SolverResults so the operator sees the
-    ' project was deliberately bypassed, not silently dropped.
-    ' Documented in 2026-05-15 SMP failure post-mortem.
-    Dim dMWdc As Double
-    dMWdc = 0
-    On Error Resume Next
-    dMWdc = CDbl(wsPI.Range("F11").Value)
-    On Error GoTo ProjErr
-    If dMWdc <= 0 Then
-        wsRes.Cells(resultsRow, 1).Value = projOffset
-        wsRes.Cells(resultsRow, 2).Value = projName
-        wsRes.Cells(resultsRow, 9).Value = False  ' bConverged
-        wsRes.Cells(resultsRow, 12).Value = "skipped:no_mwdc"
-        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
-        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
-        wsRes.Cells(resultsRow, 20).Value = "skipped"
-        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|MWdc=0_or_invalid"
-        SolveOneProjectByColHL = 0
-        Exit Function
-    End If
-
-    ' Pre-flight: skip placeholder projects with no RC1 revenue stream.
-    ' RC1 (rows 158-162) is the primary energy revenue slot. When Toggle
-    ' is "Generic" but the Generic Energy Rate at COD (row 160) is 0,
-    ' the project has zero modeled revenue → the entire cap stack
-    ' propagates #DIV/0! through PT Returns / NPP Calc / Appraisal, and
-    ' the inner GoalSeek loop spins through all MAX_ITER iterations
-    ' without converging (each iter ~10-30s on a 13MB workbook = 15-30
-    ' min of wasted compute per placeholder).
-    '
-    ' 2026-05-18 SMP run id=16 post-mortem: 10 placeholder columns in
-    ' the workbook would have burned ~3 hours of solver time across
-    ' both workers if not skipped — even with the Tranche 7 defensive
-    ' guards preventing the original 0x800a9c68 crash.
-    '
-    ' Custom toggle path is NOT caught here because Custom rates pull
-    ' from the Rate Curves tab vector (not the Generic Rate cell); a
-    ' project with Toggle="Custom" + populated Rate Name is a real
-    ' revenue stream regardless of what row 160 holds. E15a/E16
-    ' preflight catches Custom-with-empty-Name separately.
-    Dim vRC1Toggle As Variant
-    Dim vRC1Rate As Variant
-    Dim bRC1Empty As Boolean
-    bRC1Empty = False
-    vRC1Toggle = wsPI.Cells(159, colIdx).Value  ' RC1 toggle row
-    vRC1Rate = wsPI.Cells(160, colIdx).Value    ' RC1 Generic Energy Rate at COD
-    If CStr(vRC1Toggle) = "Generic" Then
-        If IsNumeric(vRC1Rate) Then
-            If CDbl(vRC1Rate) = 0 Then bRC1Empty = True
-        ElseIf IsEmpty(vRC1Rate) Or IsNull(vRC1Rate) Then
-            bRC1Empty = True
-        End If
-    End If
-    If bRC1Empty Then
-        wsRes.Cells(resultsRow, 1).Value = projOffset
-        wsRes.Cells(resultsRow, 2).Value = projName
-        wsRes.Cells(resultsRow, 9).Value = False  ' bConverged
-        wsRes.Cells(resultsRow, 12).Value = "skipped:no_rc1_revenue"
-        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
-        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
-        wsRes.Cells(resultsRow, 20).Value = "skipped"
-        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|RC1_Generic_zero_rate"
-        SolveOneProjectByColHL = 0
-        Exit Function
-    End If
 
     WriteHeartbeatHL wsRes, "STEP5_RANGE_SETUP"
 

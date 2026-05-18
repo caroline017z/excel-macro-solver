@@ -1055,6 +1055,14 @@ def _run_chunked(
         col_idx = nt.offset + BASE_COL
         results_row = idx + 2  # row 1 holds headers
         log.info("  [%d/%d] Solving %s (col %d)...", idx + 1, n, nt.name, col_idx)
+        # Two-phase status writes per project. `call_phase=invoking` lets
+        # an external observer distinguish "Python invoked COM but Excel
+        # hasn't returned" from "Excel returned, Python prepping next."
+        # 2026-05-18 SMP run id=17 post-mortem: with only the pre-call
+        # write, a stalled Excel was indistinguishable from a worker
+        # already past the project — diagnosis required digging into VBA
+        # heartbeats. The post-call write closes that gap.
+        call_start = time.time()
         status.update(
             "solving",
             per_project_status="solving",
@@ -1063,6 +1071,8 @@ def _run_chunked(
             current_project=nt.name,
             macro_used=macro_used,
             chunked=True,
+            call_phase="invoking",
+            call_col=int(col_idx),
         )
         try:
             _run_macro_with_timeout(
@@ -1076,6 +1086,18 @@ def _run_chunked(
                 timeout_sec=per_call_timeout_sec,
                 excel_proc=excel_proc,
                 label=f"SolveOneProjectByColHL[{nt.name}]",
+            )
+            status.update(
+                "solving",
+                per_project_status="solving",
+                current_index=idx + 1,
+                current_total=n,
+                current_project=nt.name,
+                macro_used=macro_used,
+                chunked=True,
+                call_phase="returned",
+                call_col=int(col_idx),
+                last_call_secs=round(time.time() - call_start, 2),
             )
         except TimeoutError as e:
             chunked_error = (
