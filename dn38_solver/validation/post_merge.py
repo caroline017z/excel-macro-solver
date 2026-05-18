@@ -197,6 +197,24 @@ def verify_merged_file(
                     continue
                 if pr.get("status") == "not_attempted":
                     continue
+                # Tranche 7.2 fast-skip leaves the project's hard-stamped
+                # cells (rows 31/32/33/37/38/39) untouched — the macro
+                # exits before reaching the cell-self-assign block. The
+                # worker still does a post-solve F-column read for each
+                # project, which returns whatever was in those cells
+                # before (typically an Excel error). COM marshals the
+                # error as a numeric sentinel; openpyxl re-reads the same
+                # cell as a string like '#NUM!'. Comparing them flags 10
+                # false-positive "mismatches" per SMP run id=18.
+                #
+                # Skip verification for skipped projects — their
+                # post-solve values are intentionally undefined and the
+                # operator already sees them as "CHECK" / "NOT CONVERGED"
+                # in the run summary.
+                meta = pr.get("meta") or {}
+                mode = meta.get("mode")
+                if isinstance(mode, str) and mode.startswith("skipped:"):
+                    continue
                 sv = pr.get("solved_values", {})
                 col_idx = column_index_from_string(task.project_col_letter)
                 for row in HARD_STAMPED_ROWS:
