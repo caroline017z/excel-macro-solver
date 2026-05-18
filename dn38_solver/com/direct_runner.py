@@ -49,6 +49,95 @@ SOLVER_RESULTS_SHEET = "__SolverResults"
 # 60 active projects + slack for header growth; one COM round-trip beats N+1.
 _RESULTS_BULK_ROWS = 200
 
+# Wall-clock cap on a single COM Application.Run call. Caroline's memory
+# notes typical 2-3 min per project; cold-start solves can reach 5-6 min.
+# 600s = 10 min gives 2x headroom for the slowest legitimate solve while
+# still catching the 50-min stall mode observed on the 2026-05-15 SMP run.
+# Configurable via env override for unusually slow workbooks.
+import os as _os
+DEFAULT_PER_CALL_TIMEOUT_SEC = int(_os.environ.get("DN38_PER_CALL_TIMEOUT_SEC", "600"))
+
+
+def _capture_excel_proc():
+    """Find the EXCEL.EXE child of the current Python process. Called once
+    after DispatchEx so the watchdog can hard-kill Excel by handle (not by
+    PID — psutil.Process is PID-reuse-safe via create_time pinning).
+
+    Returns a psutil.Process or None if psutil missing / no child found.
+    The watchdog falls back to a no-op kill if this returns None — the
+    timeout still raises, just without forcing Excel to disconnect.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return None
+    try:
+        me = psutil.Process(_os.getpid())
+    except Exception:
+        return None
+    # DispatchEx returns before Excel's child PID is necessarily registered
+    # as a descendant of the caller; allow up to 3s for the relationship
+    # to materialize. Worker startup is already 5-10s so this is in-noise.
+    for _ in range(30):
+        try:
+            for child in me.children(recursive=False):
+                try:
+                    if child.name().lower() == "excel.exe":
+                        return child
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return None
+
+
+def _run_macro_with_timeout(
+    excel: object,
+    call_args: tuple,
+    *,
+    timeout_sec: int,
+    excel_proc=None,
+    label: str = "Application.Run",
+):
+    """Invoke `excel.Application.Run(*call_args)` with a wall-clock guard.
+
+    The COM call runs on the calling thread (preserves COM apartment).
+    A daemon watchdog sleeps for `timeout_sec`; if the main call hasn't
+    signaled completion by then, the watchdog hard-kills the Excel
+    process so the COM client raises and control returns.
+
+    This is the 2026-05-15 SMP 50-min hang fix. Without it, a VBA macro
+    that enters an infinite recalc loop blocks Python indefinitely with
+    no way to surface the failure. With it, the worst case is `timeout_sec`
+    of CPU spin followed by a clear TimeoutError that the orchestrator
+    can mark as a failure and skip the project on retry.
+
+    Raises TimeoutError on watchdog fire, or the underlying COM exception
+    if Application.Run raises before the timeout.
+    """
+    import threading
+    done = threading.Event()
+
+    def watchdog():
+        if not done.wait(timeout=timeout_sec):
+            log.error(
+                "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
+                label, timeout_sec,
+            )
+            if excel_proc is not None:
+                try:
+                    excel_proc.kill()
+                except Exception as kill_exc:
+                    log.warning("  Excel kill failed: %s", kill_exc)
+
+    t = threading.Thread(target=watchdog, daemon=True, name=f"COM-WD-{label}")
+    t.start()
+    try:
+        return excel.Application.Run(*call_args)
+    finally:
+        done.set()
+
 
 class _NormCell(NamedTuple):
     sheet: str
@@ -396,14 +485,22 @@ def run_direct(
             chunked=use_chunked,
         )
 
+        # Capture the Excel process handle now so the per-call timeout
+        # watchdog can hard-kill it on hang. None if psutil unavailable —
+        # watchdog still fires but can't enforce the kill (the timeout
+        # still raises, just leaves an orphan Excel for the reaper).
+        excel_proc = _capture_excel_proc()
+
         t0 = time.time()
         if use_chunked:
-            macro_used, has_switch, macro_error = _run_chunked(
+            macro_used, has_switch, macro_error, failed_idx = _run_chunked(
                 excel, wb, norm_tasks, original_f2, status,
                 checkpoint_callback=checkpoint_callback,
+                excel_proc=excel_proc,
             )
         else:
             macro_used, has_switch, macro_error = _run_single_shot(excel, wb)
+            failed_idx = None
 
         # Auto-recovery: a generic VBA error inside Application.Run
         # (e.g. 0x80048028) almost always means the workbook's state is
@@ -457,14 +554,38 @@ def run_direct(
                         )
 
             def _retry() -> None:
-                used, switch, err = _run_chunked(
+                # Resume from the failed project, not from project 1. The
+                # 2026-05-15 SMP run wasted ~4-7 projects per worker on
+                # re-solving converged columns because _run_chunked always
+                # started at idx=0. With start_idx=failed_idx, the retry
+                # picks up exactly where the original run broke.
+                resume_from = failed_idx if failed_idx is not None else 0
+                used, switch, err, retry_failed_idx = _run_chunked(
                     excel, wb, norm_tasks, original_f2, status,
                     checkpoint_callback=checkpoint_callback,
+                    start_idx=resume_from,
+                    excel_proc=excel_proc,
                 )
                 retry_used[0] = used
                 retry_has_switch[0] = switch
                 retry_error[0] = err
                 if err:
+                    # If the retry failed at the SAME project, the bug is
+                    # deterministic and re-import didn't help — escalate
+                    # as unrecoverable rather than spinning further. The
+                    # 2026-05-15 SMP run looped here because the data on
+                    # placeholder columns produces the same #DIV/0 every
+                    # solve regardless of macro state.
+                    if (
+                        retry_failed_idx is not None
+                        and failed_idx is not None
+                        and retry_failed_idx == failed_idx
+                    ):
+                        raise RuntimeError(
+                            f"{err} (recovery failed at same project idx={failed_idx} "
+                            "-- bug is data-driven, not workbook-state corruption; "
+                            "no further retries)"
+                        )
                     raise RuntimeError(err)
 
             try:
@@ -555,15 +676,28 @@ def run_direct(
             # xlCalculationManual — reads after that would see the previous
             # project's values. Force a full recalc when we fall back so
             # the legacy-macro path doesn't silently mix projects.
+            #
+            # Both the macro and fallback paths get the watchdog timeout —
+            # SwitchProjectAndRecalc calls CalcModelCoreHL which can spin
+            # on a corrupted workbook (same hang mode as the per-project
+            # solve). Per-call timeout caps the read-pass at N * timeout
+            # in worst case, where N is project count.
             switched_with_recalc = False
             if has_switch:
                 try:
-                    excel.Application.Run(
-                        vba_call_str(wb.Name, SWITCH_PROJECT_AND_RECALC),
-                        nt.offset,
+                    _run_macro_with_timeout(
+                        excel,
+                        (vba_call_str(wb.Name, SWITCH_PROJECT_AND_RECALC), nt.offset),
+                        timeout_sec=DEFAULT_PER_CALL_TIMEOUT_SEC,
+                        excel_proc=excel_proc,
+                        label=f"SwitchProjectAndRecalc[{nt.name}]",
                     )
                     switched_with_recalc = True
-                except Exception:
+                except Exception as switch_exc:
+                    log.warning(
+                        "  Read-pass switch failed for %s: %s — falling back to direct F2",
+                        nt.name, switch_exc,
+                    )
                     _set_f2(wb, nt.idx_cell, nt.offset)
             else:
                 _set_f2(wb, nt.idx_cell, nt.offset)
@@ -595,9 +729,12 @@ def run_direct(
             # formula that openpyxl-merge reads as stale or None.
             if has_switch and not macro_error:
                 col_idx = nt.offset + BASE_COL
-                excel.Application.Run(
-                    vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
-                    int(col_idx),
+                _run_macro_with_timeout(
+                    excel,
+                    (vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN), int(col_idx)),
+                    timeout_sec=DEFAULT_PER_CALL_TIMEOUT_SEC,
+                    excel_proc=excel_proc,
+                    label=f"StampActiveProjectColumnHL[{nt.name}]",
                 )
 
             # Read cells
@@ -827,7 +964,10 @@ def _run_chunked(
     status: _StatusWriter,
     *,
     checkpoint_callback: Callable[[object, dict], None] | None = None,
-) -> tuple[str | None, bool, str | None]:
+    start_idx: int = 0,
+    excel_proc=None,
+    per_call_timeout_sec: int = DEFAULT_PER_CALL_TIMEOUT_SEC,
+) -> tuple[str | None, bool, str | None, int | None]:
     """Chunked macro path: Init + per-project SolveOneProjectByColHL + Finalize.
 
     Each project becomes its own COM Application.Run call so a long
@@ -846,14 +986,22 @@ def _run_chunked(
     """
     macro_used = "SolveHeadless"  # The chunked entry points live in this module
     has_switch = True
-    try:
-        excel.Application.Run(vba_call_str(wb.Name, INIT_SOLVE_ENV))
-    except Exception as e:
-        return macro_used, has_switch, f"InitSolveEnvHL failed: {e}"
+    # Init only on a fresh run, not on resume — InitSolveEnvHL resets the
+    # __SolverResults sheet and clears prior per-project results. On resume
+    # we want the already-converged rows preserved.
+    if start_idx == 0:
+        try:
+            excel.Application.Run(vba_call_str(wb.Name, INIT_SOLVE_ENV))
+        except Exception as e:
+            return macro_used, has_switch, f"InitSolveEnvHL failed: {e}", None
 
     n = len(norm_tasks)
     chunked_error: str | None = None
-    for idx, nt in enumerate(norm_tasks):
+    failed_idx: int | None = None
+    if start_idx > 0:
+        log.info("  Resuming chunked solve from project %d/%d", start_idx + 1, n)
+    for idx in range(start_idx, n):
+        nt = norm_tasks[idx]
         col_idx = nt.offset + BASE_COL
         results_row = idx + 2  # row 1 holds headers
         log.info("  [%d/%d] Solving %s (col %d)...", idx + 1, n, nt.name, col_idx)
@@ -867,17 +1015,31 @@ def _run_chunked(
             chunked=True,
         )
         try:
-            excel.Application.Run(
-                vba_call_str(wb.Name, SOLVE_ONE_PROJECT_BY_COL),
-                int(col_idx),
-                str(nt.name),
-                int(results_row),
+            _run_macro_with_timeout(
+                excel,
+                (
+                    vba_call_str(wb.Name, SOLVE_ONE_PROJECT_BY_COL),
+                    int(col_idx),
+                    str(nt.name),
+                    int(results_row),
+                ),
+                timeout_sec=per_call_timeout_sec,
+                excel_proc=excel_proc,
+                label=f"SolveOneProjectByColHL[{nt.name}]",
             )
+        except TimeoutError as e:
+            chunked_error = (
+                f"SolveOneProjectByColHL TIMEOUT at "
+                f"{nt.name} (col {col_idx}, row {results_row}, idx {idx}): {e}"
+            )
+            failed_idx = idx
+            break
         except Exception as e:
             chunked_error = (
                 f"SolveOneProjectByColHL failed at "
-                f"{nt.name} (col {col_idx}, row {results_row}): {e}"
+                f"{nt.name} (col {col_idx}, row {results_row}, idx {idx}): {e}"
             )
+            failed_idx = idx
             break
 
         if checkpoint_callback is not None:
@@ -896,16 +1058,21 @@ def _run_chunked(
 
     # Finalize is best-effort — it restores F2 and re-enables non-core
     # sheets, so we always try to call it even after a per-project error.
+    # Finalize also gets the timeout watchdog: a finalize that hangs would
+    # have the same silent-stall failure mode as a per-project hang.
     try:
-        excel.Application.Run(
-            vba_call_str(wb.Name, FINALIZE_SOLVE_ENV),
-            int(original_f2),
+        _run_macro_with_timeout(
+            excel,
+            (vba_call_str(wb.Name, FINALIZE_SOLVE_ENV), int(original_f2)),
+            timeout_sec=per_call_timeout_sec,
+            excel_proc=excel_proc,
+            label="FinalizeSolveEnvHL",
         )
     except Exception as e:
         if chunked_error is None:
             chunked_error = f"FinalizeSolveEnvHL failed: {e}"
 
-    return macro_used, has_switch, chunked_error
+    return macro_used, has_switch, chunked_error, failed_idx
 
 
 def _read_one_solver_result_row(wb: object, results_row: int) -> dict:

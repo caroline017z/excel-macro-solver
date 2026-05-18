@@ -120,9 +120,15 @@ def with_recovery(
 
     try:
         retry_callable()
-    except Exception as e:
+    except RuntimeError as e:
+        # Narrow to RuntimeError because that's the type _retry raises in
+        # direct_runner.py. A broad `except Exception` would swallow real
+        # COM exceptions (e.g., new HRESULT during retry), which deserve
+        # to propagate up the stack with their actual error info rather
+        # than be flattened into "retry also failed" (Agent 1 P2-8 from
+        # the 2026-05-15 audit).
         log.warning("  Auto-recovery: retry also failed: %s", e)
         return False
 
-    log.info("  Auto-recovery: SUCCESS — retry converged after re-import.")
+    log.info("  Auto-recovery: SUCCESS -- retry converged after re-import.")
     return True

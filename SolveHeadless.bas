@@ -746,6 +746,33 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ResetPhaseTelemetryHL
     WriteHeartbeatHL wsRes, "STEP4_CALC_FULL_PRE_LOOP"
     CalcForPhase PHASE_FULL
+
+    ' Pre-flight: skip placeholder / blank columns. Projects with row 4
+    ' name populated but MWdc=0 (e.g. "Project 7" through "Project 16"
+    ' template carry-overs) propagate #DIV/0 through the cap stack, which
+    ' causes rEquity.GoalSeek to RAISE 0x800a9c68 instead of returning
+    ' False — crashing the worker. Skipping cleanly here writes a
+    ' "skipped:no_mwdc" row to __SolverResults so the operator sees the
+    ' project was deliberately bypassed, not silently dropped.
+    ' Documented in 2026-05-15 SMP failure post-mortem.
+    Dim dMWdc As Double
+    dMWdc = 0
+    On Error Resume Next
+    dMWdc = CDbl(wsPI.Range("F11").Value)
+    On Error GoTo ProjErr
+    If dMWdc <= 0 Then
+        wsRes.Cells(resultsRow, 1).Value = projOffset
+        wsRes.Cells(resultsRow, 2).Value = projName
+        wsRes.Cells(resultsRow, 9).Value = False  ' bConverged
+        wsRes.Cells(resultsRow, 12).Value = "skipped:no_mwdc"
+        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
+        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+        wsRes.Cells(resultsRow, 20).Value = "skipped"
+        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|MWdc=0_or_invalid"
+        SolveOneProjectByColHL = 0
+        Exit Function
+    End If
+
     WriteHeartbeatHL wsRes, "STEP5_RANGE_SETUP"
 
     Dim rHoldCo     As Range
