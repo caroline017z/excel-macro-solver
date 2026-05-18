@@ -510,6 +510,44 @@ def run_direct(
         # showed a single fresh `import_vba_module.py` pass fully rewrote
         # the file via Excel COM SaveAs and cleared the corruption. Wrap
         # that recovery as a one-shot retry here.
+        #
+        # PRE-RECOVERY SNAPSHOT: __SolverResults rows for projects that
+        # converged BEFORE the failing idx are still in memory on the
+        # open workbook, but `wb.Close(SaveChanges=False)` below would
+        # discard them. Read the rows out now so the post-recovery
+        # read-pass can merge them in. (2026-05-18 SMP post-mortem: 5
+        # of 15 projects had actually converged when the macro errored
+        # on idx=3, but all 15 showed not_attempted in the run record
+        # because the close-without-save wiped the in-memory results.)
+        pre_recovery_results: dict[int, dict] = {}
+        pre_recovery_heartbeat: str | None = None
+        if (
+            use_chunked
+            and macro_error
+            and failed_idx is not None
+            and failed_idx > 0
+            and decode_com_error(macro_error).auto_recoverable
+        ):
+            try:
+                pre_recovery_results, pre_recovery_heartbeat = (
+                    _read_solver_results_map(wb)
+                )
+                if pre_recovery_results:
+                    log.info(
+                        "  Pre-recovery snapshot: captured %d converged "
+                        "project(s) before retry close.",
+                        len(pre_recovery_results),
+                    )
+            except Exception as snap_exc:
+                # Non-fatal: recovery proceeds, but partial results are lost.
+                # Logged so an operator forensicing a partial run sees why
+                # the pre-error projects show not_attempted.
+                log.warning(
+                    "  Pre-recovery snapshot failed (%s); partial results "
+                    "from converged-before-error projects will not be "
+                    "preserved.", snap_exc,
+                )
+
         if (
             use_chunked
             and macro_error
@@ -651,6 +689,18 @@ def run_direct(
         t0 = time.time()
         project_results = []
         solver_results, heartbeat = _read_solver_results_map(wb)
+
+        # Merge in any pre-recovery snapshot (captured before the auto-
+        # recovery close discarded in-memory __SolverResults rows). The
+        # post-recovery read takes priority for any offset it covers —
+        # rows written after recovery reflect actual retry outcomes; the
+        # snapshot only fills in offsets the recovered workbook lost.
+        # Empty dict when no recovery occurred, so the no-error path is
+        # unchanged.
+        if pre_recovery_results:
+            for offset, meta in pre_recovery_results.items():
+                solver_results.setdefault(offset, meta)
+            heartbeat = heartbeat or pre_recovery_heartbeat
 
         for nt in norm_tasks:
             meta = solver_results.get(nt.offset)

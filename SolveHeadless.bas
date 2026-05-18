@@ -727,9 +727,26 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' structure state for subsequent project solves until the next iter's
     ' HoldCo cycle. Restoring on error eliminates that cross-project
     ' bleed (P0-1 from 2026-05-15 reliability review).
+    '
+    ' GUARD: PT!C134 (the HoldCo toggle) is a formula that depends on the
+    ' currently-active F2. At this point F2 still points at the PREVIOUS
+    ' project, and on rare occasions C134 resolves to an error token
+    ' (#DIV/0! / #VALUE!) when the previous project left the cap stack
+    ' in a transient state. A bare CLng() on an error value raises VBA
+    ' Type Mismatch (13) → 0x800a9c68 to COM, crashing the worker.
+    ' Default to 1 (HoldCo ON) on any non-numeric read — the value is
+    ' only used for restore-on-error and HoldCo=1 is the post-solve
+    ' steady state in every documented TE structure. (2026-05-18 SMP
+    ' post-mortem.)
     Dim lOriginalHoldCo As Long
-    lOriginalHoldCo = CLng(wsPT.Range(PT_HOLDCO_ONOFF).Value)
-    If lOriginalHoldCo <> 0 And lOriginalHoldCo <> 1 Then lOriginalHoldCo = 1
+    Dim vHoldCoRaw As Variant
+    vHoldCoRaw = wsPT.Range(PT_HOLDCO_ONOFF).Value
+    If IsNumeric(vHoldCoRaw) Then
+        lOriginalHoldCo = CLng(vHoldCoRaw)
+        If lOriginalHoldCo <> 0 And lOriginalHoldCo <> 1 Then lOriginalHoldCo = 1
+    Else
+        lOriginalHoldCo = 1
+    End If
 
     ' Per-step heartbeats. The cost is ~20 extra cell writes per project
     ' (negligible vs the 60-200s solve time) and they pay for themselves
@@ -843,7 +860,20 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         CalcForPhase PHASE_FULL
 
         WriteHeartbeatHL wsRes, "ITER_" & iIter & "_GS_DSCR"
+        ' GoalSeek RAISES (not just returns False) when the dependent formula
+        ' chain produces an error value — e.g. PT_EQUITY = #DIV/0! when a
+        ' placeholder project has zero revenue. The bGSok = ... assignment
+        ' never completes in that case; the raise jumps to ProjErr and the
+        ' COM worker crashes with 0x800a9c68. Localize the OERN so a real
+        ' VBA error (not GoalSeek's failure mode) still surfaces.
+        On Error Resume Next
         bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
+        If Err.Number <> 0 Then
+            bGSok = False
+            WriteHeartbeatHL wsRes, "GS_RAISE_DSCR|iter=" & iIter & "|err=" & Err.Number
+            Err.Clear
+        End If
+        On Error GoTo ProjErr
         If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_DSCR|iter=" & iIter
         If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
         If rDSCR.Value > DSCR_MAX Then rDSCR.Value = DSCR_MAX
@@ -862,27 +892,62 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
             If ProjectElapsedHL(dSolveStart) > PROJECT_TIMEOUT_SECONDS Then Exit For
 
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_GS_NPP"
+            On Error Resume Next
             bGSok = rIRRLive.GoalSeek(Goal:=rIRRTgt.Value, ChangingCell:=rNPP)
+            If Err.Number <> 0 Then
+                bGSok = False
+                WriteHeartbeatHL wsRes, "GS_RAISE_NPP|iter=" & iIter & "|inner=" & iInner & "|err=" & Err.Number
+                Err.Clear
+            End If
+            On Error GoTo ProjErr
             If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_NPP|iter=" & iIter & "|inner=" & iInner
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_CALC_NPP"
             CalcForPhase PHASE_NPP
 
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_GS_APPR"
+            On Error Resume Next
             bGSok = rApprLive.GoalSeek(Goal:=rWACCTgt.Value, ChangingCell:=rDevFee)
+            If Err.Number <> 0 Then
+                bGSok = False
+                WriteHeartbeatHL wsRes, "GS_RAISE_APPR|iter=" & iIter & "|inner=" & iInner & "|err=" & Err.Number
+                Err.Clear
+            End If
+            On Error GoTo ProjErr
             If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_APPR|iter=" & iIter & "|inner=" & iInner
             WriteHeartbeatHL wsRes, "ITER_" & iIter & "_INNER_" & iInner & "_CALC_APPR"
             CalcForPhase PHASE_APPR
 
-            dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
-            dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+            ' Defensive Abs(numeric - numeric): if GoalSeek left rIRRLive
+            ' or rApprLive in an error state (#DIV/0 from broken revenue),
+            ' arithmetic raises Type Mismatch. Treat non-numeric as a large
+            ' gap so the loop continues toward Exit For via the slope-stall
+            ' break rather than crashing the whole project.
+            If IsNumeric(rIRRLive.Value) And IsNumeric(rIRRTgt.Value) Then
+                dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+            Else
+                dIRRGap = 1#
+            End If
+            If IsNumeric(rApprLive.Value) And IsNumeric(rWACCTgt.Value) Then
+                dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+            Else
+                dApprGap = 1#
+            End If
             If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then
                 ' Phase scopes can leave F37 reading a stale NPP Calc!H453.
                 ' Validate against full propagation before declaring conv-
                 ' ergence — Application.CalculateFull is the only call that
                 ' reliably re-evaluates cross-sheet OFFSET-via-F2 chains.
                 Application.CalculateFull
-                dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
-                dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+                If IsNumeric(rIRRLive.Value) And IsNumeric(rIRRTgt.Value) Then
+                    dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+                Else
+                    dIRRGap = 1#
+                End If
+                If IsNumeric(rApprLive.Value) And IsNumeric(rWACCTgt.Value) Then
+                    dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+                Else
+                    dApprGap = 1#
+                End If
                 If dIRRGap <= IRR_TOLERANCE And dApprGap <= APPR_TOLERANCE Then Exit For
             End If
 
@@ -901,10 +966,20 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
             EscalateCalcTierHL
         Next iInner
 
-        dTotalUses = rTotalUses.Value
-        If dTotalUses <> 0 Then
-            dEquityPct = rEquity.Value / dTotalUses
+        ' Defensive read: a broken cap stack (placeholder project with zero
+        ' revenue) leaves rTotalUses / rEquity as #DIV/0! and the bare
+        ' arithmetic below would raise Type Mismatch. Treat non-numeric as
+        ' equityPct=0 so the outer convergence check naturally fails and
+        ' we continue to the result-write path with bConverged=False.
+        If IsNumeric(rTotalUses.Value) And IsNumeric(rEquity.Value) Then
+            dTotalUses = rTotalUses.Value
+            If dTotalUses <> 0 Then
+                dEquityPct = rEquity.Value / dTotalUses
+            Else
+                dEquityPct = 0
+            End If
         Else
+            dTotalUses = 0
             dEquityPct = 0
         End If
 
@@ -963,8 +1038,19 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     ' Force full propagation so dIRRGap / dApprGap below are measured against
     ' the truly-converged F37 / F31, not stale phase-scoped values.
     Application.CalculateFull
-    dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
-    dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+    ' Same defensive read as in the inner loop — a project that broke into
+    ' an error state still needs to fall through to the result-write path
+    ' with bConverged=False rather than crash here.
+    If IsNumeric(rIRRLive.Value) And IsNumeric(rIRRTgt.Value) Then
+        dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
+    Else
+        dIRRGap = 1#
+    End If
+    If IsNumeric(rApprLive.Value) And IsNumeric(rWACCTgt.Value) Then
+        dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
+    Else
+        dApprGap = 1#
+    End If
 
     ' NOTE: per-column hard-stamps for rows 31/32/33/37/38/39 USED to
     ' happen here, but the values they captured were a transient cross-

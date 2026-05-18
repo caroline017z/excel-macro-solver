@@ -323,6 +323,70 @@ class TestInputBounds:
         e13 = [f for f in result.findings if f.code == "E13"]
         assert e13 == []
 
+    def test_e16_placeholder_project_detected(self, tmp_path):
+        """E16 fires when active project has RC1 Generic + Generic Rate=0.
+
+        Reproduces SMP 2026-05-18 failure: cols N..W had Generic toggle with
+        zero Generic Energy Rate at COD, crashed both workers at first
+        attempt with HRESULT 0x800a9c68."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Project H baseline: active but RC1 Generic + Rate=0 = placeholder
+        ws["H159"] = "Generic"
+        ws["H160"] = 0
+        wb.save(path)
+
+        result = run_preflight(path)
+        e16 = [f for f in result.findings if f.code == "E16"]
+        assert len(e16) == 1, f"expected E16; got: {[f.code for f in result.findings]}"
+        assert "H=" in e16[0].message
+        assert e16[0].severity == "warning"
+
+    def test_e16_does_not_fire_on_real_revenue(self, tmp_path):
+        """E16 must NOT fire when Generic toggle has a non-zero Generic Rate.
+        Real projects with merchant rate stay quiet."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        ws["H159"] = "Generic"
+        ws["H160"] = 0.055  # 5.5% merchant rate
+        wb.save(path)
+
+        result = run_preflight(path)
+        e16 = [f for f in result.findings if f.code == "E16"]
+        assert e16 == []
+
+    def test_e16_does_not_fire_on_custom_toggle(self, tmp_path):
+        """E16 is RC1-Generic-specific. Custom toggle (revenue from Rate
+        Curves tab vector) doesn't trigger even with zero/empty Generic Rate."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        ws["H158"] = "GH25 -15%"  # Custom rate name
+        ws["H159"] = "Custom"
+        ws["H160"] = None  # Custom toggle reads from Rate Curves, not this cell
+        wb.save(path)
+
+        result = run_preflight(path)
+        e16 = [f for f in result.findings if f.code == "E16"]
+        assert e16 == []
+
+    def test_e16_inactive_projects_ignored(self, tmp_path):
+        """Placeholder shape on an INACTIVE project (row 7 != 1) doesn't fire."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Add an inactive column with placeholder shape
+        ws["I7"] = 0  # inactive
+        ws["I159"] = "Generic"
+        ws["I160"] = 0
+        wb.save(path)
+
+        result = run_preflight(path)
+        e16 = [f for f in result.findings if f.code == "E16"]
+        assert e16 == []
+
 
 # --- D-tier (macro version) ----------------------------------------------
 

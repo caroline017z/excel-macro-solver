@@ -1093,6 +1093,106 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
     return findings
 
 
+def check_placeholder_projects(wb: openpyxl.Workbook) -> list[PreflightFinding]:
+    """E16: Detect active project columns that look like un-populated
+    template placeholders.
+
+    Failure mode this catches (2026-05-18 SMP run id=16): the workbook
+    had row 7 = 1 (active) on cols N..W with project names "Project 7"
+    through "Project 16" but all 10 columns shared an identical
+    placeholder shape — RC1 toggle = "Generic" with Generic Energy Rate
+    at COD = 0, identical MWdc and yield across all 10. When the macro's
+    chunked entry point reached the first placeholder it crashed with
+    HRESULT 0x800a9c68 (Type Mismatch raised by Range.GoalSeek over an
+    error-state Equity cell): zero revenue → #DIV/0! through the cap
+    stack → GoalSeek raises instead of returning False. Even with the
+    Tranche 7 defensive guards in the macro, a placeholder project
+    cannot meaningfully solve — there's no revenue stream to discount —
+    so the right answer is to refuse to attempt it and surface the
+    misconfiguration up front.
+
+    Detection heuristic (must be conservative to avoid false-positives
+    on small real projects with low merchant rates):
+      - active row 7 = 1
+      - RC1 toggle = "Generic" (the most common revenue stream slot)
+      - RC1 Generic Energy Rate at COD = 0 or None or non-numeric
+
+    Severity: warning (proceed with --strict-preflight to halt). The
+    user may have intentionally left these inactive but with row 7 = 1
+    (testing), in which case the warning is the right shape.
+    """
+    findings: list[PreflightFinding] = []
+    if "Project Inputs" not in wb.sheetnames:
+        return findings
+    ws = wb["Project Inputs"]
+
+    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
+    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
+
+    placeholders: list[tuple[str, str]] = []  # [(col_letter, project_name)]
+    # RC1 base = 157. Generic Energy Rate at COD is base+3 = row 160.
+    # Toggle is base+2 = row 159. Rate Name is base+1 = row 158.
+    rc1_toggle_row = RC_BLOCK_BASES[0] + 2  # 159
+    rc1_gen_rate_row = RC_BLOCK_BASES[0] + 3  # 160
+    for col in range(start_col, end_col + 1):
+        toggle = ws.cell(row=PI_ROW_TOGGLE, column=col).value
+        if toggle != 1:
+            continue
+        rc1_toggle = ws.cell(row=rc1_toggle_row, column=col).value
+        if rc1_toggle != "Generic":
+            continue
+        gen_rate = ws.cell(row=rc1_gen_rate_row, column=col).value
+        # Zero, None, or non-numeric (formula text in data_only=False is OK;
+        # we only flag explicit literal zero / None).
+        is_zero = (
+            gen_rate is None
+            or gen_rate == 0
+            or (isinstance(gen_rate, (int, float)) and gen_rate == 0)
+        )
+        if not is_zero:
+            continue
+        col_letter = ws.cell(row=PI_ROW_TOGGLE, column=col).coordinate.rstrip("0123456789")
+        name = ws.cell(row=4, column=col).value or "(unnamed)"
+        placeholders.append((col_letter, str(name)))
+
+    if not placeholders:
+        return findings
+
+    detail = ", ".join(f"{lt}={nm}" for lt, nm in placeholders)
+    findings.append(PreflightFinding(
+        code="E16",
+        severity="warning",
+        location="Project Inputs row 7 (active toggle) + RC1 sub-block",
+        message=(
+            f"{len(placeholders)} active project column(s) look like un-"
+            f"populated placeholders (RC1 toggle='Generic' with Generic "
+            f"Energy Rate at COD = 0): {detail}"
+        ),
+        impact=(
+            "These projects have no revenue stream on RC1 — the most "
+            "common primary energy revenue slot. The macro's chunked "
+            "GoalSeek will hit #DIV/0! through the cap stack and either "
+            "fail to converge (Tranche 7 defensive guards) or crash "
+            "outright (pre-Tranche 7). Even when guarded, solving a "
+            "no-revenue project produces a nonsensical NPP — there's "
+            "nothing for Dev Fee / Equity IRR to balance against. "
+            "Concrete failure: 2026-05-18 SMP run id=16, 0 of 15 "
+            "projects shipped after the first placeholder crashed both "
+            "workers."
+        ),
+        remediation=(
+            "Either (1) populate the Generic Energy Rate at COD on row "
+            f"{rc1_gen_rate_row} for each flagged column with the "
+            "merchant or contracted rate the project sells into, or "
+            "(2) toggle row 7 = 0 (inactive) on the placeholder columns "
+            "so the solver skips them. Only solve projects with real "
+            "revenue assumptions populated."
+        ),
+        auto_fixable=False,
+    ))
+    return findings
+
+
 def run_preflight(workbook_path: Path | str) -> PreflightResult:
     """Run the full pre-flight pass against `workbook_path`.
 
@@ -1177,6 +1277,7 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
             findings.extend(check_active_projects(wb_f))
             findings.extend(check_input_bounds(wb_f))
             findings.extend(check_rate_component_config(wb_f))
+            findings.extend(check_placeholder_projects(wb_f))
         finally:
             wb_f.close()
 
