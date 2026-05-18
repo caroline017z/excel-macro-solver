@@ -192,16 +192,27 @@ def _run_macro_with_timeout(
             # has been observed to silently fail on Excel instances that
             # are deep in a COM RPC call — taskkill via the OS scheduler
             # gets a kill ticket that bypasses the COM busy state.
+            #
+            # On an exception during the poll (e.g., AccessDenied), fall
+            # through to taskkill rather than returning — the polling
+            # error doesn't prove the process is dead, only that we
+            # can't check via psutil. The original "assume dead" comment
+            # was wrong: a 28+ min hang is exactly the failure mode
+            # where psutil's view of Excel becomes unreliable.
+            confirmed_dead = False
             for _ in range(30):
                 try:
                     if not excel_proc.is_running():
-                        return
+                        confirmed_dead = True
+                        break
                 except Exception:
-                    return  # process gone or unreadable — assume dead
+                    break  # fall through to taskkill, don't trust the check
                 time.sleep(0.1)
+            if confirmed_dead:
+                return
             log.warning(
-                "  Excel pid=%s still alive after psutil.kill -- escalating "
-                "to taskkill /F", getattr(excel_proc, "pid", "?"),
+                "  Excel pid=%s still alive (or unreadable) after psutil.kill "
+                "-- escalating to taskkill /F", getattr(excel_proc, "pid", "?"),
             )
             try:
                 import subprocess
@@ -588,7 +599,9 @@ def run_direct(
                 excel_proc=excel_proc,
             )
         else:
-            macro_used, has_switch, macro_error = _run_single_shot(excel, wb)
+            macro_used, has_switch, macro_error = _run_single_shot(
+                excel, wb, excel_proc=excel_proc,
+            )
             failed_idx = None
 
         # Auto-recovery: a generic VBA error inside Application.Run
@@ -913,10 +926,27 @@ def run_direct(
             meta = dict(meta) if meta else {}
             meta["project_offset"] = nt.offset
 
+            # Distinguish skipped placeholders from real convergence
+            # failures. VBA's Tranche 7.2 early-skip writes a sentinel
+            # like "skipped:no_rc1_revenue" to __SolverResults col 12
+            # (surfaced as meta["mode"]); without this branch, those
+            # rows look identical to a project that genuinely failed to
+            # converge after MAX_ITER iterations. The CLI summary,
+            # dashboard tracker, and post-merge verifier all key off
+            # `status` — making "skipped" a distinct value lets each
+            # surface the right label without re-parsing the mode string.
+            mode = meta.get("mode")
+            if isinstance(mode, str) and mode.startswith("skipped:"):
+                project_status = "skipped"
+            elif is_converged:
+                project_status = "converged"
+            else:
+                project_status = "not_converged"
+
             project_results.append({
                 "project_name": nt.name,
                 "project_offset": nt.offset,
-                "status": "converged" if is_converged else "not_converged",
+                "status": project_status,
                 "solved_values": solved,
                 "iterations_used": int(meta.get("iterations") or 0),
                 "duration_sec": 0,
@@ -1072,6 +1102,9 @@ def run_direct(
 def _run_single_shot(
     excel: object,
     wb: object,
+    *,
+    excel_proc=None,
+    per_call_timeout_sec: int = DEFAULT_PER_CALL_TIMEOUT_SEC,
 ) -> tuple[str | None, bool, str | None]:
     """Legacy single-invocation macro path. Tries SolveHeadless first;
     falls back to the original SolveMinEquityWithHoldCo if the headless
@@ -1081,12 +1114,29 @@ def _run_single_shot(
     SwitchProjectAndRecalc helper lives alongside the macro that ran --
     only the SolveHeadless module ships it, so the legacy fallback path
     reports False and the post-solve read uses the F2-direct fallback.
+
+    The Application.Run call is wrapped in `_run_macro_with_timeout` so a
+    hung VBA loop on this path can't burn the wall clock indefinitely.
+    Pre-Tranche 7.5, single-shot bypassed the watchdog entirely — same
+    failure class as the chunked SMP id=17 stall, just on a less-used
+    path. The chunked watchdog wraps every Application.Run; single-shot
+    now matches.
     """
     macro_names = ("SolveHeadless", "SolveMinEquityWithHoldCo")
     for macro_name in macro_names:
         try:
-            excel.Application.Run(f"'{wb.Name}'!{macro_name}")
+            _run_macro_with_timeout(
+                excel,
+                (f"'{wb.Name}'!{macro_name}",),
+                timeout_sec=per_call_timeout_sec,
+                excel_proc=excel_proc,
+                label=f"{macro_name}[single-shot]",
+            )
             return macro_name, macro_name == "SolveHeadless", None
+        except TimeoutError as e:
+            return macro_name, macro_name == "SolveHeadless", (
+                f"{macro_name} TIMEOUT (single-shot): {e}"
+            )
         except Exception as e:
             err_str = str(e).lower()
             if "macro may not be available" in err_str or "cannot run" in err_str:

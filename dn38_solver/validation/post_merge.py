@@ -195,22 +195,19 @@ def verify_merged_file(
                 pr = offset_to_result.get(task.project_offset)
                 if pr is None:
                     continue
-                if pr.get("status") == "not_attempted":
+                if pr.get("status") in ("not_attempted", "skipped"):
                     continue
-                # Tranche 7.2 fast-skip leaves the project's hard-stamped
-                # cells (rows 31/32/33/37/38/39) untouched — the macro
-                # exits before reaching the cell-self-assign block. The
-                # worker still does a post-solve F-column read for each
-                # project, which returns whatever was in those cells
-                # before (typically an Excel error). COM marshals the
-                # error as a numeric sentinel; openpyxl re-reads the same
-                # cell as a string like '#NUM!'. Comparing them flags 10
+                # Defense-in-depth: also bypass on meta["mode"] sentinel
+                # in case a future worker version forgets to translate
+                # skip-mode into status="skipped". Tranche 7.2 fast-skip
+                # leaves the project's hard-stamped cells (rows
+                # 31/32/33/37/38/39) untouched — the macro exits before
+                # the cell-self-assign block. The worker still does a
+                # post-solve F-column read, which returns whatever was in
+                # those cells (typically an Excel error). COM marshals
+                # the error as a numeric sentinel; openpyxl re-reads the
+                # same cell as '#NUM!'. Comparing them produced 10
                 # false-positive "mismatches" per SMP run id=18.
-                #
-                # Skip verification for skipped projects — their
-                # post-solve values are intentionally undefined and the
-                # operator already sees them as "CHECK" / "NOT CONVERGED"
-                # in the run summary.
                 meta = pr.get("meta") or {}
                 mode = meta.get("mode")
                 if isinstance(mode, str) and mode.startswith("skipped:"):

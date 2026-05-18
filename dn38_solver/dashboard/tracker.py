@@ -43,6 +43,8 @@ def _render_project_row(p: dict) -> None:
         st.progress(pct, text=f"🔄 {name} — iter {iteration}/{max_iter}")
     elif proj_status == "converged":
         st.progress(1.0, text=f"✅ {name} — converged")
+    elif proj_status == "skipped":
+        st.progress(1.0, text=f"⏭️ {name} — skipped (placeholder)")
     elif proj_status == "not_converged":
         st.progress(1.0, text=f"⚠️ {name} — not converged")
     else:
