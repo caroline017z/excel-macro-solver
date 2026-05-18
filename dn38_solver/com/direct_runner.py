@@ -49,11 +49,10 @@ SOLVER_RESULTS_SHEET = "__SolverResults"
 # 60 active projects + slack for header growth; one COM round-trip beats N+1.
 _RESULTS_BULK_ROWS = 200
 
-# Wall-clock cap on a single COM Application.Run call. Caroline's memory
-# notes typical 2-3 min per project; cold-start solves can reach 5-6 min.
-# 600s = 10 min gives 2x headroom for the slowest legitimate solve while
-# still catching the 50-min stall mode observed on the 2026-05-15 SMP run.
-# Configurable via env override for unusually slow workbooks.
+# Wall-clock cap on a single COM Application.Run call. Typical solve is
+# 2-3 min per project; cold-start solves can reach 5-6 min. 600s gives
+# 2x headroom for the slowest legitimate solve while still surfacing
+# stuck-recalc hangs. Configurable via env override.
 import os as _os
 DEFAULT_PER_CALL_TIMEOUT_SEC = int(_os.environ.get("DN38_PER_CALL_TIMEOUT_SEC", "600"))
 
@@ -77,12 +76,6 @@ def _capture_excel_proc(excel=None):
     Returns a ``psutil.Process`` or ``None``. The watchdog falls back to
     a no-op kill if this returns ``None`` — the timeout still raises,
     just without forcing Excel to disconnect.
-
-    2026-05-18 SMP run id=17 post-mortem: the child-scan-only version
-    returned ``None`` on parallel workers because their Excel instances
-    were COM-activated, not subprocess-spawned. The 600s per-call
-    watchdog fired but had no kill handle, leaving Excel spinning 28+
-    minutes on a single placeholder project.
     """
     try:
         import psutil  # type: ignore
@@ -141,57 +134,73 @@ def _capture_excel_proc(excel=None):
     return None
 
 
-def _call_with_timeout(
-    fn,
-    *,
-    timeout_sec: int,
-    excel_proc=None,
-    label: str = "COM-call",
-):
-    """Generic Win32-COM call watchdog. Same kill-escalation semantics
-    as `_run_macro_with_timeout` but for callables that aren't
-    `Application.Run` (e.g., `excel.CalculateFull`, `wb.Save`).
+def _kill_excel_after_timeout(done, *, timeout_sec, excel_proc, label):
+    """Watchdog body shared by `_call_with_timeout` and `_run_macro_with_timeout`.
 
-    The watchdog escalates exactly like `_run_macro_with_timeout`:
-    psutil.kill, 3s poll, taskkill /F. Without a process handle the
-    timeout still raises but Excel won't be force-killed.
+    Waits up to `timeout_sec` for `done` to signal. On timeout, escalates:
+    psutil.kill → 3s poll → taskkill /F via subprocess. The escalation is
+    necessary because psutil.kill silently fails on Excel instances deep
+    in a COM RPC call — taskkill's Win32 TerminateProcess bypasses the
+    COM busy state. Without an `excel_proc` handle (Hwnd lookup failed),
+    the timeout still fires but the kill is a no-op and the COM call may
+    block until the worker is restarted.
+    """
+    if done.wait(timeout=timeout_sec):
+        return
+    log.error(
+        "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
+        label, timeout_sec,
+    )
+    if excel_proc is None:
+        log.error(
+            "  %s: no Excel proc handle captured -- watchdog cannot force "
+            "COM to disconnect. Restart the worker to recover.", label,
+        )
+        return
+    try:
+        excel_proc.kill()
+    except Exception as kill_exc:
+        log.warning("  Excel psutil.kill failed: %s", kill_exc)
+    for _ in range(30):
+        try:
+            if not excel_proc.is_running():
+                return
+        except Exception:
+            break  # poll can fail mid-RPC; fall through to taskkill anyway
+        time.sleep(0.1)
+    log.warning(
+        "  Excel pid=%s still alive (or unreadable) after psutil.kill "
+        "-- escalating to taskkill /F", getattr(excel_proc, "pid", "?"),
+    )
+    try:
+        import subprocess
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(excel_proc.pid)],
+            capture_output=True, timeout=5, check=False,
+        )
+    except Exception as tk_exc:
+        log.error("  taskkill escalation failed: %s", tk_exc)
+
+
+def _with_watchdog(fn, *, timeout_sec, excel_proc, label):
+    """Run `fn()` on the calling thread with a daemon watchdog that
+    hard-kills Excel if the call exceeds `timeout_sec`. Returns `fn()`'s
+    return value. The COM apartment stays on the calling thread.
+
+    Used by both the macro-call wrapper (`_run_macro_with_timeout`) and
+    the generic COM-call wrapper (`_call_with_timeout`). Without this
+    guard, a VBA macro that enters an infinite recalc loop blocks
+    Python indefinitely with no way to surface the failure.
     """
     import threading
     done = threading.Event()
-
-    def watchdog():
-        if not done.wait(timeout=timeout_sec):
-            log.error(
-                "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
-                label, timeout_sec,
-            )
-            if excel_proc is None:
-                return
-            try:
-                excel_proc.kill()
-            except Exception as kill_exc:
-                log.warning("  Excel psutil.kill failed: %s", kill_exc)
-            confirmed_dead = False
-            for _ in range(30):
-                try:
-                    if not excel_proc.is_running():
-                        confirmed_dead = True
-                        break
-                except Exception:
-                    break
-                time.sleep(0.1)
-            if confirmed_dead:
-                return
-            try:
-                import subprocess
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", str(excel_proc.pid)],
-                    capture_output=True, timeout=5, check=False,
-                )
-            except Exception as tk_exc:
-                log.error("  taskkill escalation failed: %s", tk_exc)
-
-    t = threading.Thread(target=watchdog, daemon=True, name=f"COM-WD-{label}")
+    t = threading.Thread(
+        target=_kill_excel_after_timeout,
+        kwargs=dict(done=done, timeout_sec=timeout_sec,
+                    excel_proc=excel_proc, label=label),
+        daemon=True,
+        name=f"COM-WD-{label}",
+    )
     t.start()
     try:
         return fn()
@@ -199,94 +208,24 @@ def _call_with_timeout(
         done.set()
 
 
-def _run_macro_with_timeout(
-    excel: object,
-    call_args: tuple,
-    *,
-    timeout_sec: int,
-    excel_proc=None,
-    label: str = "Application.Run",
-):
-    """Invoke `excel.Application.Run(*call_args)` with a wall-clock guard.
+def _call_with_timeout(fn, *, timeout_sec, excel_proc=None, label="COM-call"):
+    """Wrap a Python callable (e.g., `excel.CalculateFull`, `wb.Save`)
+    in the COM watchdog. See `_with_watchdog` for kill semantics.
+    """
+    return _with_watchdog(fn, timeout_sec=timeout_sec,
+                          excel_proc=excel_proc, label=label)
 
-    The COM call runs on the calling thread (preserves COM apartment).
-    A daemon watchdog sleeps for `timeout_sec`; if the main call hasn't
-    signaled completion by then, the watchdog hard-kills the Excel
-    process so the COM client raises and control returns.
 
-    This is the 2026-05-15 SMP 50-min hang fix. Without it, a VBA macro
-    that enters an infinite recalc loop blocks Python indefinitely with
-    no way to surface the failure. With it, the worst case is `timeout_sec`
-    of CPU spin followed by a clear TimeoutError that the orchestrator
-    can mark as a failure and skip the project on retry.
-
+def _run_macro_with_timeout(excel, call_args, *, timeout_sec,
+                             excel_proc=None, label="Application.Run"):
+    """Wrap `excel.Application.Run(*call_args)` in the COM watchdog.
     Raises TimeoutError on watchdog fire, or the underlying COM exception
     if Application.Run raises before the timeout.
     """
-    import threading
-    done = threading.Event()
-
-    def watchdog():
-        if not done.wait(timeout=timeout_sec):
-            log.error(
-                "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
-                label, timeout_sec,
-            )
-            if excel_proc is None:
-                log.error(
-                    "  %s: no Excel proc handle captured -- watchdog cannot "
-                    "force COM to disconnect. Application.Run may hang "
-                    "indefinitely. Restart the worker to recover.",
-                    label,
-                )
-                return
-            # Tier 1: psutil kill (TerminateProcess via Win32).
-            try:
-                excel_proc.kill()
-            except Exception as kill_exc:
-                log.warning("  Excel psutil.kill failed: %s", kill_exc)
-            # Tier 2: confirm the kill landed; if Excel is still alive
-            # after 3s, escalate to a subprocess taskkill /F. psutil.kill
-            # has been observed to silently fail on Excel instances that
-            # are deep in a COM RPC call — taskkill via the OS scheduler
-            # gets a kill ticket that bypasses the COM busy state.
-            #
-            # On an exception during the poll (e.g., AccessDenied), fall
-            # through to taskkill rather than returning — the polling
-            # error doesn't prove the process is dead, only that we
-            # can't check via psutil. The original "assume dead" comment
-            # was wrong: a 28+ min hang is exactly the failure mode
-            # where psutil's view of Excel becomes unreliable.
-            confirmed_dead = False
-            for _ in range(30):
-                try:
-                    if not excel_proc.is_running():
-                        confirmed_dead = True
-                        break
-                except Exception:
-                    break  # fall through to taskkill, don't trust the check
-                time.sleep(0.1)
-            if confirmed_dead:
-                return
-            log.warning(
-                "  Excel pid=%s still alive (or unreadable) after psutil.kill "
-                "-- escalating to taskkill /F", getattr(excel_proc, "pid", "?"),
-            )
-            try:
-                import subprocess
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", str(excel_proc.pid)],
-                    capture_output=True, timeout=5, check=False,
-                )
-            except Exception as tk_exc:
-                log.error("  taskkill escalation failed: %s", tk_exc)
-
-    t = threading.Thread(target=watchdog, daemon=True, name=f"COM-WD-{label}")
-    t.start()
-    try:
-        return excel.Application.Run(*call_args)
-    finally:
-        done.set()
+    return _with_watchdog(
+        lambda: excel.Application.Run(*call_args),
+        timeout_sec=timeout_sec, excel_proc=excel_proc, label=label,
+    )
 
 
 class _NormCell(NamedTuple):
@@ -483,20 +422,19 @@ def run_direct(
                 ", ".join(rejected),
             )
         if safe_to_strip:
-            # KNOWN-RISKY PATTERN: openpyxl save on an .xlsm pre-solve. Per
-            # the 2026-05-13 RP Puma incident, this can corrupt workbook
-            # state (data validation extLst, calcChain, cond formatting)
-            # in ways the macro tolerates for direct writes but rejects
-            # during the first GoalSeek call. Mitigated downstream by
+            # KNOWN-RISKY PATTERN: openpyxl save on an .xlsm pre-solve can
+            # corrupt workbook state (data validation extLst, calcChain,
+            # cond formatting) in ways the macro tolerates for direct
+            # writes but rejects during the first GoalSeek. Mitigated by
             # auto-recovery (com.auto_recovery.with_recovery): if the
             # solve throws an auto-recoverable HRESULT, recovery re-runs
-            # import_vba_module.py whose Excel COM SaveAs fully rewrites
-            # the file and clears the corruption.
+            # import_vba_module.py whose Excel COM SaveAs rewrites the
+            # file and clears the corruption.
             #
             # DO NOT add new openpyxl.save() sites on .xlsm files. Use
-            # dn38_solver.com.com_edit.edit_xlsm instead — it routes the
-            # mutation through Excel COM SaveAs (FileFormat=52), which
-            # has been verified not to corrupt state.
+            # dn38_solver.com.com_edit.edit_xlsm — it routes the mutation
+            # through Excel COM SaveAs (FileFormat=52), which has been
+            # verified not to corrupt state.
             try:
                 import openpyxl
                 wb_strip = openpyxl.load_workbook(str(temp_path), keep_vba=True)
@@ -602,10 +540,9 @@ def run_direct(
         warmup_time = 0.0
 
         # Capture the Excel process handle as soon as the workbook is
-        # open. Moved here from after status.update (pre-Tranche 7.7) so
-        # the setup-call timeouts below (SET_SKIP_OUTPUT_RECALC) can
-        # benefit from the watchdog kill path too. None if psutil
-        # unavailable or both Hwnd-lookup and child-scan failed.
+        # open so setup-call timeouts (SET_SKIP_OUTPUT_RECALC) can use
+        # the watchdog kill path too. None if psutil unavailable or both
+        # Hwnd-lookup and child-scan failed.
         excel_proc = _capture_excel_proc(excel)
         if excel_proc is None:
             log.warning(
@@ -668,20 +605,17 @@ def run_direct(
         # Auto-recovery: a generic VBA error inside Application.Run
         # (e.g. 0x80048028) almost always means the workbook's state is
         # stale relative to the embedded macro — typically because an
-        # openpyxl save or another non-Excel writer touched the .xlsm
-        # since the last macro import. The 2026-05-13 RP Puma incident
-        # showed a single fresh `import_vba_module.py` pass fully rewrote
-        # the file via Excel COM SaveAs and cleared the corruption. Wrap
-        # that recovery as a one-shot retry here.
+        # openpyxl save (or another non-Excel writer) touched the .xlsm
+        # since the last macro import. A fresh `import_vba_module.py`
+        # pass via Excel COM SaveAs rewrites the file and clears the
+        # corruption. Wrap that recovery as a one-shot retry here.
         #
         # PRE-RECOVERY SNAPSHOT: __SolverResults rows for projects that
         # converged BEFORE the failing idx are still in memory on the
         # open workbook, but `wb.Close(SaveChanges=False)` below would
-        # discard them. Read the rows out now so the post-recovery
-        # read-pass can merge them in. (2026-05-18 SMP post-mortem: 5
-        # of 15 projects had actually converged when the macro errored
-        # on idx=3, but all 15 showed not_attempted in the run record
-        # because the close-without-save wiped the in-memory results.)
+        # discard them. Snapshot now so the post-recovery read-pass can
+        # merge them in — otherwise pre-failure converged projects show
+        # as `not_attempted` in the run record.
         pre_recovery_results: dict[int, dict] = {}
         pre_recovery_heartbeat: str | None = None
         if (
@@ -758,11 +692,9 @@ def run_direct(
                         )
 
             def _retry() -> None:
-                # Resume from the failed project, not from project 1. The
-                # 2026-05-15 SMP run wasted ~4-7 projects per worker on
-                # re-solving converged columns because _run_chunked always
-                # started at idx=0. With start_idx=failed_idx, the retry
-                # picks up exactly where the original run broke.
+                # Resume from the failed project, not project 1 — the
+                # pre-recovery snapshot already captured the converged
+                # results from earlier projects.
                 resume_from = failed_idx if failed_idx is not None else 0
                 used, switch, err, retry_failed_idx = _run_chunked(
                     excel, wb, norm_tasks, original_f2, status,
@@ -775,11 +707,11 @@ def run_direct(
                 retry_error[0] = err
                 if err:
                     # If the retry failed at the SAME project, the bug is
-                    # deterministic and re-import didn't help — escalate
-                    # as unrecoverable rather than spinning further. The
-                    # 2026-05-15 SMP run looped here because the data on
-                    # placeholder columns produces the same #DIV/0 every
-                    # solve regardless of macro state.
+                    # deterministic — re-import doesn't help, and a
+                    # second retry would just re-burn the wall clock.
+                    # Data-driven failures (e.g., placeholder columns
+                    # producing #DIV/0!) belong with the preflight
+                    # warnings, not the recovery loop.
                     if (
                         retry_failed_idx is not None
                         and failed_idx is not None
@@ -941,19 +873,16 @@ def run_direct(
             # from what we're about to read in the next loop. Skip on
             # the legacy fallback path that doesn't have the helper.
             #
-            # SKIP if a macro_error already occurred earlier in the run.
-            # The 2026-05-15 SMP 50-min hang was the read pass calling
-            # StampActiveProjectColumnHL -> Application.CalculateFull on
-            # a workbook whose data state was corrupted by the failed
-            # solve, where the circular sticky-IF cells in rows 31/37
-            # interact with #DIV/0 propagation from the failed project
-            # to spin MaxIterations=1000 iterations per project per call.
-            # If we already know the solve broke, stamping per-project is
-            # meaningless anyway -- the values we'd read are unreliable.
+            # Skip the per-column stamp when an upstream macro_error
+            # already broke the run. Stamping invokes CalculateFull,
+            # which on a corrupted workbook spins the circular sticky-IF
+            # cells in rows 31/37 against #DIV/0 propagation for the
+            # full MaxIterations budget per project. The values we'd
+            # read are unreliable anyway when the solve already failed.
             #
-            # When stamping IS run, never suppress its exception: a silent
-            # stamp failure leaves the per-column cell as a circular IF
-            # formula that openpyxl-merge reads as stale or None.
+            # When stamping IS run, never suppress its exception: a
+            # silent stamp failure leaves the per-column cell as a
+            # circular IF formula that openpyxl-merge reads as None.
             if has_switch and not macro_error:
                 col_idx = nt.offset + BASE_COL
                 _run_macro_with_timeout(
@@ -1002,14 +931,12 @@ def run_direct(
             meta["project_offset"] = nt.offset
 
             # Distinguish skipped placeholders from real convergence
-            # failures. VBA's Tranche 7.2 early-skip writes a sentinel
-            # like "skipped:no_rc1_revenue" to __SolverResults col 12
-            # (surfaced as meta["mode"]); without this branch, those
-            # rows look identical to a project that genuinely failed to
-            # converge after MAX_ITER iterations. The CLI summary,
-            # dashboard tracker, and post-merge verifier all key off
-            # `status` — making "skipped" a distinct value lets each
-            # surface the right label without re-parsing the mode string.
+            # failures. VBA's early-skip writes a sentinel like
+            # "skipped:no_rc1_revenue" to __SolverResults col 12
+            # (surfaced as meta["mode"]). Surfacing "skipped" as a
+            # distinct status lets the CLI summary, dashboard tracker,
+            # and post-merge verifier each render it correctly without
+            # re-parsing the mode string.
             mode = meta.get("mode")
             if isinstance(mode, str) and mode.startswith("skipped:"):
                 project_status = "skipped"
@@ -1032,11 +959,9 @@ def run_direct(
         read_time = time.time() - t0
         log.debug("  Read %d project(s) in %.1fs", len(tasks), read_time)
 
-        # Restore original F2. Watchdog-wrapped: this is cleanup, but a
-        # silent hang here delays workbook close and the SaveAs that
-        # produces _SOLVED.xlsm. Pre-Tranche 7.7 the suppress() let a
-        # hang here add unbounded time to post-solve. 60s cap is
-        # generous — the call just resets F2 and recalcs.
+        # Restore original F2. Watchdog-wrapped so a silent hang here
+        # doesn't delay workbook close and the SaveAs that produces
+        # _SOLVED.xlsm. 60s cap is generous for the F2 reset + recalc.
         if norm_tasks and has_switch:
             with contextlib.suppress(Exception):
                 _run_macro_with_timeout(
@@ -1200,12 +1125,8 @@ def _run_single_shot(
     only the SolveHeadless module ships it, so the legacy fallback path
     reports False and the post-solve read uses the F2-direct fallback.
 
-    The Application.Run call is wrapped in `_run_macro_with_timeout` so a
-    hung VBA loop on this path can't burn the wall clock indefinitely.
-    Pre-Tranche 7.5, single-shot bypassed the watchdog entirely — same
-    failure class as the chunked SMP id=17 stall, just on a less-used
-    path. The chunked watchdog wraps every Application.Run; single-shot
-    now matches.
+    The Application.Run call is wrapped in `_run_macro_with_timeout`
+    so a hung VBA loop on this path can't burn the wall clock.
     """
     macro_names = ("SolveHeadless", "SolveMinEquityWithHoldCo")
     for macro_name in macro_names:
@@ -1265,14 +1186,10 @@ def _run_chunked(
     # we want the already-converged rows preserved.
     if start_idx == 0:
         try:
-            # InitSolveEnvHL fires once at portfolio start to reset the
-            # __SolverResults sheet and prime calc tier state. If a prior
-            # run corrupted __SolverResults (e.g., partial write during a
-            # crash), Init can spin on the sheet teardown. Watchdog with
-            # the same per-call timeout as per-project solves prevents a
-            # silent 50-min hang at portfolio start — pre-Tranche 7.7
-            # this was the lone Application.Run on the chunked path that
-            # bypassed the watchdog.
+            # InitSolveEnvHL resets __SolverResults and primes calc tier
+            # state. A prior run that crashed mid-write can leave the
+            # sheet in a state where Init spins on teardown; the
+            # watchdog caps that at the per-call timeout.
             _run_macro_with_timeout(
                 excel,
                 (vba_call_str(wb.Name, INIT_SOLVE_ENV),),
@@ -1293,13 +1210,11 @@ def _run_chunked(
         col_idx = nt.offset + BASE_COL
         results_row = idx + 2  # row 1 holds headers
         log.info("  [%d/%d] Solving %s (col %d)...", idx + 1, n, nt.name, col_idx)
-        # Two-phase status writes per project. `call_phase=invoking` lets
-        # an external observer distinguish "Python invoked COM but Excel
-        # hasn't returned" from "Excel returned, Python prepping next."
-        # 2026-05-18 SMP run id=17 post-mortem: with only the pre-call
-        # write, a stalled Excel was indistinguishable from a worker
-        # already past the project — diagnosis required digging into VBA
-        # heartbeats. The post-call write closes that gap.
+        # Two-phase status writes per project let an external observer
+        # tell "Python invoked COM, waiting on Excel" from "Excel
+        # returned, Python prepping next" — without parsing VBA
+        # heartbeats. Pre/post the COM call carry call_phase="invoking"
+        # / "returned" respectively.
         call_start = time.time()
         status.update(
             "solving",
@@ -1385,25 +1300,16 @@ def _run_chunked(
     return macro_used, has_switch, chunked_error, failed_idx
 
 
-def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
-    """Read a single row from __SolverResults in one COM round-trip.
+def _parse_solver_result_row(row_vals: tuple) -> dict:
+    """Decode one __SolverResults row tuple into the canonical result dict.
 
-    Mirrors the bulk read schema (cols A–S) but for a single project,
-    used by the chunked checkpoint hook so each callback fires with the
-    same shape the post-solve bulk read produces.
+    Single source of truth for the cols A-T schema. Callers pass the
+    raw tuple from `Range.Value` (already flattened from the
+    `((v1, v2, ...),)` single-row shape if needed). Older workbook
+    builds without the phase-telemetry columns return short rows; the
+    `len(row_vals) > N` guards keep those cases None-valued rather
+    than IndexError.
     """
-    try:
-        ws = wb.Sheets(SOLVER_RESULTS_SHEET)
-        row_vals = ws.Range(f"A{results_row}:T{results_row}").Value
-    except Exception:
-        return {}
-    if row_vals is None:
-        return {}
-    # Single-row Range.Value comes back as ((v1, v2, ...),) — flatten.
-    if row_vals and isinstance(row_vals[0], tuple):
-        row_vals = row_vals[0]
-    if len(row_vals) < 14:
-        return {}
     tier_raw = row_vals[19] if len(row_vals) > 19 else None
     return {
         "project_name": safe_str_or_float(row_vals[1]),
@@ -1426,6 +1332,25 @@ def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
         "iterations": _to_int(row_vals[18]) if len(row_vals) > 18 else None,
         "conv_tier": tier_raw if isinstance(tier_raw, str) else "none",
     }
+
+
+def _read_one_solver_result_row(wb: object, results_row: int) -> dict:
+    """Read a single __SolverResults row used by the chunked checkpoint
+    hook so each callback fires with the same shape the post-solve bulk
+    read produces.
+    """
+    try:
+        ws = wb.Sheets(SOLVER_RESULTS_SHEET)
+        row_vals = ws.Range(f"A{results_row}:T{results_row}").Value
+    except Exception:
+        return {}
+    if row_vals is None:
+        return {}
+    if row_vals and isinstance(row_vals[0], tuple):
+        row_vals = row_vals[0]
+    if len(row_vals) < 14:
+        return {}
+    return _parse_solver_result_row(row_vals)
 
 
 def _read_cell(wb: object, sheet: str, address: str) -> float | str | None:
@@ -1489,31 +1414,7 @@ def _read_solver_results_map(
             offset = int(offset_raw)
         except (ValueError, TypeError):
             continue
-        # Older workbook builds without the phase-telemetry columns return
-        # short rows (or None in O–R); use safe_float so a missing value
-        # surfaces as None rather than raising.
-        tier_raw = row_vals[19] if len(row_vals) > 19 else None
-        out[offset] = {
-            "project_name": safe_str_or_float(row_vals[1]),
-            "dscr": safe_float(row_vals[2]),
-            "npp": safe_float(row_vals[3]),
-            "dev_fee": safe_float(row_vals[4]),
-            "equity_pct": safe_float(row_vals[5]),
-            "irr_gap": safe_float(row_vals[6]),
-            "appr_gap": safe_float(row_vals[7]),
-            "converged_flag": safe_str_or_float(row_vals[8]),
-            "calc_tier": safe_str_or_float(row_vals[9]),
-            "gs_retry_limit": safe_str_or_float(row_vals[10]),
-            "mode": safe_str_or_float(row_vals[11]),
-            "solve_seconds": safe_float(row_vals[12]),
-            "heartbeat": safe_str_or_float(row_vals[13]),
-            "calc_secs_dscr": safe_float(row_vals[14]) if len(row_vals) > 14 else None,
-            "calc_secs_npp": safe_float(row_vals[15]) if len(row_vals) > 15 else None,
-            "calc_secs_appr": safe_float(row_vals[16]) if len(row_vals) > 16 else None,
-            "calc_secs_full": safe_float(row_vals[17]) if len(row_vals) > 17 else None,
-            "iterations": _to_int(row_vals[18]) if len(row_vals) > 18 else None,
-            "conv_tier": tier_raw if isinstance(tier_raw, str) else "none",
-        }
+        out[offset] = _parse_solver_result_row(row_vals)
     return out, heartbeat
 
 

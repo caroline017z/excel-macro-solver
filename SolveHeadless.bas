@@ -68,12 +68,15 @@ Private Const PI_APPR_LIVE      As String = "F31"
 Private Const PI_WACC_TARGET    As String = "F30"
 
 ' --- Row/column layout ---
-Private Const PI_ROW_TOGGLE     As Long = 7
-Private Const PI_ROW_NAME       As Long = 4
-Private Const PI_ROW_NPP        As Long = 38
-Private Const PI_ROW_DEV_FEE    As Long = 32
-Private Const PI_FIRST_PROJ_COL As Integer = 8
-Private Const PI_BASE_COL       As Integer = 7
+Private Const PI_ROW_TOGGLE       As Long = 7
+Private Const PI_ROW_NAME         As Long = 4
+Private Const PI_ROW_MWDC         As Long = 11
+Private Const PI_ROW_NPP          As Long = 38
+Private Const PI_ROW_DEV_FEE      As Long = 32
+Private Const PI_ROW_RC1_TOGGLE   As Long = 159  ' Custom/Generic toggle
+Private Const PI_ROW_RC1_RATE     As Long = 160  ' Generic Energy Rate at COD
+Private Const PI_FIRST_PROJ_COL   As Integer = 8
+Private Const PI_BASE_COL         As Integer = 7
 
 ' --- Recalc ladder state ---
 Private mCalcTier As Integer
@@ -181,6 +184,25 @@ End Function
 
 Private Sub WriteHeartbeatHL(ByVal wsRes As Worksheet, ByVal heartbeatText As String)
     wsRes.Range("N1").Value = heartbeatText
+End Sub
+
+' Stamp a "skipped:<reason>" row into __SolverResults and emit the matching
+' heartbeat. Caller is responsible for returning from the function after this.
+Private Sub StampSkipRowHL(ByVal wsRes As Worksheet, _
+                            ByVal resultsRow As Integer, _
+                            ByVal projOffset As Integer, _
+                            ByVal projName As String, _
+                            ByVal dSolveStart As Double, _
+                            ByVal skipMode As String, _
+                            ByVal heartbeatReason As String)
+    wsRes.Cells(resultsRow, 1).Value = projOffset
+    wsRes.Cells(resultsRow, 2).Value = projName
+    wsRes.Cells(resultsRow, 9).Value = False  ' bConverged
+    wsRes.Cells(resultsRow, 12).Value = skipMode
+    wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
+    wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+    wsRes.Cells(resultsRow, 20).Value = "skipped"
+    WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|" & heartbeatReason
 End Sub
 
 ' ==============================================================================
@@ -662,14 +684,10 @@ Public Sub InitSolveEnvHL()
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
-    ' Force iterative calc on regardless of workbook XML state. The IL TEST
-    ' 2026-05-13 regression came from a workbook saved with iterateDelta
-    ' missing from <calcPr/>; we don't want a future regression on the
-    ' Iteration flag itself to silently break the row 31 self-circular
-    ' per-column hard-stamps. Belt-and-suspenders: workbook says iterate=
-    ' True, AND macro asserts it before any solve runs. SetGoalSeekPrecision
-    ' below pins MaxChange to 0.00001 (tighter than the 0.0001 used by
-    ' the working SMP / RP Puma models).
+    ' Iterative calc must stay enabled for the row 31 self-circular
+    ' per-column hard-stamps to converge. Assert here regardless of
+    ' workbook XML state — a workbook saved with iterateDelta missing
+    ' from <calcPr/> would otherwise break the stamps silently.
     Application.Iteration = True
     SetGoalSeekPrecisionHL
     ResetCalcTierHL
@@ -721,64 +739,38 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     dSolveStart = Timer
     WriteHeartbeatHL wsRes, "RUNNING|" & CStr(Now) & "|Project=" & projName & "|col=" & colIdx
 
-    ' Defensive initialization of lOriginalHoldCo BEFORE the early-skip
-    ' block below. If any line between here and the real HoldCo read
-    ' (further down) raises, ProjErr fires with lOriginalHoldCo
-    ' uninitialized — VBA Long defaults to 0, which is invalid HoldCo
-    ' state and would write through to PT_HOLDCO_ONOFF on the error-
-    ' restore path. Default to 1 (HoldCo ON, the post-solve steady
-    ' state in every documented TE structure). The "real" HoldCo read
-    ' further down overwrites this when reached; if the function exits
-    ' via early-skip, no restore happens anyway because no mutation
-    ' was attempted.
+    ' Default HoldCo to 1 (ON, post-solve steady state) so ProjErr can
+    ' safely write through PT_HOLDCO_ONOFF if anything between here and
+    ' the real cell read (post-skip) raises. The real read overwrites
+    ' this when reached.
     Dim lOriginalHoldCo As Long
     lOriginalHoldCo = 1
 
-    ' Pre-flight skip BEFORE the expensive F2 write + CalcForPhase PHASE_FULL
-    ' below. The Tranche 7.1 fix moved the same checks here from after the
-    ' recalc, but those late checks still paid the full pre-loop calc cost
-    ' (5-30 min per placeholder on a 13MB workbook with iterative calc).
-    '
-    ' 2026-05-18 SMP run id=17 post-mortem: Worker 1 skipped its 5
-    ' placeholders fast (iterative calc happened to settle quickly on its
-    ' first hit); Worker 0 stalled 28+ min on Project 8 — iterative calc
-    ' on the first placeholder it encountered (after 3 real solves left
-    ' state in a non-converging configuration) burned the full per-call
-    ' watchdog window. Asymmetric failure between identical workers on
-    ' byte-identical inputs proved the late placement was unsafe.
-    '
-    ' The skip metadata reads come from literal-input cells: row 11
-    ' (MWdc), row 159 (RC1 toggle), row 160 (RC1 Generic rate at COD).
-    ' These are populated directly by the operator / portfolio mapper —
-    ' never formulas — so reading them by direct column index before any
-    ' recalc is safe and deterministic.
+    ' Pre-flight skip BEFORE the F2 write + full recalc below. Skip
+    ' metadata reads (MWdc, RC1 toggle, RC1 rate) come from literal-
+    ' input cells populated by the operator — never formulas — so
+    ' reading them by direct column index pre-recalc is deterministic.
+    ' Placing the skip AFTER the recalc would let a placeholder column
+    ' spin iterative calc for 5-30 min before the cheap check ran.
     Dim dEarlyMWdc As Double
-    dEarlyMWdc = 0
     On Error Resume Next
-    dEarlyMWdc = CDbl(wsPI.Cells(11, colIdx).Value)
+    dEarlyMWdc = CDbl(wsPI.Cells(PI_ROW_MWDC, colIdx).Value)
     On Error GoTo ProjErr
     If dEarlyMWdc <= 0 Then
-        wsRes.Cells(resultsRow, 1).Value = projOffset
-        wsRes.Cells(resultsRow, 2).Value = projName
-        wsRes.Cells(resultsRow, 9).Value = False
-        wsRes.Cells(resultsRow, 12).Value = "skipped:no_mwdc"
-        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
-        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
-        wsRes.Cells(resultsRow, 20).Value = "skipped"
-        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|MWdc=0_or_invalid"
+        StampSkipRowHL wsRes, resultsRow, projOffset, projName, _
+                       dSolveStart, "skipped:no_mwdc", "MWdc=0_or_invalid"
         SolveOneProjectByColHL = 0
         Exit Function
     End If
 
-    ' Custom toggle path is NOT caught here — Custom rates source from
-    ' the Rate Curves tab vector, so a zero in row 160 means nothing for
-    ' them. E15a/E16 preflight catches Custom-with-empty-Name separately.
+    ' Custom-toggle RC1 sources from the Rate Curves tab vector, so a
+    ' zero in row 160 means nothing for it. E15a/E16 preflight catches
+    ' Custom-with-empty-Name separately.
     Dim vEarlyRC1Tog As Variant
     Dim vEarlyRC1Rate As Variant
     Dim bEarlyRC1Empty As Boolean
-    bEarlyRC1Empty = False
-    vEarlyRC1Tog = wsPI.Cells(159, colIdx).Value
-    vEarlyRC1Rate = wsPI.Cells(160, colIdx).Value
+    vEarlyRC1Tog = wsPI.Cells(PI_ROW_RC1_TOGGLE, colIdx).Value
+    vEarlyRC1Rate = wsPI.Cells(PI_ROW_RC1_RATE, colIdx).Value
     If CStr(vEarlyRC1Tog) = "Generic" Then
         If IsNumeric(vEarlyRC1Rate) Then
             If CDbl(vEarlyRC1Rate) = 0 Then bEarlyRC1Empty = True
@@ -787,39 +779,27 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         End If
     End If
     If bEarlyRC1Empty Then
-        wsRes.Cells(resultsRow, 1).Value = projOffset
-        wsRes.Cells(resultsRow, 2).Value = projName
-        wsRes.Cells(resultsRow, 9).Value = False
-        wsRes.Cells(resultsRow, 12).Value = "skipped:no_rc1_revenue"
-        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
-        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
-        wsRes.Cells(resultsRow, 20).Value = "skipped"
-        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|RC1_Generic_zero_rate"
+        StampSkipRowHL wsRes, resultsRow, projOffset, projName, _
+                       dSolveStart, "skipped:no_rc1_revenue", _
+                       "RC1_Generic_zero_rate"
         SolveOneProjectByColHL = 0
         Exit Function
     End If
 
-    ' Save HoldCo state at entry so the error path can restore it. The
-    ' iter loop toggles HoldCo 0→1 within each iIter; an error fired with
-    ' HoldCo=0 would leave the workbook in an inconsistent capital
-    ' structure state for subsequent project solves until the next iter's
-    ' HoldCo cycle. Restoring on error eliminates that cross-project
-    ' bleed (P0-1 from 2026-05-15 reliability review).
+    ' Save HoldCo state so the error path can restore it. The iter loop
+    ' toggles HoldCo 0→1; an error fired with HoldCo=0 would leave the
+    ' workbook in an inconsistent capital structure state for subsequent
+    ' project solves until the next iter's HoldCo cycle.
     '
-    ' GUARD: PT!C134 (the HoldCo toggle) is a formula that depends on the
-    ' currently-active F2. At this point F2 still points at the PREVIOUS
-    ' project, and on rare occasions C134 resolves to an error token
-    ' (#DIV/0! / #VALUE!) when the previous project left the cap stack
-    ' in a transient state. A bare CLng() on an error value raises VBA
-    ' Type Mismatch (13) → 0x800a9c68 to COM, crashing the worker.
-    ' Default to 1 (HoldCo ON) on any non-numeric read — the value is
-    ' only used for restore-on-error and HoldCo=1 is the post-solve
-    ' steady state in every documented TE structure. (2026-05-18 SMP
-    ' post-mortem.)
-    ' lOriginalHoldCo was defensively initialized to 1 at function entry
-    ' (Tranche 7.7); reassign here from the live cell when we reach this
-    ' point (post-skip, F2 is about to be written and the real
-    ' restore-on-error path is meaningful).
+    ' PT!C134 (the HoldCo toggle) is a formula that depends on F2. At
+    ' this point F2 still points at the previous project; on rare
+    ' occasions C134 resolves to #DIV/0!/#VALUE! when the previous
+    ' project left the cap stack in a transient state. A bare CLng() on
+    ' an error value would raise Type Mismatch (13) → 0x800a9c68 to COM.
+    ' Default to 1 (HoldCo ON, post-solve steady state) on any non-
+    ' numeric read. lOriginalHoldCo was pre-initialized to 1 at function
+    ' entry; this reassigns from the live cell now that the skip path is
+    ' past us and the restore-on-error path is meaningful.
     Dim vHoldCoRaw As Variant
     vHoldCoRaw = wsPT.Range(PT_HOLDCO_ONOFF).Value
     If IsNumeric(vHoldCoRaw) Then
@@ -829,13 +809,10 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         lOriginalHoldCo = 1
     End If
 
-    ' Per-step heartbeats. The cost is ~20 extra cell writes per project
-    ' (negligible vs the 60-200s solve time) and they pay for themselves
-    ' the first time a workbook fails — the last heartbeat in
-    ' __SolverResults!N1 names the exact line that threw. Promoted from
-    ' debug instrumentation on 2026-05-13 after they pinpointed an
-    ' openpyxl-save corruption issue on the RP Puma 2026.05.08 workbooks.
-    ' Route OFFSET formulas to this project
+    ' Per-step heartbeats: ~20 extra cell writes per project (negligible
+    ' vs the 60-200s solve time). The last heartbeat in
+    ' __SolverResults!N1 names the exact line that threw if anything
+    ' raises mid-function.
     WriteHeartbeatHL wsRes, "STEP1_F2_WRITE|" & projName
     wsPI.Range(PI_PROJ_INDEX).Value = projOffset
     WriteHeartbeatHL wsRes, "STEP2_RESET_CALC_TIER"
@@ -1107,16 +1084,12 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         dApprGap = 1#
     End If
 
-    ' NOTE: per-column hard-stamps for rows 31/32/33/37/38/39 USED to
-    ' happen here, but the values they captured were a transient cross-
-    ' project state — F37 / F31 / F33 / F39 depend on cell chains that
-    ' shift as subsequent projects' solves modify other columns. The
-    ' verifier (validation/post_merge.verify_merged_file) caught the
-    ' divergence on the SMP WalkTEST 2026-05-12 run. Stamps moved to
-    ' StampActiveProjectColumnHL which Python invokes from the post-
-    ' solve read pass, AFTER all projects have solved AND F2 is set
-    ' back to this project. That's the only moment the workbook is
-    ' simultaneously consistent for every project's column.
+    ' Per-column hard-stamps for rows 31/32/33/37/38/39 happen in
+    ' StampActiveProjectColumnHL, invoked from the post-solve read pass.
+    ' That's the only moment the workbook is simultaneously consistent
+    ' for every project's column — stamping in-loop captured transient
+    ' cross-project state because F37/F31/F33/F39 depend on cell chains
+    ' that shift as later projects solve.
 
     wsRes.Cells(resultsRow, 1).Value = projOffset
     wsRes.Cells(resultsRow, 2).Value = projName
@@ -1189,7 +1162,7 @@ Public Sub SolveHeadless()
     ' --- Save original HoldCo for restore on error ---
     ' Capital structure state must be restored if mid-portfolio error
     ' aborts the loop with HoldCo=0; otherwise the workbook saves with
-    ' an inconsistent debt-stack state across projects (P0-1 from review).
+    ' an inconsistent debt-stack state across projects.
     Dim lngOriginalHoldCo As Long
     lngOriginalHoldCo = CLng(wsPT.Range(PT_HOLDCO_ONOFF).Value)
     If lngOriginalHoldCo <> 0 And lngOriginalHoldCo <> 1 Then lngOriginalHoldCo = 1
@@ -1436,12 +1409,9 @@ Public Sub SolveHeadless()
         dIRRGap = Abs(rIRRLive.Value - rIRRTgt.Value)
         dApprGap = Abs(rApprLive.Value - rWACCTgt.Value)
 
-        ' NOTE: per-column hard-stamps moved to StampActiveProjectColumnHL,
-        ' invoked by Python from the post-solve read pass. The in-loop
-        ' stamps captured a transient cross-project state that the post-
-        ' merge verifier flagged as wrong on the SMP WalkTEST 2026-05-12
-        ' run. See the matching comment in SolveOneProjectByColHL for
-        ' the full rationale.
+        ' Per-column hard-stamps live in StampActiveProjectColumnHL,
+        ' invoked from the post-solve read pass. See the matching
+        ' comment in SolveOneProjectByColHL for rationale.
 
         wsRes.Cells(i + 1, 1).Value = projOffset
         wsRes.Cells(i + 1, 2).Value = arrNames(i)

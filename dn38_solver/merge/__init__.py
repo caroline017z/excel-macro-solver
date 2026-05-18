@@ -43,6 +43,10 @@ from pathlib import Path
 
 from openpyxl.utils import column_index_from_string
 
+from dn38_solver.com.direct_runner import (
+    _capture_excel_proc,
+    _run_macro_with_timeout,
+)
 from dn38_solver.com.vba_contract import STAMP_CONVERGED_VALUES, vba_call_str
 from dn38_solver.types import SolveTask
 
@@ -190,6 +194,7 @@ def merge_via_vba_fallback(
         excel.EnableEvents = False
 
         wb = excel.Workbooks.Open(str(master_src), ReadOnly=False, UpdateLinks=0)
+        excel_proc = _capture_excel_proc(excel)  # for watchdog kill handle
 
         # Verify StampConvergedValuesHL is callable before the per-project
         # loop. Without this check, every per-project Application.Run
@@ -282,11 +287,17 @@ def merge_via_vba_fallback(
                     continue
 
                 try:
-                    excel.Application.Run(
-                        vba_call_str(wb.Name, STAMP_CONVERGED_VALUES),
-                        int(col_idx),
-                        float(npp), float(dev_fee), float(fmv),
-                        float(live_irr), float(appr_live), float(npp_total),
+                    _run_macro_with_timeout(
+                        excel,
+                        (
+                            vba_call_str(wb.Name, STAMP_CONVERGED_VALUES),
+                            int(col_idx),
+                            float(npp), float(dev_fee), float(fmv),
+                            float(live_irr), float(appr_live), float(npp_total),
+                        ),
+                        timeout_sec=60,  # per-cell stamp is sub-second on healthy state
+                        excel_proc=excel_proc,
+                        label=f"StampConvergedValues[{task.project_name}]",
                     )
                 except Exception as stamp_exc:
                     log.error(

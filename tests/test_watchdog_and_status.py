@@ -203,3 +203,60 @@ def test_call_with_timeout_no_kill_handle_logs_no_crash(caplog) -> None:
         )
     assert result == "done"
     assert not any("exceeded" in r.message for r in caplog.records)
+
+
+def test_call_with_timeout_fires_on_slow_call(caplog) -> None:
+    """The watchdog must log a timeout error when the callable runs past
+    timeout_sec. Without this test the timeout could silently fail to
+    fire and the suite wouldn't catch it.
+    """
+    import logging
+    from dn38_solver.com.direct_runner import _call_with_timeout
+
+    with caplog.at_level(logging.ERROR):
+        # Callable runs 0.5s, timeout is 0.1s. The watchdog fires, logs
+        # the exceeded-wall-clock message, then no-ops the kill because
+        # excel_proc is None. fn() runs to completion and returns.
+        result = _call_with_timeout(
+            lambda: (time.sleep(0.5), "late")[1],
+            timeout_sec=0.1,
+            excel_proc=None,
+            label="slow-call",
+        )
+
+    assert result == "late"
+    assert any(
+        "exceeded" in r.message and "slow-call" in r.message
+        for r in caplog.records
+    ), f"Expected timeout-exceeded log for 'slow-call'; got: {[r.message for r in caplog.records]}"
+
+
+# --- orchestrator._parse_project_result honors status='skipped' ------------
+
+def test_orchestrator_parse_project_result_skipped() -> None:
+    """Tranche 7.6 contract: when the worker reports status='skipped',
+    the orchestrator must surface convergence_tier='skipped' and
+    converged=False. Regression here would cause skipped placeholders
+    to drag batch status to NOT_CONVERGED."""
+    from dn38_solver.solver.orchestrator import _parse_project_result
+    from dn38_solver.types import ProjectInfo
+
+    project = ProjectInfo(
+        name="Project 8", col=15, col_letter="O",
+        offset=8, toggle=True,
+    )
+    raw = {
+        "project_name": "Project 8",
+        "project_offset": 8,
+        "status": "skipped",
+        "iterations_used": 0,
+        "solved_values": {},
+        "meta": {"mode": "skipped:no_rc1_revenue", "conv_tier": None},
+    }
+    result = _parse_project_result(project, raw)
+
+    assert result.name == "Project 8"
+    assert result.col_letter == "O"
+    assert result.converged is False
+    assert result.convergence_tier == "skipped"
+    assert result.iterations == 0
