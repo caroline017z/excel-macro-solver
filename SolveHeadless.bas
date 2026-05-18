@@ -790,6 +790,51 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         Exit Function
     End If
 
+    ' Pre-flight: skip placeholder projects with no RC1 revenue stream.
+    ' RC1 (rows 158-162) is the primary energy revenue slot. When Toggle
+    ' is "Generic" but the Generic Energy Rate at COD (row 160) is 0,
+    ' the project has zero modeled revenue → the entire cap stack
+    ' propagates #DIV/0! through PT Returns / NPP Calc / Appraisal, and
+    ' the inner GoalSeek loop spins through all MAX_ITER iterations
+    ' without converging (each iter ~10-30s on a 13MB workbook = 15-30
+    ' min of wasted compute per placeholder).
+    '
+    ' 2026-05-18 SMP run id=16 post-mortem: 10 placeholder columns in
+    ' the workbook would have burned ~3 hours of solver time across
+    ' both workers if not skipped — even with the Tranche 7 defensive
+    ' guards preventing the original 0x800a9c68 crash.
+    '
+    ' Custom toggle path is NOT caught here because Custom rates pull
+    ' from the Rate Curves tab vector (not the Generic Rate cell); a
+    ' project with Toggle="Custom" + populated Rate Name is a real
+    ' revenue stream regardless of what row 160 holds. E15a/E16
+    ' preflight catches Custom-with-empty-Name separately.
+    Dim vRC1Toggle As Variant
+    Dim vRC1Rate As Variant
+    Dim bRC1Empty As Boolean
+    bRC1Empty = False
+    vRC1Toggle = wsPI.Cells(159, colIdx).Value  ' RC1 toggle row
+    vRC1Rate = wsPI.Cells(160, colIdx).Value    ' RC1 Generic Energy Rate at COD
+    If CStr(vRC1Toggle) = "Generic" Then
+        If IsNumeric(vRC1Rate) Then
+            If CDbl(vRC1Rate) = 0 Then bRC1Empty = True
+        ElseIf IsEmpty(vRC1Rate) Or IsNull(vRC1Rate) Then
+            bRC1Empty = True
+        End If
+    End If
+    If bRC1Empty Then
+        wsRes.Cells(resultsRow, 1).Value = projOffset
+        wsRes.Cells(resultsRow, 2).Value = projName
+        wsRes.Cells(resultsRow, 9).Value = False  ' bConverged
+        wsRes.Cells(resultsRow, 12).Value = "skipped:no_rc1_revenue"
+        wsRes.Cells(resultsRow, 13).Value = Round(ProjectElapsedHL(dSolveStart), 4)
+        wsRes.Cells(resultsRow, 14).Value = CStr(Now)
+        wsRes.Cells(resultsRow, 20).Value = "skipped"
+        WriteHeartbeatHL wsRes, "SKIPPED|" & projName & "|RC1_Generic_zero_rate"
+        SolveOneProjectByColHL = 0
+        Exit Function
+    End If
+
     WriteHeartbeatHL wsRes, "STEP5_RANGE_SETUP"
 
     Dim rHoldCo     As Range
