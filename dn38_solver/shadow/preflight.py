@@ -905,9 +905,9 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
     start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
     end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
 
-    # Collect (rc_idx, col_letter, toggle, rate_name) for every active project
-    # × every RC. Used for both checks below.
-    per_project_rc: list[tuple[int, str, object, object]] = []
+    # Collect (rc_idx, col_letter, toggle, rate_name, generic_rate) for every
+    # active project × every RC. Used for E15a, E15b, and E15c.
+    per_project_rc: list[tuple[int, str, object, object, object]] = []
     active_cols: list[int] = []
     for col in range(start_col, end_col + 1):
         toggle = ws.cell(row=PI_ROW_TOGGLE, column=col).value
@@ -918,14 +918,15 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
         for rc_idx, base in enumerate(RC_BLOCK_BASES, start=1):
             rate_name = ws.cell(row=base + 1, column=col).value
             rc_toggle = ws.cell(row=base + 2, column=col).value
-            per_project_rc.append((rc_idx, col_letter, rc_toggle, rate_name))
+            generic_rate = ws.cell(row=base + 3, column=col).value  # Generic Energy Rate at COD
+            per_project_rc.append((rc_idx, col_letter, rc_toggle, rate_name, generic_rate))
 
     if not active_cols:
         return findings  # no projects to check; covered by B9
 
     # E15a — Custom with empty Rate Name
     misconfigured: list[tuple[int, str]] = []
-    for rc_idx, col_letter, rc_toggle, rate_name in per_project_rc:
+    for rc_idx, col_letter, rc_toggle, rate_name, _gr in per_project_rc:
         if rc_toggle != "Custom":
             continue
         if rate_name is None or not str(rate_name).strip():
@@ -942,7 +943,7 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
         )
         findings.append(PreflightFinding(
             code="E15a",
-            severity="error",
+            severity="warning",
             location="Project Inputs Rate Component sub-blocks",
             message=(
                 f"{len(misconfigured)} RC sub-block(s) have Toggle='Custom' "
@@ -973,7 +974,7 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
     mismatched_rcs: list[tuple[int, dict[str, list[str]]]] = []
     for rc_idx in range(1, 7):
         by_toggle: dict[str, list[str]] = {}
-        for r, col_letter, rc_toggle, _ in per_project_rc:
+        for r, col_letter, rc_toggle, _, _gr in per_project_rc:
             if r != rc_idx:
                 continue
             key = str(rc_toggle) if rc_toggle is not None else "(none)"
@@ -1008,6 +1009,83 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
                 "Confirm whether the mixed configuration is intentional. "
                 "If not, flip the outlier projects to match the majority "
                 "mode and verify the Rate Curves tab populates correctly."
+            ),
+            auto_fixable=False,
+        ))
+
+    # E15c — Asymmetric revenue (the actual Queen City failure pattern).
+    # Fires as ERROR when the same RC has BOTH:
+    #   (a) at least one project with Toggle=Generic AND non-zero Generic
+    #       Rate (a real revenue stream the model includes in cap-stack
+    #       sizing for THAT project), AND
+    #   (b) at least one project with Toggle=Custom AND empty Rate Name
+    #       (effectively zero revenue for that project on the same RC).
+    # The Appraisal GoalSeek then compensates by inflating Dev Fee on the
+    # (b) projects until IRR=WACC still holds, producing the $4-5/W Dev
+    # Fees observed on Queen City 2026-05-15.
+    #
+    # Crucially: uniform Custom-empty across ALL active projects is NOT
+    # this case — it just means the RC is intentionally disabled for the
+    # whole portfolio. That's the SMP pattern, and the macro produces
+    # correct output for it. E15c distinguishes the two by requiring (a)
+    # to be non-empty before firing.
+    # Revenue signal: Generic toggle + non-empty Rate Name. The Rate Name
+    # being non-empty is the operator-authored signal that this RC is
+    # contributing a real revenue stream on this project. We deliberately
+    # do NOT inspect the Generic Rate (Project Inputs!base+3) value: under
+    # openpyxl data_only=False that cell may be a formula string rather
+    # than a literal, and the value-pass load happens later in run_preflight.
+    # Rate Name presence is a robust proxy that works regardless of load mode.
+    #
+    # Zero signal: Custom toggle + empty Rate Name (and by implication an
+    # empty per-project Custom rate vector in the Rate Curves tab).
+    asymmetric: list[tuple[int, list[str], list[str]]] = []
+    for rc_idx in range(1, 7):
+        revenue_cols: list[str] = []
+        zero_cols: list[str] = []
+        for r, col_letter, rc_toggle, rate_name, _gr in per_project_rc:
+            if r != rc_idx:
+                continue
+            name_is_set = rate_name is not None and bool(str(rate_name).strip())
+            if rc_toggle == "Generic" and name_is_set:
+                revenue_cols.append(col_letter)
+            elif rc_toggle == "Custom" and not name_is_set:
+                zero_cols.append(col_letter)
+        if revenue_cols and zero_cols:
+            asymmetric.append((rc_idx, revenue_cols, zero_cols))
+
+    if asymmetric:
+        lines = []
+        for rc_idx, rev, zero in asymmetric:
+            lines.append(
+                f"RC{rc_idx}: revenue=[{', '.join(rev)}] vs zeroed=[{', '.join(zero)}]"
+            )
+        findings.append(PreflightFinding(
+            code="E15c",
+            severity="error",
+            location="Project Inputs Rate Component sub-blocks",
+            message=(
+                f"{len(asymmetric)} Rate Component(s) have ASYMMETRIC revenue "
+                "across active projects (Queen City 2026-05-15 failure pattern): "
+                + " | ".join(lines)
+            ),
+            impact=(
+                "Some projects have a real revenue stream (Generic mode with "
+                "non-zero rate); others on the same RC are effectively zeroed "
+                "(Custom mode with empty Rate Name -> empty Custom rate rows). "
+                "The Appraisal GoalSeek will converge for both sets, but the "
+                "zeroed projects' Dev Fees will inflate to compensate for the "
+                "missing revenue (Queen City: $4-5/W Dev Fees on the zeroed "
+                "subset vs $1.50-$2.00/W on the revenue subset, same EPC + IX). "
+                "Mathematically valid, economically nonsensical."
+            ),
+            remediation=(
+                "Decide whether the zeroed projects SHOULD have the same "
+                "revenue stream. If yes, flip them to Generic with the same "
+                "rate as the revenue projects. If no (genuinely no merchant "
+                "revenue for those projects), populate the Custom rate rows "
+                "in the Rate Curves tab with the actual project-specific "
+                "rates. Re-run the RC audit before solving."
             ),
             auto_fixable=False,
         ))

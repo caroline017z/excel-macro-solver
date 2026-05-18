@@ -213,11 +213,12 @@ class TestInputBounds:
         e15a = [f for f in result.findings if f.code == "E15a"]
         assert len(e15a) == 1, f"expected E15a; got: {[f.code for f in result.findings]}"
         assert "RC5" in e15a[0].message
-        # E15a is severity=error because Queen City 2026-05-15 shipped wrong-
-        # but-valid Dev Fees ($4-5/W vs expected $1.50-$2.00/W) when E15 didn't
-        # exist; the macro converges mathematically, just to nonsensical values.
-        # Operator must explicitly fix the config or override to proceed.
-        assert e15a[0].severity == "error"
+        # E15a is severity=warning (informational). It fires whenever any
+        # Custom toggle has an empty Rate Name, but uniform Custom-empty
+        # across all projects is harmless (intentional RC disable, SMP
+        # 2026-05-18 pattern). The ERROR-severity check for the truly
+        # dangerous case is E15c (asymmetric revenue) — see below.
+        assert e15a[0].severity == "warning"
 
     def test_e15b_mixed_modes_across_projects(self, tmp_path):
         """E15b fires when same RC has different Toggle values across active
@@ -252,6 +253,64 @@ class TestInputBounds:
         # All projects have identical (None) toggle → no E15b.
         assert "E15a" not in codes
         assert "E15b" not in codes
+        assert "E15c" not in codes
+
+    def test_e15c_asymmetric_revenue_blocks_solve(self, tmp_path):
+        """E15c fires as ERROR on the Queen City 2026-05-15 pattern: some
+        projects have Generic + non-zero rate, others have Custom + empty
+        Name on the same RC. This is what produced the wrong-but-valid
+        $4-5/W Dev Fees that motivated the whole E15 family."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Project H: RC5 Generic with 5.5% merchant rate (Queen City H-N pattern)
+        ws["H198"] = "Merchant Rate"
+        ws["H199"] = "Generic"
+        ws["H200"] = 0.055
+        # Project I: active, RC5 Custom with empty Name (Queen City O-T pattern)
+        ws["I4"] = "P2"
+        ws["I7"] = 1
+        ws["I32"] = 0.30
+        ws["I38"] = 0.50
+        ws["I198"] = None
+        ws["I199"] = "Custom"
+        wb.save(path)
+
+        result = run_preflight(path)
+        e15c = [f for f in result.findings if f.code == "E15c"]
+        assert len(e15c) == 1, f"expected E15c; got: {[f.code for f in result.findings]}"
+        assert "RC5" in e15c[0].message
+        assert e15c[0].severity == "error"
+
+    def test_e15c_uniform_custom_empty_does_not_fire(self, tmp_path):
+        """E15c must NOT fire when ALL active projects have Custom + empty
+        on the same RC (uniform disable, SMP 2026-05-18 pattern). Without
+        any Generic-with-revenue project, there's no asymmetry."""
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Project H: RC5 Custom + empty (uniform pattern)
+        ws["H198"] = None
+        ws["H199"] = "Custom"
+        # Project I: also RC5 Custom + empty
+        ws["I4"] = "P2"
+        ws["I7"] = 1
+        ws["I32"] = 0.30
+        ws["I38"] = 0.50
+        ws["I198"] = None
+        ws["I199"] = "Custom"
+        wb.save(path)
+
+        result = run_preflight(path)
+        e15c = [f for f in result.findings if f.code == "E15c"]
+        assert e15c == [], (
+            "E15c should NOT fire on uniform Custom-empty (SMP pattern). "
+            f"Got: {[(f.code, f.message) for f in result.findings]}"
+        )
+        # E15a (Custom-with-empty-Name) still fires as a warning for visibility
+        e15a = [f for f in result.findings if f.code == "E15a"]
+        assert len(e15a) == 1
+        assert e15a[0].severity == "warning"
 
     def test_inactive_projects_ignored(self, tmp_path):
         path = _baseline_workbook(tmp_path)
