@@ -3,9 +3,25 @@
 After parallel mode merges per-worker `_SOLVED.xlsm` files into one
 canonical output, this module re-opens the merged file via openpyxl and
 asserts that the hard-stamped convergence cells (Project Inputs rows
-31/32/33/37/38/39 per project) match what each worker reported. Any
+32/33/38/39/371 per project) match what each worker reported. Any
 mismatch is a silent-corruption finding that forces the run to ERROR
 and preserves the parent_tmp directory for forensics.
+
+Rows 31 (Live Appraisal IRR) and 37 (Live Levered Pre-Tax IRR) are
+deliberately NOT verified as of Tranche 7.12. The macro no longer
+hardcodes those cells — they hold sticky-IF circular formulas
+(IF(<col>2=$F$2, $F$<row>, <col><row>)). openpyxl reading with
+data_only=True sees only cached values, and the cache is not
+populated until the workbook is recalc-and-saved through Excel
+interactively (which is the first thing Caroline does after the
+merge anyway). Including 31/37 in the verifier would produce a
+false "cached value missing" mismatch on every run.
+
+Row 371 (Min Equity DSCR Multiple) IS hardcoded per project by the
+post-solve stamp pass — that's the input lock Tranche 7.12 added to
+preserve the audit chain. Verifying it catches silent-corruption in
+the merge of the DSCR multiple just as the original rows 32/33/38/39
+verification catches it for NPP/Dev Fee/FMV/NPP-total.
 
 Why this lives in `validation/` and not `com/`:
 - It does not touch COM. It's a pure openpyxl read against the merged
@@ -30,29 +46,37 @@ from dn38_solver.types import SolveTask
 
 log = logging.getLogger(__name__)
 
-# The six rows VBA hard-stamps via cell-self-assign at end of each
-# project's solve. These are the cells the verifier checks against
-# worker-reported expected values; their values are exactly the ones
-# that ship to IC, so silent corruption here is the highest-cost bug
-# class the merge step can produce.
-HARD_STAMPED_ROWS: tuple[int, ...] = (31, 32, 33, 37, 38, 39)
+# The five rows VBA hard-stamps via cell-self-assign at end of each
+# project's solve, post-Tranche-7.12. These are the cells the verifier
+# checks against worker-reported expected values; their values are
+# exactly the ones that ship to IC (or, for row 371, the upstream input
+# lock that drives the IRR cascade by formula), so silent corruption
+# here is the highest-cost bug class the merge step can produce.
+#
+# Rows 31 and 37 are deliberately excluded — Tranche 7.12 left them as
+# sticky-IF formulas; openpyxl read with data_only=True can't see their
+# values until the workbook is recalc-and-saved through Excel.
+HARD_STAMPED_ROWS: tuple[int, ...] = (32, 33, 38, 39, 371)
 
-# Per-row tolerance for the post-merge gate. Rows 31/32/33/37/38 are
-# dollar-per-watt or rate values (typical magnitude < $5); 1¢/W slack
-# absorbs openpyxl serialization rounding without missing real bugs.
-# Row 39 is NPP $ total — typical $5M-$50M for the portfolios this tool
-# sees. A flat $1 tolerance would silently let a six-figure corruption
-# slip past on a $30M project ($0.5M = 1.7e-5 relative). Row 39 uses a
-# scaled tolerance (see `tolerance_for_row`).
+# Per-row tolerance for the post-merge gate. Rows 32/33/38/371 are
+# dollar-per-watt or unitless multiplier values (typical magnitude < $5
+# or < 2x); 1¢ / 0.01x slack absorbs openpyxl serialization rounding
+# without missing real bugs. Row 39 is NPP $ total — typical $5M-$50M
+# for the portfolios this tool sees. A flat $1 tolerance would silently
+# let a six-figure corruption slip past on a $30M project ($0.5M =
+# 1.7e-5 relative). Row 39 uses a scaled tolerance (see
+# `tolerance_for_row`).
 _VERIFY_TOL_BY_ROW: dict[int, float] = {
-    31: 0.01,
     32: 0.01,
     33: 0.01,
-    37: 0.01,
     38: 0.01,
     # Row 39 entry is unused — `tolerance_for_row` short-circuits with
     # the scaled formula. Kept for symmetry / discoverability.
     39: 1.0,
+    # Row 371: Min Equity DSCR Multiple (Tranche 7.12). Typical solved
+    # values are 1.0x-2.0x; 0.01x slack absorbs roundoff without
+    # missing a corrupt copy that lands the wrong project's DSCR.
+    371: 0.01,
 }
 
 
@@ -75,15 +99,22 @@ def expected_address_for_row(row: int, col_letter: str) -> str:
     """Return the `solved_values` key the verifier should look up for a
     given hard-stamped row in a project's column.
 
-    Rows 31 (Live Appraisal IRR) and 37 (Live IRR) are NOT in
-    READ_CELLS_TEMPLATES as per-column entries — the worker only
-    captures them as the active-project F-column (`F31`, `F37`). The VBA
-    hard-stamps the per-column cell at end-of-solve to the same value,
-    so the merged file's `{col}31` / `{col}37` SHOULD equal `F31` / `F37`
-    that the worker reported. Without this mapping, the verifier silently
-    skipped rows 31 and 37 entirely (the bug Backend #1 found in round-2
-    review).
+    Row 371 (Min Equity DSCR Multiple) is hard-stamped by the macro to
+    the per-column cell, but the worker only captures the LIVE single
+    cell `PT Returns!F129` (that's what READ_CELLS_TEMPLATES holds).
+    The macro reads PT!F129 mid-solve and stamps it onto PI!<col>!371
+    at end-of-solve, so the worker-reported PT!F129 IS the expected
+    value for the merged PI!<col>!371. Map row 371 to that key.
+
+    Rows 31 (Live Appraisal IRR) and 37 (Live IRR) were similarly
+    mapped to F31/F37 before Tranche 7.12, but they're no longer in
+    HARD_STAMPED_ROWS — the macro leaves them as sticky-IF formulas
+    so the audit chain stays intact. They'll never reach this function
+    via the verifier loop today, but defensive callers can still pass
+    them and get the F-column key back.
     """
+    if row == 371:
+        return "PT Returns!F129"
     if row in (31, 37):
         return f"Project Inputs!F{row}"
     return f"Project Inputs!{col_letter}{row}"
@@ -109,7 +140,7 @@ def verify_merged_file(
     consult the per-worker outputs.
 
     The check covers BOTH converged and non-converged projects: a project
-    that didn't converge still got its row 31/32/33/37/38/39 cells
+    that didn't converge still got its row 32/33/38/39/371 cells
     hard-stamped by VBA (cell-self-assign in SolveOneProjectByColHL), so
     a corrupt merge of a non-converged project's column is just as bad
     as a converged one's. Projects that were `not_attempted` (worker

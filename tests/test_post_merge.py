@@ -211,3 +211,118 @@ def test_verifier_still_catches_real_corruption_on_converged_project(
     assert any("H38" in m for m in mismatches), (
         f"Expected H38 mismatch flagged (NPP corruption). Got: {mismatches}"
     )
+
+
+# --- Tranche 7.14: verifier targets 32/33/38/39/371, skips 31/37 -----------
+# Tranche 7.12 left rows 31/37 as sticky-IF formulas (audit chain). openpyxl
+# read with data_only=True can't see their values until the workbook is
+# recalc-and-saved through Excel, so verifying them produces false-positive
+# mismatches on every parallel run. Tranche 7.14 drops them from the verifier
+# and adds row 371 (Min Equity DSCR Multiple — the upstream input lock that
+# Tranche 7.12 introduced).
+
+def test_verifier_skips_rows_31_and_37_post_tranche_7_12() -> None:
+    """HARD_STAMPED_ROWS must NOT include 31 or 37. Regression here
+    resurrects the false-positive "cached value missing" mismatch
+    Caroline hit on the Project Violet 2026-05-19 solve.
+    """
+    from dn38_solver.validation.post_merge import HARD_STAMPED_ROWS
+
+    assert 31 not in HARD_STAMPED_ROWS, (
+        "Row 31 (Live Appraisal IRR) is a sticky-IF formula per "
+        "Tranche 7.12 — verifier can't read its value via "
+        "data_only=True and would always flag a false mismatch"
+    )
+    assert 37 not in HARD_STAMPED_ROWS, (
+        "Row 37 (Live Levered Pre-Tax IRR) is a sticky-IF formula per "
+        "Tranche 7.12 — verifier can't read its value via "
+        "data_only=True and would always flag a false mismatch"
+    )
+    assert 371 in HARD_STAMPED_ROWS, (
+        "Row 371 (Min Equity DSCR Multiple) is the Tranche 7.12 "
+        "upstream input lock — must be verified to catch silent "
+        "corruption of the per-project DSCR in the merge step"
+    )
+
+
+def test_verifier_row_371_maps_to_pt_returns_f129() -> None:
+    """The per-column PI 371 hardcode in the merged file must verify
+    against the worker-reported `PT Returns!F129` value (the live DSCR
+    multiple the macro reads mid-solve and stamps onto PI 371 at
+    end-of-solve). Without this mapping the verifier looks up
+    `Project Inputs!H371` in solved_values, finds None, and silently
+    skips — invisible to operators if the merge corrupted the column.
+    """
+    from dn38_solver.validation.post_merge import expected_address_for_row
+
+    assert expected_address_for_row(371, "H") == "PT Returns!F129", (
+        "Row 371 must map to PT Returns!F129 (the worker's solved "
+        "DSCR multiple), not Project Inputs!H371 (per-column copy "
+        "the worker never captures directly)"
+    )
+
+
+def test_verifier_validates_row_371_against_pt_f129(tmp_path: Path) -> None:
+    """End-to-end: verifier picks up row 371 DSCR mismatches.
+
+    Workbook has H371 = 1.50 (DSCR multiple for the solved project).
+    Worker reports PT Returns!F129 = 1.50 → no mismatch (clean merge).
+    Then we corrupt H371 to 0.80 and re-run: verifier flags H371.
+    """
+    # Build a minimal workbook with row 371 populated.
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Project Inputs"
+    # Other hard-stamped rows (32/33/38/39) — clean numerics matching
+    # worker reports.
+    ws.cell(row=32, column=8, value=2.0901)
+    ws.cell(row=33, column=8, value=4.1102)
+    ws.cell(row=38, column=8, value=0.8205)
+    ws.cell(row=39, column=8, value=5_700_000)
+    # Row 371: the Tranche 7.12 DSCR multiple lock.
+    ws.cell(row=371, column=8, value=1.50)
+    merged = tmp_path / "merged_with_row_371.xlsx"
+    wb.save(merged)
+
+    task = _make_task(name="Greenlee I", col_letter="H", col_idx=8)
+    worker_results = {
+        0: {
+            "project_results": [
+                {
+                    "project_name": "Greenlee I",
+                    "project_offset": 1,
+                    "status": "converged",
+                    "solved_values": {
+                        "Project Inputs!H32": 2.0901,
+                        "Project Inputs!H33": 4.1102,
+                        "Project Inputs!H38": 0.8205,
+                        "Project Inputs!H39": 5_700_000,
+                        "PT Returns!F129": 1.50,
+                    },
+                    "meta": {"project_offset": 1, "mode": "ok"},
+                },
+            ],
+        },
+    }
+
+    mismatches = verify_merged_file(
+        final_path=merged,
+        worker_results=worker_results,
+        partitions=[[task]],
+    )
+    assert mismatches == [], (
+        f"Clean merge of row 371 must produce zero mismatches. Got: {mismatches}"
+    )
+
+    # Now corrupt H371 to 0.80 and re-verify — must flag.
+    wb2 = openpyxl.load_workbook(merged)
+    wb2["Project Inputs"].cell(row=371, column=8, value=0.80)
+    wb2.save(merged)
+    mismatches2 = verify_merged_file(
+        final_path=merged,
+        worker_results=worker_results,
+        partitions=[[task]],
+    )
+    assert any("H371" in m for m in mismatches2), (
+        f"Expected H371 mismatch flagged (DSCR corruption). Got: {mismatches2}"
+    )
