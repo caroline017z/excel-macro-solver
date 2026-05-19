@@ -126,10 +126,9 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     place on exhaustion so the NEXT successful write still recovers state
     — and so debug forensics show the failing payload.
 
-    Root cause history: Queen City 2026-05-14 run logged
-    `WinError 5: Access is denied` on this rename without any retry, even
-    though both worker macros had completed successfully. A single retry
-    would have salvaged the run.
+    Without the retry, a transient `WinError 5: Access is denied` from
+    AV / Streamlit reader / file-index service silently drops a status
+    update even when the underlying solve succeeded.
     """
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     try:

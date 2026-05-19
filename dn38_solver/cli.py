@@ -161,13 +161,11 @@ def main() -> None:
         type=int,
         default=3600,
         help=(
-            "Per-worker solver macro timeout threshold in seconds (default: 3600). "
-            "Heuristic: ~150s/project on the chunked path including warm-up + "
-            "per-project recalc, so 1 hr covers up to ~24 projects per worker "
-            "with margin. The old 1800s default tripped on real 13-project "
-            "portfolios (Queen City 2026-05-14 incident: worker 0 hit 1859s "
-            "mid-Wheeler, parent killed both workers, all results discarded). "
-            "Threshold fires the run-level error status post-hoc, not an "
+            "Per-worker solver macro timeout threshold in seconds "
+            "(default: 3600). Heuristic: ~150s/project on the chunked "
+            "path including warm-up + per-project recalc, so 1 hr "
+            "covers ~24 projects per worker with margin. Threshold "
+            "fires the run-level error status post-hoc, not an "
             "in-flight cancel."
         ),
     )

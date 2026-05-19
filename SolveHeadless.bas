@@ -71,10 +71,14 @@ Private Const PI_WACC_TARGET    As String = "F30"
 Private Const PI_ROW_TOGGLE       As Long = 7
 Private Const PI_ROW_NAME         As Long = 4
 Private Const PI_ROW_MWDC         As Long = 11
-Private Const PI_ROW_NPP          As Long = 38
+Private Const PI_ROW_APPR_LIVE    As Long = 31    ' Live Appraisal IRR per-column
 Private Const PI_ROW_DEV_FEE      As Long = 32
-Private Const PI_ROW_RC1_TOGGLE   As Long = 159  ' Custom/Generic toggle
-Private Const PI_ROW_RC1_RATE     As Long = 160  ' Generic Energy Rate at COD
+Private Const PI_ROW_FMV          As Long = 33
+Private Const PI_ROW_IRR_LIVE     As Long = 37    ' Live (post-tax) IRR per-column
+Private Const PI_ROW_NPP          As Long = 38
+Private Const PI_ROW_NPP_TOTAL    As Long = 39
+Private Const PI_ROW_RC1_TOGGLE   As Long = 159   ' Custom/Generic toggle
+Private Const PI_ROW_RC1_RATE     As Long = 160   ' Generic Energy Rate at COD
 Private Const PI_FIRST_PROJ_COL   As Integer = 8
 Private Const PI_BASE_COL         As Integer = 7
 
@@ -589,19 +593,19 @@ Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)
     Application.CalculateFull
     Application.MaxIterations = lSavedMaxIter
 
-    ' Live IRR / Live Appraisal — read from F-column live cells, not self-
-    ' assign (the per-column IF is circular; self-assign returns the
-    ' cached side of the IF).
-    wsPI.Cells(37, colIdx).Value = wsPI.Range(PI_IRR_LIVE).Value
-    wsPI.Cells(31, colIdx).Value = wsPI.Range(PI_APPR_LIVE).Value
+    ' Live IRR / Live Appraisal — read from F-column live cells, not
+    ' self-assign (the per-column IF is circular; self-assign returns
+    ' the cached side of the IF).
+    wsPI.Cells(PI_ROW_IRR_LIVE, colIdx).Value = wsPI.Range(PI_IRR_LIVE).Value
+    wsPI.Cells(PI_ROW_APPR_LIVE, colIdx).Value = wsPI.Range(PI_APPR_LIVE).Value
 
     ' Dev Fee, NPP $/W (GoalSeek changing-cells, already numeric) and
     ' FMV, NPP $ total (formulas) — self-assign via the IsError-guarded
     ' helper.
-    HardStampNumericHL wsPI, 32, colIdx, "POSTREAD"
-    HardStampNumericHL wsPI, 38, colIdx, "POSTREAD"
-    HardStampNumericHL wsPI, 33, colIdx, "POSTREAD"
-    HardStampNumericHL wsPI, 39, colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, PI_ROW_DEV_FEE,  colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, PI_ROW_NPP,      colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, PI_ROW_FMV,      colIdx, "POSTREAD"
+    HardStampNumericHL wsPI, PI_ROW_NPP_TOTAL, colIdx, "POSTREAD"
 End Sub
 
 
@@ -642,12 +646,12 @@ Public Sub StampConvergedValuesHL(ByVal colIdx As Integer, _
 
     Dim wsPI As Worksheet
     Set wsPI = ThisWorkbook.Sheets(SHT_PI)
-    wsPI.Cells(PI_ROW_NPP, colIdx).Value = npp
-    wsPI.Cells(PI_ROW_DEV_FEE, colIdx).Value = devFee
-    wsPI.Cells(33, colIdx).Value = fmv
-    wsPI.Cells(37, colIdx).Value = liveIRR
-    wsPI.Cells(31, colIdx).Value = apprLive
-    wsPI.Cells(39, colIdx).Value = nppTotal
+    wsPI.Cells(PI_ROW_NPP,       colIdx).Value = npp
+    wsPI.Cells(PI_ROW_DEV_FEE,   colIdx).Value = devFee
+    wsPI.Cells(PI_ROW_FMV,       colIdx).Value = fmv
+    wsPI.Cells(PI_ROW_IRR_LIVE,  colIdx).Value = liveIRR
+    wsPI.Cells(PI_ROW_APPR_LIVE, colIdx).Value = apprLive
+    wsPI.Cells(PI_ROW_NPP_TOTAL, colIdx).Value = nppTotal
 
     ' Append an audit row to __SolverResults so a bad merge is forensically
     ' recoverable. Columns mirror the per-solve schema, prefixed "merge"

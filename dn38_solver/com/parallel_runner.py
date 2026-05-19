@@ -124,10 +124,9 @@ class _WorkerLogTailer(threading.Thread):
                     chunk = fh.read(size - offset)
             except OSError:
                 continue
-            # Decode UTF-8 then strip non-ASCII so the parent's stdout writer
-            # (cp1252 on Windows) can't crash mid-line on a stray Unicode char
-            # that would silence the rest of the worker's output. Replacement
-            # character (U+FFFD) is the specific failure mode from 2026-05-15.
+            # Decode UTF-8 then strip non-ASCII so the parent's stdout
+            # writer (cp1252 on Windows) can't crash mid-line on a stray
+            # Unicode char and silence the rest of the worker's output.
             text = (
                 chunk.decode("utf-8", errors="replace")
                 .encode("ascii", errors="replace")
@@ -323,14 +322,13 @@ def run_parallel(
     worker_results: dict[int, dict] = {}
     project_results: list[dict] = []
 
-    # Cap Excel threads per worker so N × Excel doesn't oversubscribe CPU.
-    # Validated empirically on SMP WalkTEST: cpu_count // n_workers (24/2=12)
-    # produced ZERO speedup vs single-worker because the 24 calc threads
-    # competed with the OS, pywin32, the aggregator, and the live-progress
-    # tailer for the same 24 cores. Excel's multi-threaded recalc has
-    # sharply diminishing returns past ~4 threads anyway, so the default
-    # is a conservative cap that leaves headroom for coordination overhead.
-    # User can override via the CLI flag if their workload differs.
+    # Cap Excel threads per worker so N × Excel doesn't oversubscribe
+    # CPU. cpu_count // n_workers (e.g., 24/2=12) produced zero speedup
+    # in practice because the calc threads competed with the OS,
+    # pywin32, the aggregator, and the live-progress tailer for the
+    # same cores. Excel's multi-threaded recalc has sharply diminishing
+    # returns past ~4 threads, so the default is conservative and
+    # leaves headroom for coordination overhead. CLI flag can override.
     #
     # Semantics of `excel_threads_per_worker`:
     #   None    -> use the default 1/3-of-cores cap (per-worker)

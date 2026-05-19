@@ -1,22 +1,19 @@
 """dn38_solver.com.auto_recovery — Re-import macro + retry once on first
 COM exception from a per-project solve.
 
-Motivated by the 2026-05-13 RP Puma incident: a stale workbook state
-(left by an earlier openpyxl save) caused SolveOneProjectByColHL to
-throw a generic COM error. The fix was a second `import_vba_module.py`
-pass — Excel COM's SaveAs fully rewrote the file and cleared the
-corruption. The solver itself was fine.
-
-This module wraps that recovery as an automatic single-shot retry: when
-SolveOneProjectByColHL throws a decode-as-auto-recoverable error on
-the first project of a worker, the worker closes the workbook, hands
-off to a fresh Excel session to re-import the .bas, reopens, and
-retries the failed project once. If the retry also fails, the worker
-gives up — no infinite recovery loops.
+A stale workbook state (typically left by an earlier openpyxl save that
+rewrote a part the macro depends on) causes SolveOneProjectByColHL to
+throw a generic COM error. A fresh `import_vba_module.py` pass — Excel
+COM's SaveAs fully rewriting the file — clears the corruption. This
+module wraps that recovery as an automatic single-shot retry: when
+SolveOneProjectByColHL throws an auto-recoverable error on the first
+project of a worker, the worker closes the workbook, hands off to a
+fresh Excel session to re-import the .bas, reopens, and retries. If
+the retry also fails, the worker gives up — no infinite recovery loops.
 
 The retry is per-WORKBOOK, not per-project. Once a workbook has been
 re-imported during a run, subsequent failures don't trigger another
-re-import (the recovery is already in effect).
+re-import.
 """
 from __future__ import annotations
 
@@ -121,12 +118,11 @@ def with_recovery(
     try:
         retry_callable()
     except RuntimeError as e:
-        # Narrow to RuntimeError because that's the type _retry raises in
-        # direct_runner.py. A broad `except Exception` would swallow real
-        # COM exceptions (e.g., new HRESULT during retry), which deserve
-        # to propagate up the stack with their actual error info rather
-        # than be flattened into "retry also failed" (Agent 1 P2-8 from
-        # the 2026-05-15 audit).
+        # Narrow to RuntimeError (the type _retry raises in
+        # direct_runner.py). A broad `except Exception` would swallow
+        # real COM exceptions during retry, which deserve to propagate
+        # with their actual error info rather than get flattened into
+        # "retry also failed."
         log.warning("  Auto-recovery: retry also failed: %s", e)
         return False
 

@@ -422,19 +422,25 @@ def run_direct(
                 ", ".join(rejected),
             )
         if safe_to_strip:
-            # KNOWN-RISKY PATTERN: openpyxl save on an .xlsm pre-solve can
-            # corrupt workbook state (data validation extLst, calcChain,
-            # cond formatting) in ways the macro tolerates for direct
-            # writes but rejects during the first GoalSeek. Mitigated by
-            # auto-recovery (com.auto_recovery.with_recovery): if the
-            # solve throws an auto-recoverable HRESULT, recovery re-runs
-            # import_vba_module.py whose Excel COM SaveAs rewrites the
-            # file and clears the corruption.
+            # KNOWN-RISKY PATTERN: openpyxl save on an .xlsm pre-solve
+            # can corrupt workbook state (data validation extLst,
+            # calcChain, cond formatting) in ways the macro tolerates
+            # for direct writes but rejects during the first GoalSeek.
+            #
+            # Safety net: the strip runs ONCE, before any solve. If the
+            # first macro call hits an auto-recoverable HRESULT,
+            # auto_recovery.with_recovery closes the workbook and
+            # invokes import_vba_module.py, whose Excel COM SaveAs
+            # rewrites the file. That rewrite clears the openpyxl
+            # artifacts. The strip is NOT re-run on retry, so the
+            # recovery loop cannot re-introduce the corruption.
+            # Stripped sheets remain stripped (intended); the artifacts
+            # that broke the first solve are gone.
             #
             # DO NOT add new openpyxl.save() sites on .xlsm files. Use
-            # dn38_solver.com.com_edit.edit_xlsm — it routes the mutation
-            # through Excel COM SaveAs (FileFormat=52), which has been
-            # verified not to corrupt state.
+            # dn38_solver.com.com_edit.edit_xlsm — it routes the
+            # mutation through Excel COM SaveAs (FileFormat=52), which
+            # has been verified not to corrupt state.
             try:
                 import openpyxl
                 wb_strip = openpyxl.load_workbook(str(temp_path), keep_vba=True)

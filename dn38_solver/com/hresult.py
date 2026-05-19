@@ -8,7 +8,7 @@ This module pattern-matches common COM exception shapes and returns a
 single-line human-readable hint + a flag indicating whether automatic
 recovery is worth attempting.
 
-Verified failure modes (2026-05-13 RP Puma incident):
+Verified failure modes:
 - DISP_E_EXCEPTION (-2147352567 / 0x80020009) with secondary -2146788248
   (0x800a9c68): generic VBA runtime error inside Application.Run.
   Almost always means the workbook state is stale relative to the macro.
@@ -182,12 +182,11 @@ def format_decoded(d: DecodedComError) -> str:
     lines.append(f"    Likely:     {d.likely_cause}")
     lines.append(f"    Recovery:   {d.recovery}")
     if d.auto_recoverable:
-        # ASCII-only — this string flows through the worker's stderr (cp1252
-        # by default) and then through the parent's tailer, which decodes as
-        # UTF-8 with errors="replace". An em-dash here becomes U+FFFD on the
-        # round-trip and crashes the parent's stdout writer mid-tail, silencing
-        # ALL subsequent worker output (the 2026-05-15 SMP 50-min hang root
-        # cause). Stick to ASCII in operator-visible strings on this path.
+        # ASCII-only — this string flows through the worker's stderr
+        # (cp1252) and then through the parent's tailer (UTF-8 with
+        # errors="replace"). An em-dash becomes U+FFFD on the round-trip
+        # and crashes the parent's stdout writer mid-tail, silencing all
+        # subsequent worker output. Stick to ASCII on this path.
         lines.append(
             "    Auto-recovery: ELIGIBLE -- orchestrator will attempt re-import + retry once"
         )

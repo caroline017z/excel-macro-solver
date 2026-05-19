@@ -174,8 +174,7 @@ def verify_merged_file(
         # Read all hard-stamped rows in a single iter_rows pass.
         # values_only=True with manual offset tracking — values_only=False
         # returns EmptyCell stubs for blank cells in read_only mode and
-        # EmptyCell does NOT have .row / .column attributes, which
-        # crashed the verifier on the first SMP WalkTEST run.
+        # EmptyCell has no .row / .column attributes.
         cell_values: dict[tuple[int, int], object] = {}
         first_row = min(HARD_STAMPED_ROWS)
         for row_offset, row_values in enumerate(ws.iter_rows(
@@ -197,30 +196,24 @@ def verify_merged_file(
                     continue
                 if pr.get("status") in ("not_attempted", "skipped"):
                     continue
-                # Defense-in-depth: also bypass on meta["mode"] sentinel
+                # Defense-in-depth: bypass on meta["mode"] sentinel too,
                 # in case a future worker version forgets to translate
-                # skip-mode into status="skipped". Tranche 7.2 fast-skip
-                # leaves the project's hard-stamped cells (rows
-                # 31/32/33/37/38/39) untouched — the macro exits before
-                # the cell-self-assign block. The worker still does a
-                # post-solve F-column read, which returns whatever was in
-                # those cells (typically an Excel error). COM marshals
-                # the error as a numeric sentinel; openpyxl re-reads the
-                # same cell as '#NUM!'. Comparing them produced 10
-                # false-positive "mismatches" per SMP run id=18.
+                # skip-mode into status="skipped". The fast-skip leaves
+                # the project's hard-stamped cells untouched; the
+                # worker's post-solve F-column read returns an Excel
+                # error that COM marshals as a numeric sentinel while
+                # openpyxl reads it as '#NUM!' — comparing the two
+                # produces false-positive mismatches.
+                #
+                # stamp_skipped:<context> is written by HardStampNumericHL
+                # when a per-cell stamp fails mid-project, leaving the
+                # hard-stamped row in a partial state. Same bypass logic
+                # applies.
                 meta = pr.get("meta") or {}
                 mode = meta.get("mode")
                 if isinstance(mode, str) and (
                     mode.startswith("skipped:") or mode.startswith("stamp_skipped:")
                 ):
-                    # stamp_skipped:<context> is written by VBA's
-                    # HardStampNumericHL guard when a per-cell stamp
-                    # fails mid-project. The project's hard-stamped row
-                    # state is partial; verifying it against the worker
-                    # report would flag whichever cells the stamp
-                    # missed. Tranche 7.5 added the skipped:* check;
-                    # this completes the defense for the stamp-failure
-                    # branch (Agent A review #3).
                     continue
                 sv = pr.get("solved_values", {})
                 col_idx = column_index_from_string(task.project_col_letter)

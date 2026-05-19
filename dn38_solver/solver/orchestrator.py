@@ -94,11 +94,10 @@ def _parse_project_result(
         # exclude these from the wall-time-vs-sequential comparison).
         tier = "not_attempted"
     elif raw_status == "skipped":
-        # Tranche 7.6: VBA fast-skip path bypassed this project pre-solve
-        # (placeholder column with no RC1 revenue, or MWdc=0). Distinct
-        # from not_attempted (which is a worker crash) — operator chose
-        # to leave these in the workbook but they have no real economics.
-        # Should not count against batch-level convergence rollup.
+        # VBA fast-skip bypassed this project pre-solve (placeholder
+        # column with no RC1 revenue, or MWdc=0). Distinct from
+        # not_attempted (worker crash) — these are deliberate bypasses
+        # and shouldn't count against batch-level convergence rollup.
         tier = "skipped"
     elif isinstance(tier_raw, str) and tier_raw in _VALID_TIERS:
         tier = tier_raw
@@ -230,8 +229,7 @@ def solve_all(
             # min of openpyxl loading for guaranteed-identical results.
             # Instead, re-check ONLY the D-tier (cheap zip-level reads,
             # ~10ms) and filter the stale D-codes out of the existing
-            # preflight result. Same pattern Tranche 4 used for auto-fix's
-            # A1 re-check.
+            # preflight result.
             log.info("  Auto-import-macro: re-checking D15/D17 against updated workbook...")
             new_d_findings: list = []
             new_d_findings.extend(check_macro_version(workbook_path))
@@ -630,15 +628,14 @@ def solve_all(
 
         # Run-level convergence applies the --allow-relaxed policy. The
         # per-project ProjectResult.converged field stays strict-only --
-        # downstream consumers reading individual records get the unchanged
-        # strict semantics. Only the rolled-up run status is affected here.
+        # downstream consumers reading individual records get the
+        # unchanged strict semantics. Only the rolled-up run status is
+        # affected here.
         #
-        # Tranche 7.6: skipped projects (VBA fast-skip for placeholders)
-        # are treated as run-level OK. A workbook with 5 real + 10
-        # placeholders should report run status = CONVERGED if all 5
-        # reals converged, not NOT_CONVERGED because the operator left
-        # placeholders in the column list. The operator already sees
-        # SKIP* labels in the per-project table.
+        # Skipped projects (VBA fast-skip for placeholders) are treated
+        # as run-level OK so a workbook with 5 real + 10 placeholders
+        # reports CONVERGED if all 5 reals converged. Operator already
+        # sees SKIP* labels in the per-project table.
         def _ok_at_run_level(pr: ProjectResult) -> bool:
             if pr.converged:
                 return True

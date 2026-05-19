@@ -27,14 +27,11 @@ Three categories of checks, each with a stable error code:
        C12 Errors on Appraisal!H161 (the XIRR readout)
   D. Embedded VBA macro version. The repo's SolveHeadless.bas evolves
      (yesterday alone added phase-scoped recalc, hard-stamp post-read pass,
-     parallel-runner trust gates). Workbooks where the macro hasn't been
-     re-imported run an OUTDATED macro version that's missing critical
-     functions; the orchestrator calls them via Application.Run and they
-     silently fail (or fall through On Error Resume Next), leaving the
-     solve in a half-broken state. Confirmed root cause of the IL TEST
-     2026-05-13 regression: that workbook had a 627-line macro vs the
-     1220-line current; missing CalcSheetsForAppraisal, ClassifyConver-
-     genceHL, StampActiveProjectColumnHL, and 8 others.
+     parallel-runner trust gates). Workbooks where the macro hasn't
+     been re-imported run an OUTDATED macro version missing critical
+     functions; the orchestrator calls them via Application.Run and
+     they silently fail (or fall through On Error Resume Next),
+     leaving the solve in a half-broken state.
        D15 Embedded macro is missing required functions
        D16 Embedded macro has leftover stale modules
   E. Input-range checks against the macro's hardcoded bounds. The chunked
@@ -60,6 +57,7 @@ import logging
 import re
 import shutil
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import msgspec
@@ -74,10 +72,10 @@ from dn38_solver.shadow.validation import (
 
 log = logging.getLogger(__name__)
 
-# Tolerance ceiling for the iterative-calc engine. Below this value GoalSeek's
-# Appraisal inner loop converges reliably across the IL/SMP/RP-Puma models.
-# Above it (Excel's default 0.001) the loop bisects on half-converged H161
-# and slides Dev Fee to floor — observed on 38DN-IL_US Solar 2026-05-13.
+# Tolerance ceiling for the iterative-calc engine. Below this value
+# GoalSeek's Appraisal inner loop converges reliably. Above it (Excel's
+# default 0.001) the loop bisects on a half-converged H161 and slides
+# Dev Fee to the floor.
 ITERATE_DELTA_CEILING = 0.0001
 
 # Sheets the macro requires. Missing any of these crashes SolveHeadless or
@@ -119,46 +117,48 @@ APPRAISAL_CASHFLOW_ROWS = (155, 156, 157, 158, 159)
 # pre-flight can warn before the macro's chunked path resets out-of-range
 # values to seed values. If the .bas constants change, update these too —
 # there's no clean import path because the macro is not Python.
-NPP_BOUNDS = (-0.2, 2.0)         # NPP_MIN, NPP_MAX (raised 2026-05-14 for Project Violet's utility-scale pricing range)
-DEV_FEE_BOUNDS = (0.05, 5.5)     # DEV_FEE_MIN, DEV_FEE_MAX (raised 2026-05-15 for MD Queen City portfolio's $4.46–$5.49/W Dev Fees)
+NPP_BOUNDS = (-0.2, 2.0)         # NPP_MIN, NPP_MAX — bounds widened for utility-scale ranges
+DEV_FEE_BOUNDS = (0.05, 5.5)     # DEV_FEE_MIN, DEV_FEE_MAX — bounds widened to cover concentrated-portfolio Dev Fees
 PI_ROW_NPP = 38
 PI_ROW_DEV_FEE = 32
 PI_ROW_TOGGLE = 7
-PI_PROJECT_COL_RANGE = ("H", "BG")  # H..BG = 8..59, mirrors SolveHeadless COL_SCAN_LIMIT=60.
-# Originally ("H", "S") which silently truncated to 12 columns — caused Queen City
-# 2026-05-15 to miss Wheeler (col T) entirely in E13/E15. The actual project loop
-# in PI extends as far as macro COL_SCAN_LIMIT; preflight had a narrower view.
-# Inactive columns past the last toggled-on project are no-ops (row 7 != 1).
+# H..BG = 8..59, mirrors SolveHeadless COL_SCAN_LIMIT=60. The range
+# must reach the macro's scan limit; a shorter range would silently
+# miss projects in late columns. Inactive columns past the last
+# toggled-on project are no-ops (row 7 != 1).
+PI_PROJECT_COL_RANGE = ("H", "BG")
+APPRAISAL_CASHFLOW_MAX_COL = "UC"  # right-edge bound for the cashflow error scan
 
-# Rate Component sub-block layout in Project Inputs. Six RCs, one block each.
-# Per Caroline's devengine-model-map: PI sub-blocks at 157/167/177/187/197/207.
-# Within each block: +1 = Rate Name, +2 = Custom/Generic toggle, +5 = Term.
-# The check below uses Rate Name (base+1) and Toggle (base+2) to detect the
-# Queen City 2026-05-15 failure mode: a project with Toggle="Custom" but
-# Rate Name empty leaves a $0.055/kWh merchant-rate revenue stream unfunded,
-# which the model compensates for with an inflated Dev Fee at solve time.
+# Rate Component sub-block layout in Project Inputs. Six RCs, one block
+# each, at rows 157/167/177/187/197/207. Within each block:
+# +1 = Rate Name, +2 = Custom/Generic toggle, +5 = Term. The E15
+# check uses Rate Name and Toggle to detect Toggle="Custom" with empty
+# Rate Name — leaves the revenue stream unfunded, which the model
+# compensates for with an inflated Dev Fee at solve time.
 RC_BLOCK_BASES = (157, 167, 177, 187, 197, 207)  # RC1..RC6
+RC_OFFSET_NAME = 1
+RC_OFFSET_TOGGLE = 2
+RC_OFFSET_GEN_RATE = 3
 
 # Marker function names that must exist in the embedded macro for the
-# CURRENT orchestrator to drive the workbook correctly. Each is an entry
-# point or core helper added in a specific commit; absence implies the
-# workbook hasn't had the latest macro re-imported. We scan the binary
-# vbaProject.bin for these as plain ASCII tokens — VBA's compressed-
-# storage format leaves identifier strings readable. Cheap (~10ms on the
-# 215KB binary) and avoids requiring Excel COM at preflight time.
+# current orchestrator to drive the workbook correctly. Absence implies
+# the workbook hasn't had the latest macro re-imported. Scanned as ASCII
+# tokens in vbaProject.bin — VBA's compressed-storage format leaves
+# identifier strings readable. ~10ms on the 215KB binary, no Excel COM
+# needed at preflight time.
 REQUIRED_MACRO_FUNCTIONS = (
     "SolveHeadless",                # entry point (single-shot)
     "InitSolveEnvHL",               # entry point (chunked init)
     "SolveOneProjectByColHL",       # entry point (chunked per-project)
     "FinalizeSolveEnvHL",           # entry point (chunked finalize)
-    "CalcSheetsForAppraisal",       # phase-scoped recalc (added 2026-04-29)
+    "CalcSheetsForAppraisal",       # phase-scoped recalc
     "CalcSheetsForNPP",             # phase-scoped recalc
     "CalcSheetsForDSCR",            # phase-scoped recalc
     "ClassifyConvergenceHL",        # strict/relaxed/none tier classifier
-    "StampActiveProjectColumnHL",   # post-read hard-stamps (added 2026-05-12)
+    "StampActiveProjectColumnHL",   # post-read hard-stamps
     "ProjectElapsedHL",             # timer wraparound-safe elapsed
     "HardStampNumericHL",           # IsError-guarded numeric stamping
-    "SetSkipOutputRecalcHL",        # output-recalc skip flag (added 2026-05-12)
+    "SetSkipOutputRecalcHL",        # output-recalc skip flag
 )
 
 # Names of stale module artifacts that linger in workbooks where macros
@@ -228,17 +228,27 @@ class PreflightResult(msgspec.Struct, frozen=True, kw_only=True):
 # so they're trivially testable with synthetic in-memory workbooks.
 # ---------------------------------------------------------------------------
 
+def iter_active_project_cols(ws) -> Iterator[int]:
+    """Yield 1-based column indices for active projects on `ws`
+    (Project Inputs). Active = row 7 (PI_ROW_TOGGLE) == 1.
+    Shared by every check that iterates project columns.
+    """
+    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
+    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
+    for col in range(start_col, end_col + 1):
+        if ws.cell(row=PI_ROW_TOGGLE, column=col).value == 1:
+            yield col
+
+
 def check_calc_properties(wb: openpyxl.Workbook) -> list[PreflightFinding]:
     """A1-A4: workbook calculation properties."""
     findings: list[PreflightFinding] = []
     cp = wb.calculation
 
-    # A1: iterateDelta. Empirically observed missing on IL TEST 2026-05-13
-    # alongside the actual root cause (D15, outdated macro). Not by itself
-    # a confirmed convergence breaker, but a non-standard XML state that
-    # weakens iterative-calc convergence on the row 31 self-circular cells
-    # the macro depends on. SMP and RP Puma all have this set explicitly
-    # to 1E-4; absence is anomalous and worth flagging loud.
+    # A1: iterateDelta. Absence (or a value above the ceiling) weakens
+    # iterative-calc convergence on the row 31 self-circular cells the
+    # macro depends on. Healthy workbooks set this explicitly to 1E-4;
+    # absence is anomalous and worth flagging loud.
     if cp.iterateDelta is None or cp.iterateDelta > ITERATE_DELTA_CEILING:
         findings.append(PreflightFinding(
             code="A1",
@@ -510,8 +520,8 @@ def check_critical_path_errors(
         ws = wb_values["Appraisal"]
         bad_cf: list[str] = []
         # Active cash-flow region only — the OFFSET picks columns to the
-        # right of where the CT comes online, so scan J..UC bounded.
-        max_col = min(ws.max_column, column_index_from_string("UC"))
+        # right of where the CT comes online.
+        max_col = min(ws.max_column, column_index_from_string(APPRAISAL_CASHFLOW_MAX_COL))
         for row in APPRAISAL_CASHFLOW_ROWS:
             for col in range(column_index_from_string("J"), max_col + 1):
                 v = ws.cell(row=row, column=col).value
@@ -575,10 +585,6 @@ def check_macro_version(workbook_path: Path) -> list[PreflightFinding]:
     surrounding bytes) is more precise than a bare substring search,
     but a bare search is good enough for our marker functions which
     don't appear elsewhere in the binary.
-
-    Validated against the IL TEST 2026-05-13 regression: that workbook's
-    627-line embedded macro is missing 11 of the 12 marker functions
-    listed in REQUIRED_MACRO_FUNCTIONS.
     """
     findings: list[PreflightFinding] = []
     # .xlsx is macro-free by spec; skip D-tier entirely. Tests use .xlsx
@@ -634,8 +640,7 @@ def check_macro_version(workbook_path: Path) -> list[PreflightFinding]:
                 "The orchestrator calls these functions via Application.Run "
                 "during the chunked solve path. Missing functions either "
                 "fail silently (On Error Resume Next) or raise a VBA error, "
-                "leaving the solve in a half-broken state. ROOT CAUSE of "
-                "the IL TEST 2026-05-13 regression."
+                "leaving the solve in a half-broken state."
             ),
             remediation=(
                 f'Re-import the latest macro: python import_vba_module.py '
@@ -790,12 +795,7 @@ def check_input_bounds(wb: openpyxl.Workbook) -> list[PreflightFinding]:
     out_of_band_dev_fee: list[tuple[str, float]] = []
     out_of_band_npp: list[tuple[str, float]] = []
 
-    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
-    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
-    for col in range(start_col, end_col + 1):
-        toggle = ws.cell(row=PI_ROW_TOGGLE, column=col).value
-        if toggle != 1:
-            continue  # only check active project columns
+    for col in iter_active_project_cols(ws):
         coord_letter = ws.cell(row=PI_ROW_DEV_FEE, column=col).coordinate
 
         df = ws.cell(row=PI_ROW_DEV_FEE, column=col).value
@@ -820,13 +820,13 @@ def check_input_bounds(wb: openpyxl.Workbook) -> list[PreflightFinding]:
             impact=(
                 "Behavior depends on entry point. Chunked path "
                 "(SolveOneProjectByColHL, default for --chunked runs) only "
-                "seeds blanks — pre-existing out-of-range values are passed "
+                "seeds blanks — pre-existing out-of-range values pass "
                 "through to GoalSeek untouched, so convergence is unaffected. "
                 "Non-chunked path (SolveHeadless) resets to DEV_FEE_SEED "
                 "($0.20) at iter 0 and on every inner GoalSeek if the value "
                 "drifts back out of range — which can trap legitimate "
-                "answers (e.g. IL TEST 2026-05-13: '0 iter / NOT CONVERGED'). "
-                "The bound is a sanity check, not a model constraint."
+                "answers ('0 iter / NOT CONVERGED'). The bound is a sanity "
+                "check, not a model constraint."
             ),
             remediation=(
                 "If the run fails to converge, two options: (1) Manually "
@@ -875,13 +875,11 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
     GoalSeek then converges to an inflated Dev Fee to make IRR=WACC hold,
     producing a mathematically valid but economically nonsensical result.
 
-    Concrete: Queen City 2026-05-15 cols H-N (Bair-Jestes) had RC5 Toggle=
-    "Generic" with Rate Name="Merchant Rate" / Generic Rate=5.5% / Escalator=
-    2.5% / Term=35yr — a real revenue stream — and converged to Dev Fees
-    of $1.49-$1.96/W. Cols O-T (Schafer-Wheeler) had RC5 Toggle="Custom"
-    with empty Rate Name and converged to $4.30-$5.34/W Dev Fees. Same
-    deal, same EPC, same IX — the only material input difference was the
-    RC5 sub-block configuration.
+    Concrete: a portfolio where half the projects had RC5 Toggle=
+    "Generic" with a real Rate Name + rate produced Dev Fees of
+    $1.49-$1.96/W; the other half had RC5 Toggle="Custom" with empty
+    Rate Name and converged to $4.30-$5.34/W. Same deal, same EPC,
+    same IX — the only input difference was the RC5 sub-block config.
 
     Two flag categories:
       E15a — Custom-with-empty-name: Toggle="Custom" but Rate Name is None
@@ -902,23 +900,17 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
         return findings
     ws = wb["Project Inputs"]
 
-    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
-    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
-
-    # Collect (rc_idx, col_letter, toggle, rate_name, generic_rate) for every
-    # active project × every RC. Used for E15a, E15b, and E15c.
+    # Collect (rc_idx, col_letter, toggle, rate_name, generic_rate) for
+    # every active project × every RC. Used for E15a, E15b, and E15c.
     per_project_rc: list[tuple[int, str, object, object, object]] = []
     active_cols: list[int] = []
-    for col in range(start_col, end_col + 1):
-        toggle = ws.cell(row=PI_ROW_TOGGLE, column=col).value
-        if toggle != 1:
-            continue
+    for col in iter_active_project_cols(ws):
         active_cols.append(col)
         col_letter = ws.cell(row=PI_ROW_DEV_FEE, column=col).coordinate.rstrip("0123456789")
         for rc_idx, base in enumerate(RC_BLOCK_BASES, start=1):
-            rate_name = ws.cell(row=base + 1, column=col).value
-            rc_toggle = ws.cell(row=base + 2, column=col).value
-            generic_rate = ws.cell(row=base + 3, column=col).value  # Generic Energy Rate at COD
+            rate_name = ws.cell(row=base + RC_OFFSET_NAME, column=col).value
+            rc_toggle = ws.cell(row=base + RC_OFFSET_TOGGLE, column=col).value
+            generic_rate = ws.cell(row=base + RC_OFFSET_GEN_RATE, column=col).value
             per_project_rc.append((rc_idx, col_letter, rc_toggle, rate_name, generic_rate))
 
     if not active_cols:
@@ -955,9 +947,8 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
                 "the Rate Curves tab are likely empty too. The Appraisal "
                 "GoalSeek will compensate by inflating Dev Fee until IRR=WACC "
                 "still holds, producing an economically nonsensical solution "
-                "(e.g., Queen City 2026-05-15: $4-5/W Dev Fees on the 6 "
-                "projects with RC5 Custom + empty Name). The macro will "
-                "converge — but to the wrong equilibrium."
+                "(typical: $4-5/W Dev Fees on projects with RC5 Custom + empty "
+                "Name). The macro will converge — but to the wrong equilibrium."
             ),
             remediation=(
                 "For each flagged RC: either (1) flip Toggle to 'Generic' "
@@ -1003,7 +994,8 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
                 "workbook CAN be intentional (one project has a bespoke "
                 "tariff, others use the default curve), but the pattern "
                 "frequently signals a half-applied edit. Combined with "
-                "E15a, this is the Queen City 2026-05-15 failure mode."
+                "E15a, the same pattern produced the inflated Dev Fees "
+                "in the documented portfolio failure."
             ),
             remediation=(
                 "Confirm whether the mixed configuration is intentional. "
@@ -1013,16 +1005,14 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
             auto_fixable=False,
         ))
 
-    # E15c — Asymmetric revenue (the actual Queen City failure pattern).
-    # Fires as ERROR when the same RC has BOTH:
+    # E15c — Asymmetric revenue. Fires as ERROR when the same RC has BOTH:
     #   (a) at least one project with Toggle=Generic AND non-zero Generic
-    #       Rate (a real revenue stream the model includes in cap-stack
-    #       sizing for THAT project), AND
+    #       Rate (a real revenue stream included in cap-stack sizing), AND
     #   (b) at least one project with Toggle=Custom AND empty Rate Name
     #       (effectively zero revenue for that project on the same RC).
-    # The Appraisal GoalSeek then compensates by inflating Dev Fee on the
-    # (b) projects until IRR=WACC still holds, producing the $4-5/W Dev
-    # Fees observed on Queen City 2026-05-15.
+    # The Appraisal GoalSeek then compensates by inflating Dev Fee on
+    # the (b) projects until IRR=WACC still holds, producing the $4-5/W
+    # Dev Fees this check is designed to prevent shipping.
     #
     # Crucially: uniform Custom-empty across ALL active projects is NOT
     # this case — it just means the RC is intentionally disabled for the
@@ -1065,17 +1055,16 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
             severity="error",
             location="Project Inputs Rate Component sub-blocks",
             message=(
-                f"{len(asymmetric)} Rate Component(s) have ASYMMETRIC revenue "
-                "across active projects (Queen City 2026-05-15 failure pattern): "
-                + " | ".join(lines)
+                f"{len(asymmetric)} Rate Component(s) have ASYMMETRIC "
+                "revenue across active projects: " + " | ".join(lines)
             ),
             impact=(
                 "Some projects have a real revenue stream (Generic mode with "
                 "non-zero rate); others on the same RC are effectively zeroed "
                 "(Custom mode with empty Rate Name -> empty Custom rate rows). "
-                "The Appraisal GoalSeek will converge for both sets, but the "
-                "zeroed projects' Dev Fees will inflate to compensate for the "
-                "missing revenue (Queen City: $4-5/W Dev Fees on the zeroed "
+                "Appraisal GoalSeek will converge for both sets, but the "
+                "zeroed projects' Dev Fees inflate to compensate for the "
+                "missing revenue (observed: $4-5/W Dev Fees on the zeroed "
                 "subset vs $1.50-$2.00/W on the revenue subset, same EPC + IX). "
                 "Mathematically valid, economically nonsensical."
             ),
@@ -1097,19 +1086,15 @@ def check_placeholder_projects(wb: openpyxl.Workbook) -> list[PreflightFinding]:
     """E16: Detect active project columns that look like un-populated
     template placeholders.
 
-    Failure mode this catches (2026-05-18 SMP run id=16): the workbook
-    had row 7 = 1 (active) on cols N..W with project names "Project 7"
-    through "Project 16" but all 10 columns shared an identical
-    placeholder shape — RC1 toggle = "Generic" with Generic Energy Rate
-    at COD = 0, identical MWdc and yield across all 10. When the macro's
-    chunked entry point reached the first placeholder it crashed with
-    HRESULT 0x800a9c68 (Type Mismatch raised by Range.GoalSeek over an
-    error-state Equity cell): zero revenue → #DIV/0! through the cap
-    stack → GoalSeek raises instead of returning False. Even with the
-    Tranche 7 defensive guards in the macro, a placeholder project
-    cannot meaningfully solve — there's no revenue stream to discount —
-    so the right answer is to refuse to attempt it and surface the
-    misconfiguration up front.
+    Failure mode this catches: a workbook with row 7 = 1 (active) on
+    template-name columns ("Project 7" .. "Project 16") that share an
+    identical placeholder shape — RC1 toggle = "Generic" with Generic
+    Energy Rate at COD = 0. Zero revenue propagates #DIV/0! through the
+    cap stack; pre-skip the macro's chunked entry point raises HRESULT
+    0x800a9c68 (Type Mismatch from Range.GoalSeek on an error cell).
+    Even with the macro's defensive guards a placeholder cannot
+    meaningfully solve, so the right answer is to refuse it up front
+    and surface the misconfiguration.
 
     Detection heuristic (must be conservative to avoid false-positives
     on small real projects with low merchant rates):
@@ -1126,18 +1111,10 @@ def check_placeholder_projects(wb: openpyxl.Workbook) -> list[PreflightFinding]:
         return findings
     ws = wb["Project Inputs"]
 
-    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
-    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
-
     placeholders: list[tuple[str, str]] = []  # [(col_letter, project_name)]
-    # RC1 base = 157. Generic Energy Rate at COD is base+3 = row 160.
-    # Toggle is base+2 = row 159. Rate Name is base+1 = row 158.
-    rc1_toggle_row = RC_BLOCK_BASES[0] + 2  # 159
-    rc1_gen_rate_row = RC_BLOCK_BASES[0] + 3  # 160
-    for col in range(start_col, end_col + 1):
-        toggle = ws.cell(row=PI_ROW_TOGGLE, column=col).value
-        if toggle != 1:
-            continue
+    rc1_toggle_row = RC_BLOCK_BASES[0] + RC_OFFSET_TOGGLE      # 159
+    rc1_gen_rate_row = RC_BLOCK_BASES[0] + RC_OFFSET_GEN_RATE  # 160
+    for col in iter_active_project_cols(ws):
         rc1_toggle = ws.cell(row=rc1_toggle_row, column=col).value
         if rc1_toggle != "Generic":
             continue
@@ -1169,16 +1146,13 @@ def check_placeholder_projects(wb: openpyxl.Workbook) -> list[PreflightFinding]:
             f"Energy Rate at COD = 0): {detail}"
         ),
         impact=(
-            "These projects have no revenue stream on RC1 — the most "
-            "common primary energy revenue slot. The macro's chunked "
-            "GoalSeek will hit #DIV/0! through the cap stack and either "
-            "fail to converge (Tranche 7 defensive guards) or crash "
-            "outright (pre-Tranche 7). Even when guarded, solving a "
-            "no-revenue project produces a nonsensical NPP — there's "
-            "nothing for Dev Fee / Equity IRR to balance against. "
-            "Concrete failure: 2026-05-18 SMP run id=16, 0 of 15 "
-            "projects shipped after the first placeholder crashed both "
-            "workers."
+            "These projects have no revenue stream on RC1 — the primary "
+            "energy revenue slot. The macro's chunked GoalSeek hits "
+            "#DIV/0! through the cap stack; defensive guards convert the "
+            "crash into not-converged, but solving a no-revenue project "
+            "produces a nonsensical NPP — there's nothing for Dev Fee / "
+            "Equity IRR to balance against. A workbook with 10 such "
+            "columns will not ship a single project's results."
         ),
         remediation=(
             "Either (1) populate the Generic Energy Rate at COD on row "
@@ -1199,22 +1173,18 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
     Pure function. Never mutates the input file. Returns a PreflightResult
     with categorized findings; caller decides how to act on them.
 
-    Load-budget shape (Tranche 6.5 refactor):
-      1x value-pass load (data_only=True, read_only=True) — shared between
-        the cell-level error scan and the C-tier critical-path checks.
-      1x formula-pass load (data_only=False, keep_vba=True) — used by all
-        A/B/E-tier checks that need calc properties, structure, or non-
-        cached formula text.
-      0-1x conditional formula-pass load inside scan_workbook_errors only
-        if the value-pass actually found errors (formula-count denominator
-        for the triage report). The common clean-workbook case pays only
-        the first two loads.
+    Load budget — one value-pass and one formula-pass openpyxl load,
+    shared across all checks:
+      value-pass (data_only=True, read_only=True): cell-level error
+        scan and C-tier critical-path checks
+      formula-pass (data_only=False, keep_vba=True): A/B/E-tier checks
+        needing calc properties, structure, or non-cached formula text
+      conditional 0-1x extra formula-pass inside scan_workbook_errors
+        only when the value-pass already found errors
 
-      Before: 3 full loads on clean workbook (scan value-pass + preflight
-      formula-pass + preflight value-pass) = ~6-9 min on a 13MB xlsm.
-      After: 2 loads = ~3-4 min. Doubles up under --auto-import-macro
-      because preflight runs twice; orchestrator skips the redundant second
-      preflight by re-checking only D15/D17 directly (see orchestrator).
+    On a 13MB xlsm the two loads take ~3-4 min. --auto-import-macro
+    runs preflight twice; orchestrator skips the redundant second pass
+    by re-checking only D15/D17 directly.
     """
     p = Path(workbook_path)
     findings: list[PreflightFinding] = []

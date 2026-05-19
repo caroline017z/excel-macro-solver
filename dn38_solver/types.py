@@ -11,17 +11,15 @@ from typing import Literal
 import msgspec
 
 
-# Convergence-tier constants. Keep this Literal in sync with
-# convergence_label() and orchestrator._parse_project_result(). msgspec
-# validates Literal values at decode time, so a SQLite row with a stale
-# tier string surfaces immediately rather than slipping through to the
-# rollup as a silently-mis-categorized row.
+# Per-project convergence tier. Keep in sync with convergence_label()
+# and orchestrator._parse_project_result(); msgspec validates at decode
+# time, so a stale SQLite row surfaces immediately rather than slipping
+# through to the rollup mis-categorized.
 #
-# "skipped" was added in Tranche 7.6 for placeholder columns that the
-# VBA fast-skip bypasses (RC1 Generic + Rate=0, or MWdc=0). Distinct
-# from "not_attempted" (which means a worker crashed before reaching the
-# project) — skipped projects were *deliberately* bypassed pre-solve
-# and should not count against batch-level convergence rollup.
+# "skipped" is for placeholder columns the VBA fast-skip bypasses
+# pre-solve (RC1 Generic + Rate=0, or MWdc=0). Distinct from
+# "not_attempted" (worker crashed before reaching the project) —
+# skipped projects shouldn't count against batch-level convergence.
 ConvergenceTier = Literal["strict", "relaxed", "none", "not_attempted", "skipped"]
 
 
@@ -81,7 +79,7 @@ class SolveStatus(str, enum.Enum):
     """Solve outcome — str enum for JSON serialization."""
     CONVERGED = "converged"
     NOT_CONVERGED = "not_converged"
-    SKIPPED = "skipped"           # Tranche 7.6: placeholder fast-skip path
+    SKIPPED = "skipped"           # placeholder fast-skip (no real revenue / no MW)
     ERROR = "error"
     TIMEOUT = "timeout"
     DRY_RUN = "dry_run"

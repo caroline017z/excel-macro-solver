@@ -9,8 +9,8 @@ WHY THIS EXISTS — the openpyxl .xlsm hazard
 ============================================
 openpyxl with `keep_vba=True` reads + writes the macro blob (vbaProject
 .bin) faithfully on a save round-trip, but it does NOT model every
-Excel-specific XML part. The 2026-05-13 RP Puma incident proved that
-openpyxl's save can strip or rewrite:
+Excel-specific XML part. openpyxl's save has been observed to strip or
+rewrite:
 
   - data-validation extensions (x14:extLst inside xl/worksheets/*.xml)
   - conditional-formatting state
