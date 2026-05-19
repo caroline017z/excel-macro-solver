@@ -84,7 +84,16 @@ SWITCH_PROJECT_AND_RECALC = VBASub(
 # why the stamp lives here rather than inside SolveOneProjectByColHL.
 STAMP_ACTIVE_PROJECT_COLUMN = VBASub(
     name="StampActiveProjectColumnHL",
-    args=(("colIdx", "Integer"),),
+    args=(
+        ("colIdx",      "Integer"),
+        # Per-project DSCR (meta["dscr"] from __SolverResults!C). Required
+        # — PT!F129 is a single live cell that GoalSeek overwrites per
+        # project; without this restore the post-read CalculateFull
+        # propagates the last-solved-project's DSCR through the equity
+        # IRR chain and stamps the wrong IRR into row 37. Pass 0.0 only
+        # if no DSCR was captured (placeholder / fast-skip projects).
+        ("dscrRestore", "Double"),
+    ),
 )
 
 

@@ -260,3 +260,103 @@ def test_orchestrator_parse_project_result_skipped() -> None:
     assert result.converged is False
     assert result.convergence_tier == "skipped"
     assert result.iterations == 0
+
+
+# --- Tranche 7.10: post-read DSCR restore contract -------------------------
+# Locks in the fix for the 2026-05-18 SolarStone bug. PT Returns!F129 is a
+# single live cell that GoalSeek overwrites per project. By post-read time
+# it holds the LAST-solved-project's DSCR, so the CalculateFull inside
+# StampActiveProjectColumnHL would propagate the wrong DSCR through the
+# IRR chain and stamp the wrong Live IRR into rows 31/37. The fix is to
+# pass meta["dscr"] as the second arg to StampActiveProjectColumnHL and
+# have VBA restore F129 before the CalculateFull.
+#
+# These tests verify both the contract (Python args match VBA sig) and
+# the call-site (direct_runner threads meta["dscr"] through).
+
+def test_stamp_active_project_contract_includes_dscr_arg() -> None:
+    """The Python-side VBASub declaration for StampActiveProjectColumnHL
+    must include dscrRestore as a Double. Drift here would silently
+    revert to the pre-fix single-arg call and resurrect the IRR-bleed
+    bug (Albion / Bethel stamped at 40%+ vs 18% target on SolarStone).
+    """
+    from dn38_solver.com.vba_contract import STAMP_ACTIVE_PROJECT_COLUMN
+
+    arg_names = [a[0] for a in STAMP_ACTIVE_PROJECT_COLUMN.args]
+    arg_types = [a[1] for a in STAMP_ACTIVE_PROJECT_COLUMN.args]
+    assert arg_names == ["colIdx", "dscrRestore"], (
+        f"StampActiveProjectColumnHL args drifted: got {arg_names}"
+    )
+    assert arg_types == ["Integer", "Double"], (
+        f"StampActiveProjectColumnHL arg types drifted: got {arg_types}"
+    )
+
+
+def test_vba_stamp_active_signature_takes_two_args() -> None:
+    """The VBA Sub declaration in SolveHeadless.bas must match the Python
+    contract — two args, dscrRestore as Double. A drift here means the
+    macro re-import would silently leave the wrong signature in the
+    workbook and Application.Run would fail with arg-count mismatch.
+    """
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parent.parent
+    bas = (repo_root / "SolveHeadless.bas").read_text(encoding="utf-8")
+    # Find the Public Sub StampActiveProjectColumnHL declaration. The
+    # signature spans multiple lines via VBA's `_` continuation, so
+    # collapse continuations before matching.
+    import re
+    collapsed = re.sub(r"_\s*\n\s*", " ", bas)
+    m = re.search(
+        r"Public Sub StampActiveProjectColumnHL\(([^)]*)\)",
+        collapsed,
+    )
+    assert m, "StampActiveProjectColumnHL declaration not found in SolveHeadless.bas"
+    sig = m.group(1)
+    assert "colIdx As Integer" in sig
+    assert "dscrRestore As Double" in sig, (
+        f"dscrRestore arg missing from VBA sig — pre-fix bug resurrected: {sig!r}"
+    )
+
+
+def test_direct_runner_threads_dscr_into_stamp_call(monkeypatch) -> None:
+    """The post-read pass in direct_runner must pass meta['dscr'] as the
+    second positional arg to STAMP_ACTIVE_PROJECT_COLUMN. Verifies the
+    call-site stays in sync with the contract — a regression here is
+    invisible to the contract test above (which only checks the schema).
+
+    The check is structural: we read the call site as source text and
+    assert that the dscr is read from meta and threaded into the Application.Run
+    args tuple. Spinning up Excel COM in unit tests would require a
+    licensed install + a real workbook; the source-level assert is the
+    pragmatic safety net.
+    """
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parent.parent
+    src = (repo_root / "dn38_solver" / "com" / "direct_runner.py").read_text(
+        encoding="utf-8"
+    )
+
+    # The call site must read DSCR from meta and pass it as a positional
+    # arg in the same tuple as STAMP_ACTIVE_PROJECT_COLUMN. The marker
+    # text is stable; if anyone restructures this, they must keep DSCR
+    # threading or this test breaks loud.
+    assert 'meta.get("dscr")' in src, (
+        "direct_runner no longer reads meta['dscr'] — DSCR restore bypassed"
+    )
+    assert "STAMP_ACTIVE_PROJECT_COLUMN" in src
+    # The contract test above already locks in the two-arg shape; here
+    # we just need to confirm DSCR is what fills the second slot.
+    import re
+    # Find the STAMP_ACTIVE_PROJECT_COLUMN call site and assert dscr is
+    # nearby (within ~10 lines — generous so refactors don't break us).
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        if "STAMP_ACTIVE_PROJECT_COLUMN" in line and "vba_call_str" in line:
+            window = "\n".join(lines[max(0, i - 5):i + 10])
+            assert "dscr_for_stamp" in window or "dscr" in window, (
+                f"STAMP_ACTIVE_PROJECT_COLUMN call site at line {i+1} "
+                f"is missing DSCR threading; got:\n{window}"
+            )
+            break
+    else:
+        pytest.fail("STAMP_ACTIVE_PROJECT_COLUMN call site not found")

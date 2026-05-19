@@ -889,11 +889,24 @@ def run_direct(
             # When stamping IS run, never suppress its exception: a
             # silent stamp failure leaves the per-column cell as a
             # circular IF formula that openpyxl-merge reads as None.
+            #
+            # Pass this project's DSCR so the stamp can restore PT!F129
+            # before the CalculateFull that pins rows 31/37. PT!F129 is
+            # a single live cell that GoalSeek overwrites once per
+            # project; without the restore, every project except the
+            # worker's last gets its IRR computed against the wrong
+            # DSCR. Use 0.0 sentinel when no DSCR was captured (the VBA
+            # side reads >0 as "perform restore", 0 as "skip").
             if has_switch and not macro_error:
                 col_idx = nt.offset + BASE_COL
+                dscr_for_stamp = safe_float(meta.get("dscr")) or 0.0
                 _run_macro_with_timeout(
                     excel,
-                    (vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN), int(col_idx)),
+                    (
+                        vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
+                        int(col_idx),
+                        float(dscr_for_stamp),
+                    ),
                     timeout_sec=DEFAULT_PER_CALL_TIMEOUT_SEC,
                     excel_proc=excel_proc,
                     label=f"StampActiveProjectColumnHL[{nt.name}]",

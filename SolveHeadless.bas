@@ -561,8 +561,16 @@ End Sub
 '  the cached side of the IF (= itself) instead of the F<row> side.
 '  Rows 32, 33, 38, 39 self-assign via HardStampNumericHL, which refuses
 '  to freeze Excel error values into the cell.
+'
+'  CRITICAL: dscrRestore MUST be this project's converged DSCR (captured
+'  by SolveOneProjectByColHL into __SolverResults!C and surfaced by the
+'  Python runner as meta["dscr"]). PT Returns!F129 is a single live
+'  cell that GoalSeek overwrites once per project — without restoring
+'  this project's value before CalculateFull, rows 31/37 stamp with an
+'  IRR computed against the LAST-solved-project's DSCR.
 ' ==============================================================================
-Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)
+Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer, _
+                                       ByVal dscrRestore As Double)
     If colIdx < PI_BASE_COL + 1 Or colIdx > PI_BASE_COL + COL_SCAN_LIMIT Then
         Err.Raise 5, "StampActiveProjectColumnHL", _
             "colIdx " & colIdx & " out of bounds [" & (PI_BASE_COL + 1) & _
@@ -571,6 +579,29 @@ Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)
 
     Dim wsPI As Worksheet
     Set wsPI = ThisWorkbook.Sheets(SHT_PI)
+    Dim wsPT As Worksheet
+    Set wsPT = ThisWorkbook.Sheets(SHT_PT)
+
+    ' Per-project DSCR restore. PT Returns!F129 is a single live cell that
+    ' the in-loop GoalSeek (rEquity.GoalSeek ChangingCell:=rDSCR) overwrites
+    ' once per project. By the time the post-read pass reaches the stamp
+    ' step for an earlier project, F129 still holds the LAST-solved
+    ' project's DSCR — and the CalculateFull below would propagate THAT
+    ' DSCR through Operations / CL / Perm Debt / TE / NPP Calc, producing
+    ' a Live IRR that has nothing to do with this project's actual solve.
+    ' The wrong IRR then gets hard-stamped into row 37, and Caroline opens
+    ' the merged file to see a project that "converged" reading 40%+ IRR
+    ' against an 18% target. (The bug Caroline caught on the 2026-05-18
+    ' SolarStone run — Albion / Bethel stamped at 40.35% / 37.72% against
+    ' 18% target, only Branch Creek I / II — each worker's last project —
+    ' read correctly because their own DSCR was still in F129.)
+    '
+    ' Callers MUST pass this project's DSCR (captured in-loop and stored
+    ' as __SolverResults!C[row] / meta["dscr"]). 0 is treated as "no
+    ' restore" so the caller can opt out explicitly if needed.
+    If dscrRestore > 0 Then
+        wsPT.Range(PT_DSCR_MULTIPLE).Value = dscrRestore
+    End If
 
     ' Force full propagation BEFORE reading row 31/37. The caller's
     ' SwitchProjectAndRecalc uses tier-1 CalcSheetsAll which doesn't
