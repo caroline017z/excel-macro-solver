@@ -143,9 +143,12 @@ STAMP_CONVERGED_VALUES = VBASub(
         ("npp",       "Double"),
         ("devFee",    "Double"),
         ("fmv",       "Double"),
-        ("liveIRR",   "Double"),
-        ("apprLive",  "Double"),
         ("nppTotal",  "Double"),
+        # Per Tranche 7.12: liveIRR + apprLive dropped (rows 31/37 stay
+        # as sticky-IF formulas). dscrMult takes the upstream-input lock
+        # at PI row 371 so debt sizing / equity / IRR remain dynamic by
+        # formula.
+        ("dscrMult",  "Double"),
     ),
 )
 

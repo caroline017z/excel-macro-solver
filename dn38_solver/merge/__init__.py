@@ -9,8 +9,10 @@ Two merge paths, in order of preference:
 
 1. `merge_via_openpyxl` — the standard path. Loads the master worker's
    xlsm with `keep_vba=True`, copies each peer worker's per-project
-   column cells (rows 31/32/33/37/38/39 on Project Inputs) into the
-   master via openpyxl, and saves. Only the project-column cells are
+   column cells (rows 32/33/38/39/371 on Project Inputs — Dev Fee, FMV,
+   NPP $/W, NPP $, Min Equity DSCR Multiple) into the master via
+   openpyxl, and saves. Rows 31 and 37 stay as their sticky-IF formulas
+   (Tranche 7.12). Only the project-column cells are
    touched; portfolio aggregates are left as-is on the assumption that
    Excel will recalc them on next interactive open. Fast, no COM.
 
@@ -52,13 +54,21 @@ from dn38_solver.types import SolveTask
 
 log = logging.getLogger(__name__)
 
-# The six rows VBA hard-stamps via cell-self-assign at end of each
-# project's solve. These are the only cells we copy between workers —
-# everything else in each project's column was already correct in the
-# master pre-merge (since each worker started from the same source) or
-# is a portfolio aggregate that Excel will recalc on next interactive
-# open.
-OUTPUT_ROWS: tuple[int, ...] = (31, 32, 33, 37, 38, 39)
+# The rows VBA hard-stamps at end of each project's solve. These are the
+# only cells we copy between workers — everything else in each project's
+# column was already correct in the master pre-merge (since each worker
+# started from the same source) or is a portfolio aggregate that Excel
+# will recalc on next interactive open.
+#
+# Rows 31 (Live Appraisal IRR) and 37 (Live Levered Pre-Tax IRR) are
+# deliberately NOT in this set as of Tranche 7.12 (Caroline's 2026-05-19
+# preference). They stay as their sticky-IF circular formulas
+# (=IF(<col>2=$F$2, $F$<row>, <col><row>)) so the audit chain is
+# preserved when opening the merged file. Row 371 (Min Equity DSCR
+# Multiple) is hardcoded instead — locking that upstream input freezes
+# debt sizing / equity / IRR all by formula, and a one-cell revert to
+# ='PT Returns'!$F$129 puts Min Equity back into fully dynamic solve.
+OUTPUT_ROWS: tuple[int, ...] = (32, 33, 38, 39, 371)
 
 
 def _extract_worker_id(other_path: Path) -> int | None:
@@ -89,8 +99,10 @@ def merge_via_openpyxl(
     """Copy per-project converged column values from other workers' SOLVED
     workbooks into the master, then save to final_path.
 
-    Only the project-column cells are copied (rows 31, 32, 33, 37, 38, 39
-    on Project Inputs — the cached convergence outputs). The rest of the
+    Only the project-column cells are copied (rows 32, 33, 38, 39, 371
+    on Project Inputs — Dev Fee, FMV, NPP $/W, NPP $, Min Equity DSCR
+    Multiple). Rows 31/37 stay as their sticky-IF formulas (Tranche
+    7.12). The rest of the
     workbook in the master is left as-is; per Caroline's spec, portfolio
     aggregates may be stale and will refresh on next interactive open.
 
@@ -263,19 +275,23 @@ def merge_via_vba_fallback(
                 npp = ws_pi_other.cell(row=38, column=col_idx).value
                 dev_fee = ws_pi_other.cell(row=32, column=col_idx).value
                 fmv = ws_pi_other.cell(row=33, column=col_idx).value
-                live_irr = ws_pi_other.cell(row=37, column=col_idx).value
-                appr_live = ws_pi_other.cell(row=31, column=col_idx).value
                 npp_total = ws_pi_other.cell(row=39, column=col_idx).value
+                # DSCR Multiple from row 371 — the upstream input that
+                # locks the per-project debt sizing / equity / IRR
+                # cascade. Replaces the prior reads of live_irr (row 37)
+                # and appr_live (row 31), which are no longer stamped
+                # by the worker (they stay as sticky-IF formulas per
+                # Tranche 7.12).
+                dscr_mult = ws_pi_other.cell(row=371, column=col_idx).value
 
-                # Skip the entire row if ANY of the six values is missing.
+                # Skip the entire row if ANY of the five values is missing.
                 # Coercing None → 0.0 (prior behavior) silently writes a $0
                 # Dev Fee or $0 NPP into the merged file, which downstream
                 # IC summaries don't distinguish from a real zero.
                 missing = [
                     name for name, val in (
                         ("npp", npp), ("dev_fee", dev_fee), ("fmv", fmv),
-                        ("live_irr", live_irr), ("appr_live", appr_live),
-                        ("npp_total", npp_total),
+                        ("npp_total", npp_total), ("dscr_mult", dscr_mult),
                     ) if val is None
                 ]
                 if missing:
@@ -293,7 +309,7 @@ def merge_via_vba_fallback(
                             vba_call_str(wb.Name, STAMP_CONVERGED_VALUES),
                             int(col_idx),
                             float(npp), float(dev_fee), float(fmv),
-                            float(live_irr), float(appr_live), float(npp_total),
+                            float(npp_total), float(dscr_mult),
                         ),
                         timeout_sec=60,  # per-cell stamp is sub-second on healthy state
                         excel_proc=excel_proc,

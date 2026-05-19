@@ -45,6 +45,12 @@ OUTPUT_ROWS: dict[int, str] = {
     37: "Live Levered Pre-Tax IRR",
     38: "NPP ($/W)",
     39: "NPP ($)",
+    # Per-project DSCR Multiple input (Tranche 7.12). Default cell
+    # formula is ='PT Returns'!$F$129; macro replaces with the converged
+    # numeric so rows 31/37 can stay as sticky-IF formulas with the
+    # right per-project cached value. Restore the formula to put Min
+    # Equity back into fully dynamic solve.
+    371: "Min Equity DSCR Multiple",
 }
 
 # Computed inverse — derived, never manually maintained

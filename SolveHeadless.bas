@@ -77,6 +77,15 @@ Private Const PI_ROW_FMV          As Long = 33
 Private Const PI_ROW_IRR_LIVE     As Long = 37    ' Live (post-tax) IRR per-column
 Private Const PI_ROW_NPP          As Long = 38
 Private Const PI_ROW_NPP_TOTAL    As Long = 39
+' DSCR Multiple per-column input. The default cell formula is
+' ='PT Returns'!$F$129 (live link to the in-loop Min Equity solver's
+' DSCR Multiple). The post-solve stamp replaces the formula with the
+' converged numeric so PI row 31 (Live Appraisal IRR) and row 37
+' (Live Levered Pre-Tax IRR) can stay as their sticky-IF circular
+' formulas — the upstream input lock at row 371 is what freezes the
+' downstream IRR cascade per-project. To re-enable Min Equity solve
+' dynamically, restore =Reference: 'PT Returns'!$F$129 on this cell.
+Private Const PI_ROW_DSCR_MULT    As Long = 371
 Private Const PI_ROW_RC1_TOGGLE   As Long = 159   ' Custom/Generic toggle
 Private Const PI_ROW_RC1_RATE     As Long = 160   ' Generic Energy Rate at COD
 Private Const PI_FIRST_PROJ_COL   As Integer = 8
@@ -542,23 +551,35 @@ End Sub
 '  SwitchProjectAndRecalc has set F2 = this project's offset and refreshed
 '  the workbook state.
 '
-'  Stamps rows 31, 32, 33, 37, 38, 39 on Project Inputs at column `colIdx`,
-'  replacing each cell's IF(<col>2=$F$2, $F$<row>, <col><row>) circular-
-'  formula cache with the cell's current evaluated value.
+'  Stamps rows 32, 33, 38, 39 on Project Inputs at column `colIdx`
+'  (Dev Fee, FMV, NPP $/W, NPP $) via the IsError-guarded self-assign
+'  helper, and writes the converged DSCR Multiple onto row 371. Rows
+'  31 (Live Appraisal IRR) and 37 (Live Levered Pre-Tax IRR) are
+'  deliberately LEFT AS FORMULAS — their sticky-IF circular pattern
+'  IF(<col>2=$F$2, $F$<row>, <col><row>) freezes per-project via
+'  iterative calc once the right upstream inputs are locked in.
+'
+'  Why hardcode row 371 instead of rows 31/37 (Caroline's preference,
+'  2026-05-19): rows 31/37 are downstream IRR caches. Freezing them as
+'  numbers destroys the audit chain — opening the merged file shows a
+'  number with no formula trail, no way to trace how the IRR was
+'  derived, no recalc when an input changes. Row 371 (Min Equity DSCR
+'  Multiple) is the *upstream input* that the in-loop GoalSeek targets
+'  via PT Returns!F129. Locking row 371 per-project freezes debt sizing
+'  → equity → IRR all by formula, preserving the audit chain. The
+'  one-cell revert: restore ='PT Returns'!$F$129 on the cell and the
+'  Min Equity solver is back to fully dynamic mode.
 '
 '  Why not stamp inside SolveOneProjectByColHL: doing so captures a
 '  transient cross-project state because each project's solve modifies
 '  cells that NPP Calc!H453 (= F37) and Appraisal cells (= F31, F33)
 '  depend on. The "real" converged value for project N can only be read
 '  after ALL projects have solved AND F2 is set back to N. The worker's
-'  post-read pass does exactly that — stamping there pins the value the
-'  worker is about to report in solved_values, and the merged file's
-'  per-column cells then match the verifier's expectations.
+'  post-read pass does exactly that — stamping the upstream DSCR input
+'  on row 371 pins what the worker is about to report in solved_values,
+'  and the sticky-IF on rows 31/37 then resolves the right numeric for
+'  each project's cached side of the IF.
 '
-'  Rows 31 (Live Appraisal IRR) and 37 (Live IRR) read from F31 / F37
-'  rather than self-assign because the per-column IF formula is a
-'  circular reference; reading the per-column cell would resolve to
-'  the cached side of the IF (= itself) instead of the F<row> side.
 '  Rows 32, 33, 38, 39 self-assign via HardStampNumericHL, which refuses
 '  to freeze Excel error values into the cell.
 '
@@ -603,14 +624,15 @@ Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer, _
         wsPT.Range(PT_DSCR_MULTIPLE).Value = dscrRestore
     End If
 
-    ' Force full propagation BEFORE reading row 31/37. The caller's
-    ' SwitchProjectAndRecalc uses tier-1 CalcSheetsAll which doesn't
-    ' reliably mark cross-sheet OFFSET-via-F2 dependencies dirty under
-    ' xlCalculationManual + multi-threaded calc (same reason the solve
-    ' loop runs CalculateFull at line 821 before declaring convergence).
-    ' Without this, the hard-stamp could pin a stale prior-project IRR
-    ' value into this column — invisible until the merged file diverges
-    ' from the worker's reported solved_values.
+    ' Force full propagation BEFORE reading the per-column outputs. The
+    ' caller's SwitchProjectAndRecalc uses tier-1 CalcSheetsAll which
+    ' doesn't reliably mark cross-sheet OFFSET-via-F2 dependencies dirty
+    ' under xlCalculationManual + multi-threaded calc (same reason the
+    ' solve loop runs CalculateFull at line 821 before declaring
+    ' convergence). Without this, the sticky-IF circular formulas on
+    ' rows 31/37 could fail to freeze the per-project IRR into the
+    ' cached side of the IF, and the merged file would diverge from
+    ' worker-reported solved_values.
     '
     ' Lower MaxIterations to 100 around this call. SetGoalSeekPrecisionHL
     ' raised it to 1000 (GS_MAXITER_COLD) for the solve loop. At 1000
@@ -624,15 +646,27 @@ Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer, _
     Application.CalculateFull
     Application.MaxIterations = lSavedMaxIter
 
-    ' Live IRR / Live Appraisal — read from F-column live cells, not
-    ' self-assign (the per-column IF is circular; self-assign returns
-    ' the cached side of the IF).
-    wsPI.Cells(PI_ROW_IRR_LIVE, colIdx).Value = wsPI.Range(PI_IRR_LIVE).Value
-    wsPI.Cells(PI_ROW_APPR_LIVE, colIdx).Value = wsPI.Range(PI_APPR_LIVE).Value
+    ' Hardcode the converged DSCR Multiple onto row 371. This is the
+    ' upstream input the Min Equity solver targets (via PT Returns!F129
+    ' as the GoalSeek changing cell). Freezing it per-project locks debt
+    ' sizing and lets the sticky-IF circular formulas on rows 31/37 hold
+    ' the right per-project Live IRR / Live Appraisal IRR by formula —
+    ' preserving the audit chain Caroline relies on when opening the
+    ' merged file (every IRR has a traceable formula bar entry, every
+    ' input has a one-cell revert to dynamic).
+    '
+    ' Skip when dscrRestore is non-positive — same opt-out semantics as
+    ' the PT!F129 restore above.
+    If dscrRestore > 0 Then
+        wsPI.Cells(PI_ROW_DSCR_MULT, colIdx).Value = dscrRestore
+    End If
 
     ' Dev Fee, NPP $/W (GoalSeek changing-cells, already numeric) and
     ' FMV, NPP $ total (formulas) — self-assign via the IsError-guarded
-    ' helper.
+    ' helper. Rows 31 (Live Appraisal IRR) and 37 (Live Levered Pre-Tax
+    ' IRR) are deliberately NOT touched — their sticky-IF formulas are
+    ' the audit surface; the row 371 lock above is what controls the
+    ' per-project value of the cached side of the IF.
     HardStampNumericHL wsPI, PI_ROW_DEV_FEE,  colIdx, "POSTREAD"
     HardStampNumericHL wsPI, PI_ROW_NPP,      colIdx, "POSTREAD"
     HardStampNumericHL wsPI, PI_ROW_FMV,      colIdx, "POSTREAD"
@@ -650,16 +684,21 @@ End Sub
 '  directly via Excel COM. Excel handles the .xlsm round-trip natively, so
 '  this is the durable fallback.
 '
-'  Stamps the same six rows that VBA hardcoded at end-of-solve into the
-'  per-project columns (see SolveOneProjectByColHL / SolveHeadless body).
+'  Stamps the same five rows that StampActiveProjectColumnHL writes in
+'  the in-Excel post-solve pass: rows 32 (Dev Fee), 33 (FMV), 38 (NPP
+'  $/W), 39 (NPP $ total), and 371 (Min Equity DSCR Multiple). Rows 31
+'  (Live Appraisal IRR) and 37 (Live Levered Pre-Tax IRR) are
+'  deliberately NOT stamped — see StampActiveProjectColumnHL for the
+'  full rationale; the short version is that locking row 371 lets
+'  rows 31/37 stay as sticky-IF circular formulas, preserving the
+'  audit chain.
 ' ==============================================================================
 Public Sub StampConvergedValuesHL(ByVal colIdx As Integer, _
                                    ByVal npp As Double, _
                                    ByVal devFee As Double, _
                                    ByVal fmv As Double, _
-                                   ByVal liveIRR As Double, _
-                                   ByVal apprLive As Double, _
-                                   ByVal nppTotal As Double)
+                                   ByVal nppTotal As Double, _
+                                   ByVal dscrMult As Double)
     ' Bounds guardrail. Reject anything outside the project-column band
     ' [PI_BASE_COL+1 .. PI_BASE_COL+COL_SCAN_LIMIT] so a corrupted filename
     ' parse in parallel_runner's _merge_via_vba_fallback can't silently
@@ -677,16 +716,23 @@ Public Sub StampConvergedValuesHL(ByVal colIdx As Integer, _
 
     Dim wsPI As Worksheet
     Set wsPI = ThisWorkbook.Sheets(SHT_PI)
-    wsPI.Cells(PI_ROW_NPP,       colIdx).Value = npp
-    wsPI.Cells(PI_ROW_DEV_FEE,   colIdx).Value = devFee
-    wsPI.Cells(PI_ROW_FMV,       colIdx).Value = fmv
-    wsPI.Cells(PI_ROW_IRR_LIVE,  colIdx).Value = liveIRR
-    wsPI.Cells(PI_ROW_APPR_LIVE, colIdx).Value = apprLive
-    wsPI.Cells(PI_ROW_NPP_TOTAL, colIdx).Value = nppTotal
+    wsPI.Cells(PI_ROW_NPP,        colIdx).Value = npp
+    wsPI.Cells(PI_ROW_DEV_FEE,    colIdx).Value = devFee
+    wsPI.Cells(PI_ROW_FMV,        colIdx).Value = fmv
+    wsPI.Cells(PI_ROW_NPP_TOTAL,  colIdx).Value = nppTotal
+    ' Hardcode the converged DSCR Multiple onto row 371 (upstream input
+    ' lock). Rows 31 and 37 stay as their sticky-IF formulas; the row
+    ' 371 lock controls what their cached IF-side resolves to.
+    If dscrMult > 0 Then
+        wsPI.Cells(PI_ROW_DSCR_MULT, colIdx).Value = dscrMult
+    End If
 
     ' Append an audit row to __SolverResults so a bad merge is forensically
     ' recoverable. Columns mirror the per-solve schema, prefixed "merge"
-    ' in column B to distinguish from solve rows.
+    ' in column B to distinguish from solve rows. Column 6 now carries
+    ' the DSCR multiple instead of the (no-longer-stamped) Live IRR;
+    ' column 7 holds 0.0 as a placeholder so downstream schemas that
+    ' read by column index stay valid without code changes.
     Dim wsRes As Worksheet
     Set wsRes = EnsureSolverResultsSheetHL()
     Dim r As Long
@@ -696,8 +742,8 @@ Public Sub StampConvergedValuesHL(ByVal colIdx As Integer, _
     wsRes.Cells(r, 3).Value = npp
     wsRes.Cells(r, 4).Value = devFee
     wsRes.Cells(r, 5).Value = fmv
-    wsRes.Cells(r, 6).Value = liveIRR
-    wsRes.Cells(r, 7).Value = apprLive
+    wsRes.Cells(r, 6).Value = dscrMult
+    wsRes.Cells(r, 7).Value = 0#
     wsRes.Cells(r, 8).Value = nppTotal
     wsRes.Cells(r, 14).Value = CStr(Now)
 End Sub

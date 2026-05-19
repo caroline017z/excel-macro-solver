@@ -360,3 +360,139 @@ def test_direct_runner_threads_dscr_into_stamp_call(monkeypatch) -> None:
             break
     else:
         pytest.fail("STAMP_ACTIVE_PROJECT_COLUMN call site not found")
+
+
+# --- Tranche 7.12: PI 31/37 stay dynamic; hardcode lands on PI 371 ----------
+# Caroline's 2026-05-19 rule: stop hardcoding over PI rows 31 (Live Appraisal
+# IRR) and 37 (Live Levered Pre-Tax IRR) — those need to stay as sticky-IF
+# circular formulas so the audit chain from solver tabs through to the
+# per-column cells is preserved in the formula bar. Instead, hardcode the
+# converged DSCR Multiple onto PI row 371 (Min Equity DSCR Multiple). That
+# upstream-input lock freezes debt sizing / equity / IRR cascade by formula,
+# and the one-cell revert (restore ='PT Returns'!$F$129 on row 371) puts
+# Min Equity back into fully dynamic solve mode.
+#
+# These tests lock in the contract + VBA signature + behavior. Drift in any
+# of these resurrects the audit-chain destruction Caroline rejected.
+
+def test_stamp_converged_values_contract_carries_dscr_not_irrs() -> None:
+    """The StampConvergedValuesHL Python contract must take dscrMult and
+    NOT take liveIRR / apprLive. A regression to the pre-7.12 signature
+    would have the merge fallback re-hardcode over rows 31/37, destroying
+    the audit chain Caroline relies on when opening the merged file.
+    """
+    from dn38_solver.com.vba_contract import STAMP_CONVERGED_VALUES
+
+    arg_names = [a[0] for a in STAMP_CONVERGED_VALUES.args]
+    arg_types = [a[1] for a in STAMP_CONVERGED_VALUES.args]
+    assert arg_names == ["colIdx", "npp", "devFee", "fmv", "nppTotal", "dscrMult"], (
+        f"StampConvergedValuesHL args drifted: got {arg_names}"
+    )
+    assert "liveIRR" not in arg_names, (
+        "liveIRR resurrected in StampConvergedValuesHL — would re-hardcode PI 37"
+    )
+    assert "apprLive" not in arg_names, (
+        "apprLive resurrected in StampConvergedValuesHL — would re-hardcode PI 31"
+    )
+    assert arg_types == ["Integer", "Double", "Double", "Double", "Double", "Double"]
+
+
+def test_vba_stamp_converged_signature_takes_dscr_not_irrs() -> None:
+    """SolveHeadless.bas Public Sub StampConvergedValuesHL must match the
+    Python contract: dscrMult arg, no liveIRR / apprLive. Drift here
+    means the macro re-import would leave the wrong signature in the
+    workbook and Application.Run would fail with arg-count mismatch.
+    """
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parent.parent
+    bas = (repo_root / "SolveHeadless.bas").read_text(encoding="utf-8")
+
+    import re
+    collapsed = re.sub(r"_\s*\n\s*", " ", bas)
+    m = re.search(
+        r"Public Sub StampConvergedValuesHL\(([^)]*)\)",
+        collapsed,
+    )
+    assert m, "StampConvergedValuesHL declaration not found in SolveHeadless.bas"
+    sig = m.group(1)
+    assert "colIdx As Integer" in sig
+    assert "dscrMult As Double" in sig, (
+        f"dscrMult arg missing from VBA sig — Tranche 7.12 reverted: {sig!r}"
+    )
+    assert "liveIRR" not in sig, (
+        f"liveIRR resurrected in VBA sig — would re-hardcode PI 37: {sig!r}"
+    )
+    assert "apprLive" not in sig, (
+        f"apprLive resurrected in VBA sig — would re-hardcode PI 31: {sig!r}"
+    )
+
+
+def test_stamp_active_writes_dscr_to_371_not_31_or_37() -> None:
+    """The Public Sub StampActiveProjectColumnHL body must write the
+    converged DSCR onto row 371 and must NOT write to rows 31 or 37
+    (sticky-IF formulas stay). Structural check against the .bas source
+    text — a unit test on COM behavior isn't feasible without a licensed
+    Excel install + real workbook fixture.
+    """
+    from pathlib import Path
+    import re
+    repo_root = Path(__file__).resolve().parent.parent
+    bas = (repo_root / "SolveHeadless.bas").read_text(encoding="utf-8")
+
+    # Isolate the StampActiveProjectColumnHL body (from `Public Sub` to
+    # matching `End Sub`). Defensive: must locate the body before
+    # asserting against it.
+    m = re.search(
+        r"Public Sub StampActiveProjectColumnHL\([^)]*\)(.*?)End Sub",
+        bas, re.DOTALL,
+    )
+    assert m, "StampActiveProjectColumnHL Sub body not found"
+    body = m.group(1)
+
+    # MUST write to PI_ROW_DSCR_MULT (row 371). The Cells(..., colIdx)
+    # form is the canonical per-column write pattern in the .bas.
+    assert "Cells(PI_ROW_DSCR_MULT, colIdx)" in body, (
+        "StampActiveProjectColumnHL must write the converged DSCR onto "
+        "PI row 371 (PI_ROW_DSCR_MULT) — upstream input lock per Tranche 7.12"
+    )
+
+    # MUST NOT write to PI_ROW_IRR_LIVE or PI_ROW_APPR_LIVE. The Tranche
+    # 7.12 change deliberately leaves rows 31/37 as sticky-IF formulas
+    # so the audit chain stays intact.
+    assert "Cells(PI_ROW_IRR_LIVE, colIdx).Value =" not in body, (
+        "StampActiveProjectColumnHL must NOT hardcode PI row 37 "
+        "(Live Levered Pre-Tax IRR) — Tranche 7.12 reverted"
+    )
+    assert "Cells(PI_ROW_APPR_LIVE, colIdx).Value =" not in body, (
+        "StampActiveProjectColumnHL must NOT hardcode PI row 31 "
+        "(Live Appraisal IRR) — Tranche 7.12 reverted"
+    )
+
+
+def test_merge_output_rows_excludes_31_and_37() -> None:
+    """The merge module's OUTPUT_ROWS (rows copied between worker
+    outputs) must exclude rows 31 and 37 and must include row 371. The
+    openpyxl merge path iterates this exact tuple, so a regression here
+    would re-copy the hardcoded IRR cache cells (pre-7.12 behavior) or
+    drop the DSCR multiple stamp (broken merge).
+    """
+    from dn38_solver.merge import OUTPUT_ROWS
+
+    assert 31 not in OUTPUT_ROWS, (
+        "OUTPUT_ROWS includes row 31 — merge would re-copy hardcoded "
+        "Live Appraisal IRR, destroying the sticky-IF audit chain"
+    )
+    assert 37 not in OUTPUT_ROWS, (
+        "OUTPUT_ROWS includes row 37 — merge would re-copy hardcoded "
+        "Live Levered Pre-Tax IRR, destroying the sticky-IF audit chain"
+    )
+    assert 371 in OUTPUT_ROWS, (
+        "OUTPUT_ROWS missing row 371 — merge wouldn't carry the "
+        "Min Equity DSCR Multiple lock per Tranche 7.12"
+    )
+    # Lock in the exact tuple as a regression net. Adding a row in
+    # the future is fine; the targeted asserts above will still catch
+    # specific bad-rows. But pinning the current set documents intent.
+    assert set(OUTPUT_ROWS) == {32, 33, 38, 39, 371}, (
+        f"OUTPUT_ROWS drifted from Tranche 7.12 baseline: got {OUTPUT_ROWS}"
+    )
