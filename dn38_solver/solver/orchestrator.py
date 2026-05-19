@@ -195,20 +195,18 @@ def solve_all(
     preflight = run_preflight(workbook_path)
     log.info("\n%s", format_preflight_report(preflight))
 
-    # Phase 0.5 — Auto-import macro (D15/D17 remediation).
-    # If pre-flight surfaces D15 (missing required Public Subs in the
-    # embedded macro) or D17 (hash drift between repo .bas and workbook
-    # stamp), AND the operator passed --auto-import-macro, run the macro
-    # import via Excel COM SaveAs subprocess and re-run preflight. This
-    # closes the UX gap where today's operator has to manually shell out
-    # to `python import_vba_module.py "<workbook>"` before every run on
-    # a stale workbook. Reactive recovery (post-COM-failure re-import)
-    # still works as a backstop for runtime drift.
+    # Phase 0.5 — Auto-import macro into SOURCE workbook.
+    # Destructive path: --auto-import-macro alone (without --auto-fix) is
+    # the explicit "mutate the source" mode. Kept for back-compat with
+    # callers that need the side effect (e.g., a one-off macro refresh on
+    # a workbook the operator wants to keep as the canonical artifact).
+    # The preferred path for everyday solves is --auto-fix, which routes
+    # the same re-import into the _FIXED.xlsm sibling — see Phase 0.6.
     macro_import_codes = {"D15", "D17"}
     needs_macro_import = any(
         f.code in macro_import_codes for f in preflight.findings
     )
-    if auto_import_macro and needs_macro_import:
+    if auto_import_macro and not auto_fix and needs_macro_import:
         try:
             from dn38_solver.com.auto_recovery import (
                 AutoRecoveryUnavailable,
@@ -261,22 +259,31 @@ def solve_all(
                 ),
             )
 
-    # Auto-fix path: write _FIXED.xlsm and resume against it.
-    # Preserves the original file path in the run record so the audit
-    # trail names the source workbook, not the patched copy.
+    # Phase 0.6 — Auto-fix sibling path.
+    # Write _FIXED.xlsm and resume against it. Preserves the original
+    # file path in the run record so the audit trail names the source
+    # workbook, not the patched copy.
     #
-    # We DO NOT re-run the full preflight on the fixed file. The fixed
-    # file differs from the source ONLY in the calcPr/iterateDelta XML
-    # attribute (the sole auto-fixable finding today, A1). No other
-    # finding depends on that attribute, so re-running preflight would
-    # produce identical findings minus A1 — at a cost of 4 openpyxl
-    # loads of a 13MB xlsm (~10 min). Instead, filter A1 (and any other
-    # applied codes) out of the existing result and proceed.
+    # Per Tranche 7.13, --auto-fix covers TWO classes of auto-fixable
+    # findings:
+    #   * A1  — workbook calcPr / iterateDelta missing or out-of-bound.
+    #           Patched at the xl/workbook.xml zip layer (no COM).
+    #   * D15 / D17 — embedded macro missing required Subs or .bas hash
+    #           drift. Patched via reimport_macro_subprocess (Excel COM
+    #           SaveAs against the sibling — the source remains
+    #           untouched).
+    #
+    # Both paths target the _FIXED.xlsm sibling, never the source. After
+    # the patch pass, we re-check only the affected codes (A1 from the
+    # findings filter; D15/D17 by re-running the D-tier scan against the
+    # patched file). We do NOT re-run the full preflight — its A/B/C/E
+    # tiers are invariant under both A1 and D15/D17 mutations.
     original_workbook_path = workbook_path
     if auto_fix and preflight.auto_fixable:
         fixed_path = workbook_path.with_name(
             workbook_path.stem + "_FIXED" + workbook_path.suffix
         )
+        auto_fixable_codes = {f.code for f in preflight.auto_fixable}
         log.info(
             "  Auto-fix: applying %d fixable finding(s) -> %s",
             len(preflight.auto_fixable), fixed_path.name,
@@ -284,9 +291,67 @@ def solve_all(
         fixed_path, applied_codes = apply_auto_fixes(
             workbook_path, fixed_path, preflight.findings
         )
-        log.info("  Auto-fix: applied codes %s", applied_codes)
+        if applied_codes:
+            log.info("  Auto-fix: applied codes %s (zip-layer)", applied_codes)
+
+        # Macro re-import on the sibling. apply_auto_fixes already
+        # copied the source to fixed_path (and patched A1 if needed),
+        # so the sibling exists and is ready to be SaveAs'd by the
+        # macro import subprocess. The source workbook is untouched.
+        macro_codes_fired = auto_fixable_codes & macro_import_codes
+        if macro_codes_fired:
+            try:
+                from dn38_solver.com.auto_recovery import (
+                    AutoRecoveryUnavailable,
+                    reimport_macro_subprocess,
+                )
+                log.info(
+                    "  Auto-fix: re-importing macro into sibling %s "
+                    "(%s fired in pre-flight)...",
+                    fixed_path.name, ", ".join(sorted(macro_codes_fired)),
+                )
+                reimport_macro_subprocess(fixed_path)
+                applied_codes = list(applied_codes) + sorted(macro_codes_fired)
+                log.info(
+                    "  Auto-fix: re-checking D15/D17 against patched sibling..."
+                )
+                new_d_findings: list = []
+                new_d_findings.extend(check_macro_version(fixed_path))
+                new_d_findings.extend(check_macro_hash(fixed_path))
+                d_tier_codes = {"D15", "D16", "D17"}
+                filtered = tuple(
+                    f for f in preflight.findings if f.code not in d_tier_codes
+                )
+                # Re-stitch into a preflight result against the patched
+                # path. The A/B/C/E findings still reference the source's
+                # path attribute, but their codes are what gates the run.
+                preflight = type(preflight)(
+                    workbook_path=str(fixed_path),
+                    findings=filtered + tuple(new_d_findings),
+                    error_scan=preflight.error_scan,
+                )
+            except AutoRecoveryUnavailable as ar_exc:
+                log.error("  Auto-fix macro re-import FAILED: %s", ar_exc)
+                return RunRecord(
+                    workbook_name=workbook_path.name,
+                    run_timestamp=now_iso(),
+                    batch_id=batch_id,
+                    solver_mode="hybrid_shadow",
+                    projects=(),
+                    total_duration_sec=time.time() - start,
+                    status=SolveStatus.ERROR.value,
+                    error=(
+                        f"Auto-fix macro re-import failed: {ar_exc}. Close "
+                        "the workbook if open in Excel, verify Trust Center "
+                        "'Trust access to the VBA project object model' is "
+                        "enabled, and retry."
+                    ),
+                )
+
         workbook_path = fixed_path  # swap to the fixed copy for the solve
 
+        # Filter the codes we just resolved out of the cached preflight
+        # result so the bank-grade error gate below sees a clean slate.
         applied_set = set(applied_codes)
         preflight = type(preflight)(
             workbook_path=str(fixed_path),

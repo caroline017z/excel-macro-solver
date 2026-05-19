@@ -683,7 +683,11 @@ def check_macro_version(workbook_path: Path) -> list[PreflightFinding]:
                 f'Re-import the latest macro: python import_vba_module.py '
                 f'"{workbook_path}"'
             ),
-            auto_fixable=False,  # Requires Excel COM; not safe to auto-do
+            # Per Tranche 7.13: --auto-fix can recover from this by
+            # re-importing the macro into the _FIXED.xlsm sibling
+            # (orchestrator handles the COM call; preflight stays pure).
+            # The original workbook is never mutated.
+            auto_fixable=True,
         ))
 
     stale_present = [m for m in STALE_MACRO_MODULES if m in text]
@@ -786,7 +790,9 @@ def check_macro_hash(workbook_path: Path) -> list[PreflightFinding]:
                 f"Re-import the macro once to plant the stamp: "
                 f'python import_vba_module.py "{workbook_path}"'
             ),
-            auto_fixable=False,
+            # Per Tranche 7.13: --auto-fix re-imports the macro into the
+            # _FIXED.xlsm sibling, which plants the stamp as a side effect.
+            auto_fixable=True,
         ))
         return findings
     if stamped.lower() != current.lower():
@@ -809,7 +815,10 @@ def check_macro_hash(workbook_path: Path) -> list[PreflightFinding]:
                 f'Re-import the macro: python import_vba_module.py '
                 f'"{workbook_path}"'
             ),
-            auto_fixable=False,
+            # Per Tranche 7.13: --auto-fix re-imports the macro into the
+            # _FIXED.xlsm sibling and re-checks D15/D17 post-import.
+            # Original workbook is never mutated.
+            auto_fixable=True,
         ))
     return findings
 

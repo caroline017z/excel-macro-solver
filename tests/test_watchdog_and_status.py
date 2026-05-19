@@ -496,3 +496,72 @@ def test_merge_output_rows_excludes_31_and_37() -> None:
     assert set(OUTPUT_ROWS) == {32, 33, 38, 39, 371}, (
         f"OUTPUT_ROWS drifted from Tranche 7.12 baseline: got {OUTPUT_ROWS}"
     )
+
+
+# --- Tranche 7.13: --auto-fix unifies A1 + D15/D17 on the _FIXED sibling ----
+# Caroline's seamless-everyday-solve preference: one flag (--auto-fix) covers
+# both the calcPr iterateDelta patch (A1) and the macro re-import for missing-
+# functions / hash drift (D15/D17). Both target the _FIXED.xlsm sibling so
+# the source workbook is never mutated. The orchestrator's Phase 0.6 block is
+# the gate; these tests lock the structural invariants so a future refactor
+# can't silently degrade the UX back to the two-flag dance.
+
+def test_orchestrator_auto_fix_block_handles_macro_codes() -> None:
+    """The Phase 0.6 auto-fix block in solver/orchestrator.py must
+    re-import the macro into the _FIXED.xlsm sibling when D15 or D17
+    is in preflight.auto_fixable. Source-level check — invoking the
+    real flow requires a licensed Excel install + COM round-trip.
+    """
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parent.parent
+    src = (repo_root / "dn38_solver" / "solver" / "orchestrator.py").read_text(
+        encoding="utf-8"
+    )
+
+    # The block exists.
+    assert "if auto_fix and preflight.auto_fixable:" in src, (
+        "Phase 0.6 auto-fix block missing — Tranche 7.13 reverted"
+    )
+    # Inside it, D15/D17 fork into reimport_macro_subprocess on the
+    # _FIXED sibling.
+    assert "macro_codes_fired" in src, (
+        "Tranche 7.13 macro-codes branch missing from auto-fix block"
+    )
+    assert "reimport_macro_subprocess(fixed_path)" in src, (
+        "Macro re-import must target fixed_path (the _FIXED sibling), "
+        "not workbook_path (the source). The whole point of routing "
+        "through --auto-fix is to keep the source untouched."
+    )
+    # And it must NOT call reimport_macro_subprocess(workbook_path)
+    # anywhere inside the --auto-fix branch (that would be the
+    # destructive --auto-import-macro path leaking into the safe path).
+    auto_fix_block_start = src.index("if auto_fix and preflight.auto_fixable:")
+    # End of the block: the next `# Bank-grade gate` comment, which is
+    # the section divider right after Phase 0.6.
+    auto_fix_block_end = src.index("# Bank-grade gate", auto_fix_block_start)
+    auto_fix_block = src[auto_fix_block_start:auto_fix_block_end]
+    assert "reimport_macro_subprocess(workbook_path)" not in auto_fix_block, (
+        "Auto-fix block must not call reimport_macro_subprocess on the "
+        "source workbook_path — that destroys the source-untouched "
+        "invariant. Use fixed_path (the _FIXED sibling) instead."
+    )
+
+
+def test_orchestrator_auto_import_macro_skips_when_auto_fix_set() -> None:
+    """When both --auto-fix and --auto-import-macro are set, --auto-fix
+    wins (the source stays untouched). The Phase 0.5 source-mutation
+    block must gate itself off when auto_fix is True.
+    """
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parent.parent
+    src = (repo_root / "dn38_solver" / "solver" / "orchestrator.py").read_text(
+        encoding="utf-8"
+    )
+    # The Phase 0.5 gate must include `not auto_fix` so it skips when
+    # the operator passed both flags. Otherwise both branches fire and
+    # the source ends up mutated.
+    assert "if auto_import_macro and not auto_fix and needs_macro_import:" in src, (
+        "Phase 0.5 (source-mutation auto-import) must gate on "
+        "`not auto_fix` per Tranche 7.13 — otherwise passing both flags "
+        "still mutates the source"
+    )

@@ -202,26 +202,29 @@ def main() -> None:
         help=(
             "Patch auto-fixable pre-flight findings into a sibling "
             "<workbook>_FIXED.xlsm copy and proceed against the patched "
-            "file. Original workbook is never modified. Only A1 "
-            "(missing iterateDelta) is auto-fixable today; structural "
-            "issues require manual remediation. Off by default — bank-"
-            "grade default is to surface and halt rather than silently "
-            "mutate the input."
+            "file. Original workbook is never modified. Covers: "
+            "A1 (missing iterateDelta — zip-layer patch) and D15/D17 "
+            "(missing macro functions or .bas hash drift — re-imported "
+            "into the sibling via Excel COM SaveAs). For seamless "
+            "everyday solves, this is the flag you want. Off by default "
+            "— bank-grade default is to surface and halt rather than "
+            "silently mutate the input."
         ),
     )
     parser.add_argument(
         "--auto-import-macro",
         action="store_true",
         help=(
-            "If pre-flight surfaces D15 (missing macro functions) or D17 "
-            "(macro hash drift between repo .bas and workbook stamp), "
-            "automatically re-import SolveHeadless.bas into the source "
-            "workbook via Excel COM SaveAs (a destructive mutation — "
-            "writes vbaProject.bin and the DN38_BAS_SHA256 stamp on the "
-            "original file). Closes the UX gap where the operator would "
-            "otherwise need to shell out to import_vba_module.py manually. "
-            "Off by default — bank-grade default never mutates the input "
-            "without explicit consent."
+            "DESTRUCTIVE source-mutation path. If pre-flight surfaces "
+            "D15 (missing macro functions) or D17 (.bas hash drift), "
+            "re-import SolveHeadless.bas directly into the source "
+            "workbook via Excel COM SaveAs (writes vbaProject.bin and "
+            "the DN38_BAS_SHA256 stamp on the original file). Use this "
+            "when you want the original workbook itself updated. For "
+            "everyday solves, prefer --auto-fix, which routes the same "
+            "re-import into the _FIXED.xlsm sibling instead. If both "
+            "flags are passed, --auto-fix wins (the source stays "
+            "untouched). Off by default."
         ),
     )
     parser.add_argument(

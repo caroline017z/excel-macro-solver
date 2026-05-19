@@ -502,6 +502,14 @@ class TestMacroVersion:
             assert missing in d15[0].message, (
                 f"Expected {missing} in D15 message: {d15[0].message}"
             )
+        # Tranche 7.13: D15 (missing-functions variant) is auto_fixable
+        # — orchestrator handles via reimport_macro_subprocess on the
+        # _FIXED.xlsm sibling under --auto-fix.
+        assert d15[0].auto_fixable is True, (
+            "D15 (missing functions) must be auto_fixable=True per "
+            "Tranche 7.13 — orchestrator routes a macro re-import into "
+            "the _FIXED.xlsm sibling under --auto-fix"
+        )
 
     def test_d16_stale_modules_detected(self, tmp_path):
         import zipfile as zf
@@ -750,6 +758,31 @@ class TestMacroHashDrift:
         assert len(d17) == 1
         assert d17[0].severity == "error"
         assert "does not match" in d17[0].message
+        # Tranche 7.13: hash-drift D17 is auto_fixable. Orchestrator
+        # re-imports the macro into the _FIXED.xlsm sibling under
+        # --auto-fix so the source workbook is never mutated.
+        assert d17[0].auto_fixable is True, (
+            "D17 (hash drift error) must be auto_fixable=True per "
+            "Tranche 7.13 — operator must not need a separate flag for "
+            "the common macro-drift case"
+        )
+
+    def test_no_stamp_d17_is_auto_fixable(self, tmp_path):
+        """The 'no stamp' warning variant of D17 is also auto_fixable —
+        a macro re-import plants the stamp as a side effect, so
+        --auto-fix should clear this warning automatically.
+        """
+        if _current_bas_sha256() is None:
+            pytest.skip("SolveHeadless.bas not in repo")
+        path = _baseline_xlsm(tmp_path)
+        result = run_preflight(path)
+        d17 = [f for f in result.findings if f.code == "D17"]
+        assert len(d17) == 1
+        assert d17[0].severity == "warning"
+        assert d17[0].auto_fixable is True, (
+            "D17 (no-stamp warning) must be auto_fixable=True per "
+            "Tranche 7.13"
+        )
 
     def test_xlsx_skips_macro_hash_check(self, tmp_path):
         # .xlsx is macro-free by spec — D17 must not fire on it even
