@@ -449,13 +449,22 @@ def check_workbook_protection(wb: openpyxl.Workbook) -> list[PreflightFinding]:
 
 
 def check_active_projects(wb: openpyxl.Workbook) -> list[PreflightFinding]:
-    """B9: at least one project must be flagged active in row 7."""
+    """B9: at least one project must be flagged active in row 7.
+
+    Scans the full PI_PROJECT_COL_RANGE (H..BG, cols 8..59) — not just
+    H..S as in the original implementation. The hardcoded H..S range
+    pre-dated portfolios bigger than 12 projects and silently missed
+    every active toggle past col S on a workbook with > 12 projects
+    (caught on the 2026-05-19 SolarStone re-run — 15 projects toggled
+    on at V..AJ but B9 false-positive'd "no active projects").
+    """
     if "Project Inputs" not in wb.sheetnames:
         return []  # B5 covered this
     ws = wb["Project Inputs"]
-    # Project columns are H..S (8..19). Row 7 is the active flag (1=on).
+    start_col = column_index_from_string(PI_PROJECT_COL_RANGE[0])
+    end_col = column_index_from_string(PI_PROJECT_COL_RANGE[1])
     active_cols = []
-    for col in range(column_index_from_string("H"), column_index_from_string("S") + 1):
+    for col in range(start_col, end_col + 1):
         v = ws.cell(row=7, column=col).value
         if v == 1:
             active_cols.append(col)
@@ -463,7 +472,10 @@ def check_active_projects(wb: openpyxl.Workbook) -> list[PreflightFinding]:
         return [PreflightFinding(
             code="B9",
             severity="error",
-            location="Project Inputs!H7:S7",
+            location=(
+                f"Project Inputs!{PI_PROJECT_COL_RANGE[0]}7:"
+                f"{PI_PROJECT_COL_RANGE[1]}7"
+            ),
             message="no active projects flagged (row 7 = 1 in any project column)",
             impact="Solver will exit immediately with 'No active projects found'.",
             remediation=(

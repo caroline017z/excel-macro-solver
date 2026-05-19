@@ -159,6 +159,38 @@ class TestStructure:
         result = run_preflight(path)
         assert any(f.code == "B9" for f in result.findings)
 
+    def test_b9_scans_full_project_col_range_not_just_h_to_s(self, tmp_path):
+        """B9 must scan H..BG (the full PI_PROJECT_COL_RANGE), not just
+        H..S. The old implementation hardcoded H..S (cols 8..19) and
+        silently missed every active toggle past col S — a 15-project
+        portfolio with toggles at V..AJ (cols 22..36) false-positive'd
+        as "no active projects." Caught on 2026-05-19 SolarStone re-run.
+
+        Fixture: turn off H..S entirely, set V7 = 1 (a column the old
+        range didn't cover). B9 must NOT fire.
+        """
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Clear every toggle in the old H..S range
+        for col_letter in ("H", "I", "J", "K", "L", "M", "N", "O", "P",
+                           "Q", "R", "S"):
+            ws[f"{col_letter}7"] = 0
+        # Set a toggle past the old scan boundary
+        ws["V7"] = 1
+        # Plant a project name on V so the row reads as populated; B9
+        # is permissive about column names, but populated rows make the
+        # fixture realistic.
+        ws["V4"] = "Mock project past col S"
+        wb.save(path)
+        result = run_preflight(path)
+        b9 = [f for f in result.findings if f.code == "B9"]
+        assert b9 == [], (
+            f"B9 must NOT fire when V7=1 — preflight scans full "
+            f"PI_PROJECT_COL_RANGE (H..BG). Old H..S hardcode regressed. "
+            f"Got: {b9}"
+        )
+
 
 # --- E-tier (input bounds) -----------------------------------------------
 
