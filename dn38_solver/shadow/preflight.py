@@ -140,6 +140,18 @@ RC_OFFSET_NAME = 1
 RC_OFFSET_TOGGLE = 2
 RC_OFFSET_GEN_RATE = 3
 
+# Equity master on/off toggles for each RC. These sit ABOVE the per-RC
+# sub-blocks under the "Revenue Rate Components for Equity Model" header
+# (row 149). When the master toggle is 0, the RC contributes zero
+# revenue regardless of the per-block Custom/Generic config below — so
+# E15a/b/c must skip those (col, rc) pairs to avoid false positives on
+# the common pattern of a workbook with RC5/RC6 master-off but cosmetic
+# values still in the sub-blocks (typical IL CS deal config — RC5/RC6
+# master-off for all projects but rows 197-215 carry leftover template
+# data). Caught on the 2026-05-18 SolarStone next-wave run after the
+# E15c block produced an actionable false positive.
+RC_MASTER_TOGGLE_ROWS = (150, 151, 152, 153, 154, 155)  # RC1..RC6, Equity
+
 # Marker function names that must exist in the embedded macro for the
 # current orchestrator to drive the workbook correctly. Absence implies
 # the workbook hasn't had the latest macro re-imported. Scanned as ASCII
@@ -522,11 +534,36 @@ def check_critical_path_errors(
         # Active cash-flow region only — the OFFSET picks columns to the
         # right of where the CT comes online.
         max_col = min(ws.max_column, column_index_from_string(APPRAISAL_CASHFLOW_MAX_COL))
-        for row in APPRAISAL_CASHFLOW_ROWS:
-            for col in range(column_index_from_string("J"), max_col + 1):
-                v = ws.cell(row=row, column=col).value
+        # Use iter_rows for bulk scanning, NOT ws.cell() in a loop. The
+        # caller's wb_values handle was opened with read_only=True for
+        # memory efficiency; in that mode each random ws.cell(row, col)
+        # call re-streams the sheet part from the start, making the
+        # nested loop O(rows × cols × cols) instead of O(rows × cols).
+        # On a workbook with the Appraisal cashflow spanning ~550 cols
+        # (post-many-projects-solved state), this turned a sub-second
+        # check into a multi-minute hang that timed out pre-flight
+        # entirely. (Caught 2026-05-18 on the 25-project SolarStone
+        # re-run — the same workbook ran cleanly through the same check
+        # earlier in the day when fewer columns were populated.)
+        min_col = column_index_from_string("J")
+        appr_row_set = set(APPRAISAL_CASHFLOW_ROWS)
+        # iter_rows is bulk-streamed and respects min_row/max_row, so
+        # we get one efficient pass over just the cashflow rows.
+        first_row = min(APPRAISAL_CASHFLOW_ROWS)
+        last_row = max(APPRAISAL_CASHFLOW_ROWS)
+        for row_idx, row_vals in enumerate(
+            ws.iter_rows(min_row=first_row, max_row=last_row,
+                         min_col=1, max_col=max_col, values_only=True),
+            start=first_row,
+        ):
+            if row_idx not in appr_row_set:
+                continue
+            for col_offset, v in enumerate(row_vals, start=1):
+                if col_offset < min_col:
+                    continue
                 if is_error(v):
-                    bad_cf.append(f"Appraisal!{ws.cell(row=row, column=col).coordinate}={v}")
+                    coord = ws.cell(row=row_idx, column=col_offset).coordinate
+                    bad_cf.append(f"Appraisal!{coord}={v}")
                     if len(bad_cf) >= 10:
                         break
             if len(bad_cf) >= 10:
@@ -901,13 +938,33 @@ def check_rate_component_config(wb: openpyxl.Workbook) -> list[PreflightFinding]
     ws = wb["Project Inputs"]
 
     # Collect (rc_idx, col_letter, toggle, rate_name, generic_rate) for
-    # every active project × every RC. Used for E15a, E15b, and E15c.
+    # every active project × every RC. Skip (col, rc) pairs where the
+    # Equity master toggle (rows 150-155) is 0 — those RCs don't
+    # contribute to revenue regardless of what the per-block sub-block
+    # at rows 157-215 contains, so flagging them as "asymmetric" or
+    # "Custom-empty" produces false positives. The model's per-block
+    # cells often retain leftover template values when the master is
+    # off, especially in IL CS deals where only RC1/RC2 are typically
+    # active. Used for E15a, E15b, and E15c.
     per_project_rc: list[tuple[int, str, object, object, object]] = []
     active_cols: list[int] = []
+    skipped_master_off = 0
     for col in iter_active_project_cols(ws):
         active_cols.append(col)
         col_letter = ws.cell(row=PI_ROW_DEV_FEE, column=col).coordinate.rstrip("0123456789")
         for rc_idx, base in enumerate(RC_BLOCK_BASES, start=1):
+            master = ws.cell(row=RC_MASTER_TOGGLE_ROWS[rc_idx - 1], column=col).value
+            # Master toggle is 0/1 per project. Treat anything that
+            # isn't an explicit truthy numeric as off — None / blank /
+            # FALSE all mean "RC inactive for Equity," so the sub-block
+            # below is irrelevant.
+            try:
+                master_on = float(master) == 1.0
+            except (TypeError, ValueError):
+                master_on = False
+            if not master_on:
+                skipped_master_off += 1
+                continue
             rate_name = ws.cell(row=base + RC_OFFSET_NAME, column=col).value
             rc_toggle = ws.cell(row=base + RC_OFFSET_TOGGLE, column=col).value
             generic_rate = ws.cell(row=base + RC_OFFSET_GEN_RATE, column=col).value

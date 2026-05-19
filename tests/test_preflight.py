@@ -204,6 +204,11 @@ class TestInputBounds:
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
         ws = wb["Project Inputs"]
+        # Master Equity toggle ON for RC5 (row 154). Required since
+        # the SolarStone 2026-05-18 fix — E15a/b/c skip (col, rc) pairs
+        # where the master toggle = 0 (RC inactive for Equity, so the
+        # sub-block content is cosmetic).
+        ws["H154"] = 1
         # RC5 PI sub-block base = 197 → Rate Name=198, Toggle=199
         ws["H198"] = None         # empty Rate Name
         ws["H199"] = "Custom"     # Custom toggle
@@ -232,6 +237,9 @@ class TestInputBounds:
         ws["I7"] = 1
         ws["I32"] = 0.30
         ws["I38"] = 0.50
+        # Master Equity toggle ON for RC5 on both projects (row 154).
+        ws["H154"] = 1
+        ws["I154"] = 1
         # RC5: H=Generic with name, I=Custom with name (both populated, just mixed)
         ws["H198"] = "Merchant Rate"
         ws["H199"] = "Generic"
@@ -263,6 +271,9 @@ class TestInputBounds:
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
         ws = wb["Project Inputs"]
+        # Master Equity toggle ON for RC5 on both projects (row 154).
+        ws["H154"] = 1
+        ws["I154"] = 1
         # Project H: RC5 Generic with 5.5% merchant rate (Queen City H-N pattern)
         ws["H198"] = "Merchant Rate"
         ws["H199"] = "Generic"
@@ -282,6 +293,48 @@ class TestInputBounds:
         assert "RC5" in e15c[0].message
         assert e15c[0].severity == "error"
 
+    def test_e15_master_off_suppresses_all_three_checks(self, tmp_path):
+        """SolarStone 2026-05-18 fix: when the Equity master toggle for an
+        RC is 0 (row 150-155), E15a/b/c must skip that RC entirely — the
+        per-block sub-block content is cosmetic when the master is off.
+
+        Without this, a workbook with the master RC5 turned off on all
+        projects but leftover template values in rows 197-215 produces
+        a false-positive E15c block on a perfectly valid solve. (The
+        SolarStone next-wave run hit exactly this — 25 projects with
+        RC5 master-off but rows 197-203 retained template merchant-rate
+        config, and the run was blocked until the operator overrode.)
+        """
+        path = _baseline_workbook(tmp_path)
+        wb = openpyxl.load_workbook(path)
+        ws = wb["Project Inputs"]
+        # Master Equity toggle OFF for RC5 (row 154) — the value of 0
+        # means RC5 contributes zero revenue regardless of the sub-block.
+        ws["H154"] = 0
+        # Even with a fully-populated Generic + revenue config on H,
+        # and an asymmetric Custom-empty on I, the master-off should
+        # suppress all three E15 checks for RC5.
+        ws["H198"] = "Merchant Rate"
+        ws["H199"] = "Generic"
+        ws["H200"] = 0.055  # would normally trigger E15c
+        ws["I4"] = "P2"
+        ws["I7"] = 1
+        ws["I32"] = 0.30
+        ws["I38"] = 0.50
+        ws["I154"] = 0      # master OFF on I too
+        ws["I198"] = None
+        ws["I199"] = "Custom"  # would normally trigger E15a/E15b
+        wb.save(path)
+
+        result = run_preflight(path)
+        codes = {f.code for f in result.findings}
+        assert "E15a" not in codes, (
+            f"E15a fired despite master-off; got: "
+            f"{[(f.code, f.message) for f in result.findings if f.code.startswith('E15')]}"
+        )
+        assert "E15b" not in codes
+        assert "E15c" not in codes
+
     def test_e15c_uniform_custom_empty_does_not_fire(self, tmp_path):
         """E15c must NOT fire when ALL active projects have Custom + empty
         on the same RC (uniform disable, SMP 2026-05-18 pattern). Without
@@ -289,6 +342,11 @@ class TestInputBounds:
         path = _baseline_workbook(tmp_path)
         wb = openpyxl.load_workbook(path)
         ws = wb["Project Inputs"]
+        # Master Equity toggle ON for RC5 on both projects so the E15
+        # checks actually evaluate the sub-blocks (uniform Custom-empty
+        # is the intentional-disable case the test asserts is harmless).
+        ws["H154"] = 1
+        ws["I154"] = 1
         # Project H: RC5 Custom + empty (uniform pattern)
         ws["H198"] = None
         ws["H199"] = "Custom"
