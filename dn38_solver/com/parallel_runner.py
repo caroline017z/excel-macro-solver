@@ -463,7 +463,9 @@ def run_parallel(
 
         # Start the status aggregator. Each worker writes its own status JSON;
         # the aggregator merges them into the canonical `solver_status.json`
-        # the Streamlit tracker reads, so dashboards work without changes.
+        # and runs the per-worker stall detector. No live viewer ships (the
+        # Streamlit dashboard was removed); the file is retained for stall
+        # detection and ad-hoc inspection of an in-flight run.
         # Pass expected_worker_count explicitly so the aggregator's
         # "don't roll up to complete until all workers have reported"
         # guard is wired correctly. Defaulting via len(worker_status_paths)

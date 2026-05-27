@@ -6,6 +6,9 @@ dist/
 build/
 .venv/
 venv/
+# Dependencies are declared in pyproject.toml (canonical) + requirements.txt;
+# uv.lock is a local resolution artifact and is not the source of truth here.
+uv.lock
 
 # Data
 results.db

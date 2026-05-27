@@ -1,10 +1,7 @@
+# Runtime dependencies — mirror of [project.dependencies] in pyproject.toml,
+# which is the canonical source. Optional groups (e.g. dev) live there under
+# [project.optional-dependencies]; install with: uv pip install -e ".[dev]"
 pywin32>=306; platform_system == "Windows"
 psutil>=5.9.0
 msgspec>=0.18.0
 openpyxl>=3.1.0
-streamlit>=1.30.0
-plotly>=5.18.0
-pandas>=2.0.0
-formulas>=1.3.0
-scipy>=1.10.0
-numpy-financial>=1.0.0
