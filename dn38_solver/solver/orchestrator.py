@@ -35,7 +35,6 @@ from dn38_solver.shadow.preflight import (
 )
 from dn38_solver.shadow.validation import (
     format_validation_report,
-    scan_workbook_errors,
 )
 from dn38_solver.com.direct_runner import run_direct
 from dn38_solver.solver.sequence import build_solve_task
@@ -841,7 +840,6 @@ def solve_all(
         for r in project_results:
             tier_counts[r.convergence_tier] = tier_counts.get(r.convergence_tier, 0) + 1
         n_total = len(project_results)
-        n_attempted = n_total - tier_counts["not_attempted"]
         n_ship = tier_counts["strict"] + (
             tier_counts["relaxed"] if allow_relaxed else 0
         )
@@ -850,7 +848,7 @@ def solve_all(
         log.info(
             "  Ship-ready: %d/%d projects%s",
             n_ship, n_total,
-            f"  (relaxed counted, --allow-relaxed)" if allow_relaxed else "",
+            "  (relaxed counted, --allow-relaxed)" if allow_relaxed else "",
         )
         log.info(
             "  Convergence: %d strict / %d relaxed / %d none / %d not_attempted",

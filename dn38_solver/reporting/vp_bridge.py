@@ -9,8 +9,8 @@ import logging
 from pathlib import Path
 
 from dn38_solver.types import ProjectResult, RunRecord
-from dn38_solver.config import DB_PATH, LABEL_TO_ROW, OUTPUT_ROWS
-from dn38_solver.storage.database import get_connection, get_latest_run, get_run_by_id, get_runs
+from dn38_solver.config import DB_PATH
+from dn38_solver.storage.database import get_connection, get_run_by_id, get_runs
 
 log = logging.getLogger(__name__)
 
