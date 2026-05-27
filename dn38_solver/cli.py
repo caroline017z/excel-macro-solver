@@ -13,7 +13,7 @@ import logging
 import sys
 from pathlib import Path
 
-from dn38_solver.config import DEFAULT_WORKBOOK, OUTPUT_ROWS
+from dn38_solver.config import DEFAULT_WORKBOOK
 from dn38_solver.shadow.preflight import (
     format_preflight_report,
     run_preflight,
@@ -25,7 +25,6 @@ from dn38_solver.storage.database import (
     get_runs,
 )
 from dn38_solver.types import (
-    ProjectResult,
     RELAXED_LEGEND,
     SolveStatus,
     convergence_label,
@@ -88,7 +87,7 @@ def _show_history(limit: int = 20) -> None:
         return
 
     print(f"\n{'='*80}")
-    print(f"  Recent Solver Runs")
+    print("  Recent Solver Runs")
     print(f"{'='*80}")
     print(f"  {'Timestamp':<22} {'Workbook':<30} {'Projects':>8} {'Status':>14}")
     print(f"  {'-'*22} {'-'*30} {'-'*8} {'-'*14}")

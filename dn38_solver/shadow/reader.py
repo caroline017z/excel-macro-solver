@@ -11,7 +11,7 @@ from typing import Self
 
 import openpyxl
 
-from dn38_solver.types import CellRef, ProjectInfo
+from dn38_solver.types import ProjectInfo
 from dn38_solver.config import (
     BASE_COL,
     OUTPUT_ROWS,

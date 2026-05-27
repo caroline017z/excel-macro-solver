@@ -11,8 +11,8 @@ Performance gains over subprocess approach:
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
+import os as _os
 import shutil
 import tempfile
 import time
@@ -29,7 +29,6 @@ from dn38_solver.com.vba_contract import (
     FINALIZE_SOLVE_ENV,
     INIT_SOLVE_ENV,
     SET_SKIP_OUTPUT_RECALC,
-    SOLVE_HEADLESS,
     SOLVE_ONE_PROJECT_BY_COL,
     STAMP_ACTIVE_PROJECT_COLUMN,
     SWITCH_PROJECT_AND_RECALC,
@@ -53,7 +52,6 @@ _RESULTS_BULK_ROWS = 200
 # 2-3 min per project; cold-start solves can reach 5-6 min. 600s gives
 # 2x headroom for the slowest legitimate solve while still surfacing
 # stuck-recalc hangs. Configurable via env override.
-import os as _os
 DEFAULT_PER_CALL_TIMEOUT_SEC = int(_os.environ.get("DN38_PER_CALL_TIMEOUT_SEC", "600"))
 
 

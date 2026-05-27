@@ -1432,7 +1432,7 @@ def format_preflight_report(result: PreflightResult) -> str:
     fix_n = len(result.auto_fixable)
 
     if result.ok and warn_n == 0:
-        lines.append(f"  Pre-flight: PASS (0 findings)")
+        lines.append("  Pre-flight: PASS (0 findings)")
     else:
         status = "FAIL" if err_n else "WARN"
         lines.append(
