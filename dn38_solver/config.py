@@ -78,7 +78,10 @@ CALC_CORE_SHEETS: tuple[str, ...] = (
 
 CALC_OUTPUT_SHEETS: tuple[str, ...] = (
     "Portfolio",
-    "AT Returns_WIP",
+    # "AT Returns_WIP" — REMOVED 2026-05-27. Sheet deleted from model
+    # (Round 1 cleanup: 48,714 #REF! errors from broken Project Inputs
+    # reference cascade). The .bas's CalcOutputSheetsHL no longer recalcs
+    # it either; this tuple is documentation-only but kept in sync.
     "Corp Model Output",
     "Cust Prop",
     "Dashboard",

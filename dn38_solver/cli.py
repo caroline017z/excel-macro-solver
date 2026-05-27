@@ -260,7 +260,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Skip the optional output-sheet recalc at finalize: Portfolio, "
-            "AT Returns_WIP, Corp Model Output, Cust Prop, Waterfall "
+            "Corp Model Output, Cust Prop, Waterfall "
             "Sensitivity. Dashboard and Table ALWAYS recalc regardless of "
             "this flag (deal-summary surfaces). Core 13 sheets (Project "
             "Inputs / PT Returns / NPP Calc / Appraisal / Perm Debt / Tax "
@@ -301,13 +301,13 @@ def main() -> None:
         default="",
         help=(
             "Comma-separated list of sheet names to DELETE from the temp copy "
-            "before opening (e.g. 'Waterfall Sensitivity,AT Returns_WIP'). "
+            "before opening (e.g. 'Waterfall Sensitivity,Corp Model Output'). "
             "Original workbook is never modified. NEVER strip critical "
             "sheets: Dashboard, Table, PT Returns, NPP Calc, Appraisal, "
             "Perm Debt, Tax Equity, CL, Project Inputs — these are required "
             "every run and stripping them will produce wrong results or "
             "#REF! errors. Safe candidates: Waterfall Sensitivity, "
-            "AT Returns_WIP, Corp Model Output, Cust Prop, Portfolio."
+            "Corp Model Output, Cust Prop, Portfolio."
         ),
     )
     parser.add_argument(

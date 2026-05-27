@@ -437,11 +437,17 @@ Private Sub CalcOutputSheetsHL()
     '     -- summary surfaces the deal team relies on every run; per
     '        Caroline's spec these must reflect the converged state.
     '
-    '   SKIP-IF-FLAGGED: Portfolio, AT Returns_WIP, Corp Model Output,
-    '                    Cust Prop, Waterfall Sensitivity
+    '   SKIP-IF-FLAGGED: Portfolio, Corp Model Output, Cust Prop,
+    '                    Waterfall Sensitivity
     '     -- portfolio rollups and scenario tabs that the team typically
     '        inspects separately. Stale state here is acceptable for
     '        speed; Excel recalcs lazily on next interactive open.
+    '
+    ' Note: "AT Returns_WIP" was removed 2026-05-27 — sheet was deleted
+    ' from the model (Round 1 cleanup: 48,714 #REF! errors from a broken
+    ' Project Inputs reference cascade). On Error Resume Next would have
+    ' silently swallowed the resulting "Subscript out of range" but every
+    ' miss is wasted error-handling overhead; cleaner to drop it.
     '
     ' mSkipOutputRecalc=True only affects the second group. Set via
     ' SetSkipOutputRecalcHL from Python before Init / SolveHeadless.
@@ -460,7 +466,7 @@ Private Sub CalcOutputSheetsHL()
 
     If mSkipOutputRecalc Then Exit Sub
 
-    vOptional = Array("Portfolio", "AT Returns_WIP", "Corp Model Output", _
+    vOptional = Array("Portfolio", "Corp Model Output", _
                       "Cust Prop", "Waterfall Sensitivity")
     For Each vSh In vOptional
         On Error Resume Next
