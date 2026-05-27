@@ -1,10 +1,12 @@
 """dn38_solver.com.status_aggregator — Merge per-worker status JSONs.
 
 Each worker writes `solver_status_w{id}.json` in its own temp dir. In
-parallel mode the Streamlit tracker still reads the canonical
-`solver_status.json` next to the project root, so the parent runs a
-background thread that polls the worker files and writes an aggregated
-view to that path.
+parallel mode the parent runs a background thread that polls the worker
+files, writes an aggregated `solver_status.json` next to the project
+root, and runs the per-worker stall detector. No live viewer ships (the
+Streamlit dashboard was removed) — the aggregate file is retained for
+stall detection and ad-hoc inspection of an in-flight run; live progress
+goes to stdout via the orchestrator's logging.
 
 Aggregation rules:
 - overall phase = least-completed phase across workers (opening >
@@ -15,7 +17,6 @@ Aggregation rules:
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import threading
