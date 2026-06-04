@@ -823,3 +823,179 @@ class TestMacroHashDrift:
         path = _baseline_workbook(tmp_path)  # .xlsx
         result = run_preflight(path)
         assert not any(f.code == "D17" for f in result.findings)
+
+
+# --- D16 v2 (PROJECT-stream live-module list) + D18 (signature drift) -----
+
+class TestVbaDecompress:
+    """MS-OVBA 2.4.1 CompressedContainer decompression — hand-built
+    vectors covering the literal, copy-token, and overlapping-copy paths."""
+
+    def test_rejects_non_container(self):
+        from dn38_solver.shadow.preflight import _decompress_vba
+        with pytest.raises(ValueError):
+            _decompress_vba(b"\x02whatever")
+        with pytest.raises(ValueError):
+            _decompress_vba(b"")
+
+    def test_uncompressed_chunk(self):
+        from dn38_solver.shadow.preflight import _decompress_vba
+        # Raw chunk: header 0x3FFF (field=0xFFF, not compressed) + 4096 bytes
+        payload = bytes(range(256)) * 16
+        data = b"\x01" + (0x3FFF).to_bytes(2, "little") + payload
+        assert _decompress_vba(data) == payload
+
+    def test_compressed_chunk_with_copy_token(self):
+        from dn38_solver.shadow.preflight import _decompress_vba
+        # literals 'a','b','c' then copy token offset=3 len=6 -> "abcabcabc"
+        # flag byte 0b00001000 (4th token is a copy); token = (offset-1)<<12 | (len-3)
+        chunk = b"\x08abc" + (0x2003).to_bytes(2, "little")
+        header = (len(chunk) + 2 - 3) | 0x3000 | 0x8000
+        data = b"\x01" + header.to_bytes(2, "little") + chunk
+        assert _decompress_vba(data) == b"abcabcabc"
+
+    def test_overlapping_copy(self):
+        from dn38_solver.shadow.preflight import _decompress_vba
+        # literal 'a' then copy offset=1 len=7 -> "aaaaaaaa"
+        chunk = b"\x02a" + (0x0004).to_bytes(2, "little")
+        header = (len(chunk) + 2 - 3) | 0x3000 | 0x8000
+        data = b"\x01" + header.to_bytes(2, "little") + chunk
+        assert _decompress_vba(data) == b"a" * 8
+
+
+class TestParamCounts:
+    def test_basic_signatures(self):
+        from dn38_solver.shadow.preflight import _parse_param_counts
+        src = (
+            "Public Sub NoArgs()\r\nEnd Sub\r\n"
+            "Private Function TwoArgs(ByVal a As Integer, b As String) As Long\r\n"
+            "End Function\r\n"
+            "Sub OneArg(ByVal colIdx As Integer)\r\nEnd Sub\r\n"
+        )
+        counts = _parse_param_counts(src)
+        assert counts == {"NoArgs": 0, "TwoArgs": 2, "OneArg": 1}
+
+    def test_line_continuation_folded(self):
+        from dn38_solver.shadow.preflight import _parse_param_counts
+        src = (
+            "Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer, _\r\n"
+            "                                      ByVal dscrRestore As Double)\r\n"
+            "End Sub\r\n"
+        )
+        assert _parse_param_counts(src) == {"StampActiveProjectColumnHL": 2}
+
+    def test_array_param_does_not_truncate(self):
+        from dn38_solver.shadow.preflight import _parse_param_counts
+        src = "Sub TakesArray(ByRef arr() As Double, ByVal n As Integer)\r\nEnd Sub\r\n"
+        assert _parse_param_counts(src) == {"TakesArray": 2}
+
+    def test_call_sites_not_matched(self):
+        from dn38_solver.shadow.preflight import _parse_param_counts
+        # A call inside a body must not register as a definition.
+        src = (
+            "Sub Caller()\r\n"
+            "    DoWork 1, 2\r\n"
+            "    x = Helper(3)\r\n"
+            "End Sub\r\n"
+        )
+        assert _parse_param_counts(src) == {"Caller": 0}
+
+
+class TestD16ProjectStream:
+    """D16 must trust the PROJECT stream's live-module list when present:
+    removed modules leave residual name strings in the binary's identifier
+    table, and the legacy substring scan false-positives on them
+    (observed on SolarStone 2026-06-04 after VBProject cleanup)."""
+
+    def _xlsm_with_vba(self, tmp_path, vba_bin: bytes):
+        import zipfile as zf
+        path = _baseline_workbook(tmp_path)
+        xlsm = path.with_suffix(".xlsm")
+        with zf.ZipFile(path, "r") as zin, zf.ZipFile(xlsm, "w") as zout:
+            for item in zin.infolist():
+                zout.writestr(item, zin.read(item.filename))
+            zout.writestr("xl/vbaProject.bin", vba_bin)
+        return xlsm
+
+    _ALL_REQUIRED = (
+        b"\x00".join(
+            name.encode("ascii")
+            for name in (
+                "SolveHeadless", "InitSolveEnvHL", "SolveOneProjectByColHL",
+                "FinalizeSolveEnvHL", "CalcSheetsForAppraisal",
+                "CalcSheetsForNPP", "CalcSheetsForDSCR",
+                "ClassifyConvergenceHL", "StampActiveProjectColumnHL",
+                "ProjectElapsedHL", "HardStampNumericHL",
+                "SetSkipOutputRecalcHL",
+            )
+        )
+    )
+
+    def test_residual_names_ignored_when_project_stream_clean(self, tmp_path):
+        # PROJECT stream lists only modSolveHeadless; the stale names appear
+        # elsewhere in the binary (identifier-table residue). No D16.
+        vba = (
+            self._ALL_REQUIRED
+            + b"\r\nModule=modSolveHeadless\r\n"
+            + b"\x00residue\x00Module2_Optimized\x00Module3\x00Module4\x00"
+        )
+        result = run_preflight(self._xlsm_with_vba(tmp_path, vba))
+        assert not [f for f in result.findings if f.code == "D16"], (
+            "D16 must not fire on identifier-table residue when the "
+            "PROJECT stream shows the module was removed"
+        )
+
+    def test_live_stale_module_still_flagged(self, tmp_path):
+        # PROJECT stream still lists the stale module -> D16 fires, and the
+        # numeric-suffix family match catches Module2_Optimized3.
+        vba = (
+            self._ALL_REQUIRED
+            + b"\r\nModule=modSolveHeadless\r\nModule=Module2_Optimized3\r\n"
+        )
+        result = run_preflight(self._xlsm_with_vba(tmp_path, vba))
+        d16 = [f for f in result.findings if f.code == "D16"]
+        assert len(d16) == 1
+        assert "Module2_Optimized" in d16[0].message
+
+    def test_legacy_fallback_without_project_stream(self, tmp_path):
+        # No Module= lines anywhere -> fall back to the substring scan
+        # (keeps synthetic-bin behavior; see test_d16_stale_modules_detected).
+        vba = self._ALL_REQUIRED + b"\x00Module2_Optimized\x00"
+        result = run_preflight(self._xlsm_with_vba(tmp_path, vba))
+        assert [f for f in result.findings if f.code == "D16"]
+
+
+class TestMacroSignatures:
+    """D18 — parameter-count drift between embedded macro and repo .bas."""
+
+    def test_skips_when_extraction_impossible(self, tmp_path):
+        # Synthetic bins aren't valid OLE containers; extraction returns {}
+        # and D18 stays silent rather than guessing.
+        import zipfile as zf
+        path = _baseline_workbook(tmp_path)
+        xlsm = path.with_suffix(".xlsm")
+        with zf.ZipFile(path, "r") as zin, zf.ZipFile(xlsm, "w") as zout:
+            for item in zin.infolist():
+                zout.writestr(item, zin.read(item.filename))
+            zout.writestr("xl/vbaProject.bin", b"\x00SolveHeadless\x00garbage")
+        from dn38_solver.shadow.preflight import check_macro_signatures
+        assert check_macro_signatures(xlsm) == []
+
+    def test_skips_xlsx(self, tmp_path):
+        from dn38_solver.shadow.preflight import check_macro_signatures
+        assert check_macro_signatures(_baseline_workbook(tmp_path)) == []
+
+    def test_mismatch_detection_logic(self):
+        # The comparison core: same name, different arity -> flagged.
+        from dn38_solver.shadow.preflight import _parse_param_counts
+        embedded = _parse_param_counts(
+            "Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer)\r\nEnd Sub\r\n"
+        )
+        repo = _parse_param_counts(
+            "Public Sub StampActiveProjectColumnHL(ByVal colIdx As Integer, _\r\n"
+            "    ByVal dscrRestore As Double)\r\nEnd Sub\r\n"
+        )
+        name = "StampActiveProjectColumnHL"
+        assert embedded[name] == 1
+        assert repo[name] == 2
+        assert embedded[name] != repo[name]

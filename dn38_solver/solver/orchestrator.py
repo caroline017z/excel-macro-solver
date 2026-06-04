@@ -29,6 +29,7 @@ from dn38_solver.shadow.reader import WorkbookReader
 from dn38_solver.shadow.preflight import (
     apply_auto_fixes,
     check_macro_hash,
+    check_macro_signatures,
     check_macro_version,
     format_preflight_report,
     run_preflight,
@@ -201,7 +202,7 @@ def solve_all(
     # a workbook the operator wants to keep as the canonical artifact).
     # The preferred path for everyday solves is --auto-fix, which routes
     # the same re-import into the _FIXED.xlsm sibling — see Phase 0.6.
-    macro_import_codes = {"D15", "D17"}
+    macro_import_codes = {"D15", "D17", "D18"}
     needs_macro_import = any(
         f.code in macro_import_codes for f in preflight.findings
     )
@@ -227,11 +228,12 @@ def solve_all(
             # Instead, re-check ONLY the D-tier (cheap zip-level reads,
             # ~10ms) and filter the stale D-codes out of the existing
             # preflight result.
-            log.info("  Auto-import-macro: re-checking D15/D17 against updated workbook...")
+            log.info("  Auto-import-macro: re-checking D15/D17/D18 against updated workbook...")
             new_d_findings: list = []
             new_d_findings.extend(check_macro_version(workbook_path))
             new_d_findings.extend(check_macro_hash(workbook_path))
-            d_tier_codes = {"D15", "D16", "D17"}
+            new_d_findings.extend(check_macro_signatures(workbook_path))
+            d_tier_codes = {"D15", "D16", "D17", "D18"}
             filtered = tuple(
                 f for f in preflight.findings if f.code not in d_tier_codes
             )
@@ -312,12 +314,13 @@ def solve_all(
                 reimport_macro_subprocess(fixed_path)
                 applied_codes = list(applied_codes) + sorted(macro_codes_fired)
                 log.info(
-                    "  Auto-fix: re-checking D15/D17 against patched sibling..."
+                    "  Auto-fix: re-checking D15/D17/D18 against patched sibling..."
                 )
                 new_d_findings: list = []
                 new_d_findings.extend(check_macro_version(fixed_path))
                 new_d_findings.extend(check_macro_hash(fixed_path))
-                d_tier_codes = {"D15", "D16", "D17"}
+                new_d_findings.extend(check_macro_signatures(fixed_path))
+                d_tier_codes = {"D15", "D16", "D17", "D18"}
                 filtered = tuple(
                     f for f in preflight.findings if f.code not in d_tier_codes
                 )
