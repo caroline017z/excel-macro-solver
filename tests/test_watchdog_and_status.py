@@ -21,9 +21,7 @@ import msgspec
 import pytest
 
 from dn38_solver.types import (
-    ConvergenceTier,
     ProjectResult,
-    RELAXED_LEGEND,
     SolveStatus,
     convergence_label,
 )
@@ -119,7 +117,6 @@ def test_convergence_label_strict_relaxed_unchanged() -> None:
 def test_skipped_project_does_not_drag_batch_status() -> None:
     """The run-level convergence check should pass a workbook where the
     only non-converged projects are deliberate skips."""
-    from dn38_solver.solver import orchestrator
 
     # Reconstruct the local closure logic — orchestrator._ok_at_run_level
     # is a nested function, so we exercise it through the public API
@@ -298,7 +295,6 @@ def test_vba_stamp_active_signature_takes_two_args() -> None:
     macro re-import would silently leave the wrong signature in the
     workbook and Application.Run would fail with arg-count mismatch.
     """
-    from pathlib import Path
     repo_root = Path(__file__).resolve().parent.parent
     bas = (repo_root / "SolveHeadless.bas").read_text(encoding="utf-8")
     # Find the Public Sub StampActiveProjectColumnHL declaration. The
@@ -330,7 +326,6 @@ def test_direct_runner_threads_dscr_into_stamp_call(monkeypatch) -> None:
     licensed install + a real workbook; the source-level assert is the
     pragmatic safety net.
     """
-    from pathlib import Path
     repo_root = Path(__file__).resolve().parent.parent
     src = (repo_root / "dn38_solver" / "com" / "direct_runner.py").read_text(
         encoding="utf-8"
@@ -346,7 +341,6 @@ def test_direct_runner_threads_dscr_into_stamp_call(monkeypatch) -> None:
     assert "STAMP_ACTIVE_PROJECT_COLUMN" in src
     # The contract test above already locks in the two-arg shape; here
     # we just need to confirm DSCR is what fills the second slot.
-    import re
     # Find the STAMP_ACTIVE_PROJECT_COLUMN call site and assert dscr is
     # nearby (within ~10 lines — generous so refactors don't break us).
     lines = src.splitlines()
@@ -403,7 +397,6 @@ def test_vba_stamp_converged_signature_takes_dscr_not_irrs() -> None:
     means the macro re-import would leave the wrong signature in the
     workbook and Application.Run would fail with arg-count mismatch.
     """
-    from pathlib import Path
     repo_root = Path(__file__).resolve().parent.parent
     bas = (repo_root / "SolveHeadless.bas").read_text(encoding="utf-8")
 
@@ -434,7 +427,6 @@ def test_stamp_active_writes_dscr_to_371_not_31_or_37() -> None:
     text — a unit test on COM behavior isn't feasible without a licensed
     Excel install + real workbook fixture.
     """
-    from pathlib import Path
     import re
     repo_root = Path(__file__).resolve().parent.parent
     bas = (repo_root / "SolveHeadless.bas").read_text(encoding="utf-8")
@@ -512,7 +504,6 @@ def test_orchestrator_auto_fix_block_handles_macro_codes() -> None:
     is in preflight.auto_fixable. Source-level check — invoking the
     real flow requires a licensed Excel install + COM round-trip.
     """
-    from pathlib import Path
     repo_root = Path(__file__).resolve().parent.parent
     src = (repo_root / "dn38_solver" / "solver" / "orchestrator.py").read_text(
         encoding="utf-8"
@@ -552,7 +543,6 @@ def test_orchestrator_auto_import_macro_skips_when_auto_fix_set() -> None:
     wins (the source stays untouched). The Phase 0.5 source-mutation
     block must gate itself off when auto_fix is True.
     """
-    from pathlib import Path
     repo_root = Path(__file__).resolve().parent.parent
     src = (repo_root / "dn38_solver" / "solver" / "orchestrator.py").read_text(
         encoding="utf-8"

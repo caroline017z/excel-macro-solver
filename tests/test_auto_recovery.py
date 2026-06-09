@@ -6,7 +6,6 @@ recovery is exercised by the live solver runs against RP Puma fixtures.
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 

@@ -7,6 +7,7 @@ skipped when the fixtures aren't accessible (CI without Box mounted, etc).
 """
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -14,11 +15,10 @@ import pytest
 from openpyxl import Workbook
 
 from dn38_solver.shadow.preflight import (
-    DEV_FEE_BOUNDS,
-    ITERATE_DELTA_CEILING,
-    NPP_BOUNDS,
+    BAS_HASH_PROP,
     REQUIRED_SHEETS,
     REQUIRED_PI_CELLS,
+    _current_bas_sha256,
     apply_auto_fixes,
     format_preflight_report,
     run_preflight,
@@ -694,12 +694,6 @@ def test_real_smp_passes_preflight():
 
 
 # --- D17 macro hash drift ------------------------------------------------
-
-import zipfile
-from dn38_solver.shadow.preflight import (
-    BAS_HASH_PROP,
-    _current_bas_sha256,
-)
 
 
 def _baseline_xlsm(tmp_path: Path, name: str = "macro.xlsm") -> Path:
