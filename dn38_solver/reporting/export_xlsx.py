@@ -36,7 +36,10 @@ DSCR_MULTIPLE_ROW = LABEL_TO_ROW["Min Equity DSCR Multiple"]
 # self-documenting. Keep in sync with the .bas if the macro's bands change;
 # they are display/audit values here, not the values the solver reads.
 TOL_IRR = 0.0003              # 3 bps — IRR and appraisal gap acceptance tol
-EQUITY_TARGET = 0.10          # Min Equity target (10%)
+EQUITY_TARGET = 0.10          # Min Equity target fallback when the run carries
+                              # no usable equity data. The macro solves to the
+                              # workbook target (PT F128 / C130) — see
+                              # _derive_equity_target for the per-run value.
 EQUITY_BAND_STRICT = 0.0025   # +/-0.25pp — strict convergence band (reference)
 EQUITY_BAND_RELAXED = 0.005   # +/-0.50pp — relaxed-tier / acceptance band
 
@@ -252,6 +255,32 @@ def generate_summary_xlsx(record: RunRecord) -> io.BytesIO:
     return buf
 
 
+def _derive_equity_target(record: RunRecord) -> float:
+    """Infer the Min Equity target the macro solved against for this run.
+
+    The macro GoalSeeks equity to the workbook target (PT Returns F128 =
+    Total Uses x target %), so converged projects sit within +/-0.25pp
+    (strict) of it. The median solved equity of strict/relaxed projects,
+    snapped to the nearest 0.5pp, recovers the target without re-opening
+    the workbook — correct for both 10% models and re-levered ones (e.g.
+    the 5% Min Equity SolarStone case). Falls back to EQUITY_TARGET when
+    no project carries usable equity data.
+    """
+    pcts = [
+        p.equity_pct
+        for p in record.projects
+        if p.equity_pct is not None
+        and p.convergence_tier in ("strict", "relaxed")
+    ]
+    if not pcts:
+        pcts = [p.equity_pct for p in record.projects if p.equity_pct]
+    if not pcts:
+        return EQUITY_TARGET
+    pcts.sort()
+    median = pcts[len(pcts) // 2]
+    return round(median / 0.005) * 0.005
+
+
 def _build_checks_sheet(wb: openpyxl.Workbook, record: RunRecord) -> None:
     """Append an audit "Checks" tab to ``wb``.
 
@@ -331,7 +360,7 @@ def _build_checks_sheet(wb: openpyxl.Workbook, record: RunRecord) -> None:
     tc.alignment = _ALIGN_LEFT
     tol_rows = [
         ("IRR / Appraisal gap tolerance", TOL_IRR, _NF_PCT_FINE),
-        ("Min Equity target", EQUITY_TARGET, _NF_PCT),
+        ("Min Equity target (derived from run)", _derive_equity_target(record), _NF_PCT),
         ("Equity strict band (+/-, reference)", EQUITY_BAND_STRICT, _NF_PCT),
         ("Equity acceptance band (+/-)", EQUITY_BAND_RELAXED, _NF_PCT),
     ]

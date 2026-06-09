@@ -96,6 +96,33 @@ Manual cleanup: Excel → Alt+F11 → right-click each stale module under
 VBAProject → Remove. Decline the export prompt. Stale modules don't break
 the solve directly but shadow current function names.
 
+Since 2026-06-04 the check parses the live module list from the VBA
+PROJECT stream instead of substring-scanning the whole binary. Removed
+modules leave residual name strings in the identifier table / SRP compile
+cache until a full VBA recompile, and the old scan false-positived on
+them (observed on SolarStone after cleanup). The substring scan remains
+only as a fallback for binaries with no parseable PROJECT stream.
+
+**D18 (error) — `embedded macro signature drift on N required function(s)`**
+The embedded macro has every required function NAME (so D15 passes) but at
+least one parameter count differs from the repo's `SolveHeadless.bas`. On
+workbooks predating the `DN38_BAS_SHA256` stamp, D17 can't see it either.
+At runtime the orchestrator's `Application.Run` call fails with
+`com_error (-2147352567, ..., -2147352562)` — `DISP_E_BADPARAMCOUNT`
+(0x8002000E) — *after* the full solve cost has been paid.
+
+Confirmed root cause of the 2026-06-04 SolarStone failure: a 1-arg
+embedded `StampActiveProjectColumnHL` met the current 2-arg call in the
+read pass; all 37 projects solved, then all four parallel workers errored
+without saving. Same fix as D15/D17:
+```powershell
+python import_vba_module.py "C:\path\to\workbook.xlsm"
+```
+`--auto-fix` also recovers it (re-import routed into the `_FIXED.xlsm`
+sibling). Detection is best-effort: it requires the VBA source to be
+extractable (olefile + MS-OVBA decompression); when it isn't, D18 stays
+silent and D15/D17 remain the guards.
+
 ---
 
 ## 4. Pre-flight: calc properties (A-tier)

@@ -29,6 +29,7 @@ from dn38_solver.shadow.reader import WorkbookReader
 from dn38_solver.shadow.preflight import (
     apply_auto_fixes,
     check_macro_hash,
+    check_macro_signatures,
     check_macro_version,
     format_preflight_report,
     run_preflight,
@@ -130,7 +131,10 @@ def solve_all(
     *,
     batch_id: str | None = None,
     dry_run: bool = False,
-    timeout_sec: int = 600,
+    # C21: 3600 matches the CLI default. The old 600 hard-killed parallel
+    # workers at ~11 min and post-hoc-mislabeled a converged single-worker
+    # run as ERROR for any programmatic caller that relied on the default.
+    timeout_sec: int = 3600,
     strict_validation: bool = False,
     strict_preflight: bool = False,
     auto_fix: bool = False,
@@ -201,7 +205,7 @@ def solve_all(
     # a workbook the operator wants to keep as the canonical artifact).
     # The preferred path for everyday solves is --auto-fix, which routes
     # the same re-import into the _FIXED.xlsm sibling — see Phase 0.6.
-    macro_import_codes = {"D15", "D17"}
+    macro_import_codes = {"D15", "D17", "D18"}
     needs_macro_import = any(
         f.code in macro_import_codes for f in preflight.findings
     )
@@ -227,11 +231,12 @@ def solve_all(
             # Instead, re-check ONLY the D-tier (cheap zip-level reads,
             # ~10ms) and filter the stale D-codes out of the existing
             # preflight result.
-            log.info("  Auto-import-macro: re-checking D15/D17 against updated workbook...")
+            log.info("  Auto-import-macro: re-checking D15/D17/D18 against updated workbook...")
             new_d_findings: list = []
             new_d_findings.extend(check_macro_version(workbook_path))
             new_d_findings.extend(check_macro_hash(workbook_path))
-            d_tier_codes = {"D15", "D16", "D17"}
+            new_d_findings.extend(check_macro_signatures(workbook_path))
+            d_tier_codes = {"D15", "D16", "D17", "D18"}
             filtered = tuple(
                 f for f in preflight.findings if f.code not in d_tier_codes
             )
@@ -312,12 +317,13 @@ def solve_all(
                 reimport_macro_subprocess(fixed_path)
                 applied_codes = list(applied_codes) + sorted(macro_codes_fired)
                 log.info(
-                    "  Auto-fix: re-checking D15/D17 against patched sibling..."
+                    "  Auto-fix: re-checking D15/D17/D18 against patched sibling..."
                 )
                 new_d_findings: list = []
                 new_d_findings.extend(check_macro_version(fixed_path))
                 new_d_findings.extend(check_macro_hash(fixed_path))
-                d_tier_codes = {"D15", "D16", "D17"}
+                new_d_findings.extend(check_macro_signatures(fixed_path))
+                d_tier_codes = {"D15", "D16", "D17", "D18"}
                 filtered = tuple(
                     f for f in preflight.findings if f.code not in d_tier_codes
                 )
@@ -456,6 +462,23 @@ def solve_all(
             total_duration_sec=time.time() - start,
             status=SolveStatus.DRY_RUN.value,
         )
+
+    # C3: auto-upgrade to the chunked path for any multi-project run. The
+    # single-shot SolveHeadless path solves the WHOLE portfolio in one
+    # Application.Run, governed by the per-call watchdog sized for one
+    # project — so a portfolio of more than a few projects gets Excel
+    # hard-killed mid-solve, every project lands not_attempted, and no
+    # _SOLVED.xlsm is written. Chunked (one COM call per project) is
+    # strictly safer for >1 project; single-shot is kept only for genuine
+    # single-project runs where it's marginally faster.
+    if not use_chunked and len(projects) > 1:
+        log.warning(
+            "  Auto-enabling chunked solve: %d projects exceed the safe "
+            "single-shot bound (one COM call would solve the whole portfolio "
+            "under a per-project watchdog). Pass a single-project workbook to "
+            "use single-shot.", len(projects),
+        )
+        use_chunked = True
 
     # Phase 2: Build tasks for ALL projects
     tasks = [build_solve_task(p, str(workbook_path)) for p in projects]
@@ -768,12 +791,28 @@ def solve_all(
             save_run_metrics(conn, metrics)
         except Exception as metrics_exc:
             log.warning("RunMetrics persistence failed: %s", metrics_exc)
-        if use_chunked and record.status == SolveStatus.CONVERGED.value:
+        # C1: never clear checkpoints on a recovered run. After an auto-
+        # recovery resume, pre-failure projects may carry less-trustworthy
+        # re-stamped cells than their in-flight checkpoint telemetry, so the
+        # checkpoints are the forensic record of what actually converged
+        # before the crash — keep them even though the run rolled up CONVERGED.
+        run_was_recovered = bool(batch_result.get("recovered"))
+        if (
+            use_chunked
+            and record.status == SolveStatus.CONVERGED.value
+            and not run_was_recovered
+        ):
             # Run finished cleanly — drop the per-project checkpoint rows
             # so the audit trail only retains incidents worth keeping.
             cleared = clear_project_checkpoints(conn, batch_id)
             if cleared:
                 log.debug("  Cleared %d per-project checkpoint(s) on clean run", cleared)
+        elif use_chunked and run_was_recovered:
+            log.warning(
+                "  Run completed via auto-recovery — per-project checkpoints "
+                "retained under batch_id=%s for forensics (inspect with "
+                "--show-checkpoints %s).", batch_id, batch_id,
+            )
         # conn.close handled by outer finally below
 
         # Summary

@@ -137,8 +137,10 @@ def merge_via_openpyxl(
         if not other_path.exists():
             continue
         try:
+            # C26: read-only value source for the copy — never saved, so no
+            # keep_vba (avoids the leaked vba_archive ZipFile handle).
             wb_other = openpyxl.load_workbook(
-                str(other_path), keep_vba=True, data_only=True,
+                str(other_path), data_only=True,
             )
         except Exception:
             continue

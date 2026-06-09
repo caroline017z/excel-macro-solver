@@ -30,7 +30,7 @@ Private Const MAX_GS_RETRY_WARM As Integer = 3
 Private Const MAX_GS_RETRY_COLD As Integer = 6
 Private Const GS_MAXITER_WARM   As Integer = 200
 Private Const GS_MAXITER_COLD   As Integer = 1000
-Private Const EQUITY_FINAL_TOL  As Double = 0.0025   ' +/-0.25pp = 25bps off 10% min equity target
+Private Const EQUITY_FINAL_TOL  As Double = 0.0025   ' +/-0.25pp = 25bps off the workbook min equity target (PT F128 / C130)
 Private Const EQUITY_RELAXED_TOL As Double = 0.005   ' +/-0.5pp band; investment-grade but outside strict
 Private Const RELAXED_GAP_FACTOR As Double = 5#       ' inner gaps must be <= 5x tol to count as relaxed
 Private Const IRR_TOLERANCE     As Double = 0.0003
@@ -181,12 +181,13 @@ End Sub
 ' the tier so Python can apply --allow-relaxed policy at the run level.
 Private Function ClassifyConvergenceHL(ByVal dEquityPct As Double, _
                                        ByVal dIRRGap As Double, _
-                                       ByVal dApprGap As Double) As String
-    If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL _
+                                       ByVal dApprGap As Double, _
+                                       ByVal dEqTarget As Double) As String
+    If Abs(dEquityPct - dEqTarget) <= EQUITY_FINAL_TOL _
        And dIRRGap <= IRR_TOLERANCE _
        And dApprGap <= APPR_TOLERANCE Then
         ClassifyConvergenceHL = "strict"
-    ElseIf Abs(dEquityPct - 0.1) <= EQUITY_RELAXED_TOL _
+    ElseIf Abs(dEquityPct - dEqTarget) <= EQUITY_RELAXED_TOL _
        And dIRRGap <= IRR_TOLERANCE * RELAXED_GAP_FACTOR _
        And dApprGap <= APPR_TOLERANCE * RELAXED_GAP_FACTOR Then
         ClassifyConvergenceHL = "relaxed"
@@ -950,6 +951,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     Dim dIRRGap     As Double
     Dim dApprGap    As Double
     Dim dTotalUses  As Double
+    Dim dEqTarget   As Double
     Dim dPrevNPP    As Double
     Dim dPrevDevFee As Double
 
@@ -959,6 +961,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     SetGoalSeekModeHL False
     ResetCalcTierHL
     dPrevEqPct = -999
+    dEqTarget = 0.1   ' fallback only; overwritten from PT F128 / C130 each iteration
     iActualIters = 0
 
     For iIter = 1 To MAX_ITER
@@ -1096,7 +1099,14 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
             dEquityPct = 0
         End If
 
-        If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL Then
+        ' Derive the equity target % from the workbook (PT F128 = Total
+        ' Uses x target %), not a hardcoded 10% -- models priced at other
+        ' Min Equity levels (e.g. 5%) classify correctly without re-patch.
+        If IsNumeric(rMinEqTgt.Value) And dTotalUses <> 0 Then
+            dEqTarget = rMinEqTgt.Value / dTotalUses
+        End If
+
+        If Abs(dEquityPct - dEqTarget) <= EQUITY_FINAL_TOL Then
             bConverged = True
             iActualIters = iIter
             Exit For
@@ -1106,7 +1116,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         ' outer iterations -- they rarely tighten further. bConverged
         ' stays False so column I keeps strict-only semantics; column T
         ' carries the tier for Python-side policy.
-        If Abs(dEquityPct - 0.1) <= EQUITY_RELAXED_TOL _
+        If Abs(dEquityPct - dEqTarget) <= EQUITY_RELAXED_TOL _
            And dIRRGap  <= IRR_TOLERANCE  * RELAXED_GAP_FACTOR _
            And dApprGap <= APPR_TOLERANCE * RELAXED_GAP_FACTOR Then
             iActualIters = iIter
@@ -1132,7 +1142,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
         ' Residual-gated cold-mode escalation. Iter 1's actual residuals
         ' decide whether iter 2+ needs the heavier retries / calc tier;
         ' a portfolio that's already close to converged stays warm.
-        bNeedCold = (Abs(dEquityPct - 0.1) > 0.02) _
+        bNeedCold = (Abs(dEquityPct - dEqTarget) > 0.02) _
                     Or (dIRRGap > IRR_TOLERANCE * 3) _
                     Or (dApprGap > APPR_TOLERANCE * 3)
 
@@ -1191,7 +1201,7 @@ Public Function SolveOneProjectByColHL(ByVal colIdx As Integer, _
     wsRes.Cells(resultsRow, 17).Value = Round(mCalcSecsAppr, 4)
     wsRes.Cells(resultsRow, 18).Value = Round(mCalcSecsFull, 4)
     wsRes.Cells(resultsRow, 19).Value = iActualIters
-    wsRes.Cells(resultsRow, 20).Value = ClassifyConvergenceHL(dEquityPct, dIRRGap, dApprGap)
+    wsRes.Cells(resultsRow, 20).Value = ClassifyConvergenceHL(dEquityPct, dIRRGap, dApprGap, dEqTarget)
     WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & projName
 
     SolveOneProjectByColHL = IIf(bConverged, 1, 0)
@@ -1298,6 +1308,7 @@ Public Sub SolveHeadless()
     Dim dIRRGap     As Double
     Dim dApprGap    As Double
     Dim dTotalUses  As Double
+    Dim dEqTarget   As Double
     Dim dSolveStart As Double
     Dim dPrevNPP    As Double
     Dim dPrevDevFee As Double
@@ -1346,6 +1357,7 @@ Public Sub SolveHeadless()
         SetGoalSeekModeHL False
         ResetCalcTierHL
         dPrevEqPct = -999
+        dEqTarget = 0.1   ' fallback only; overwritten from PT F128 / C130 each iteration
         iActualIters = 0
 
         ' Pre-seed only if cell is blank. Do NOT clamp by bounds — clamping
@@ -1366,7 +1378,7 @@ Public Sub SolveHeadless()
             rHoldCo.Value = 0
             CalcForPhase PHASE_FULL
 
-            ' Step 2: GoalSeek Min Equity = 10% (changes DSCR Multiple)
+            ' Step 2: GoalSeek Min Equity to the workbook target (changes DSCR Multiple)
             bGSok = rEquity.GoalSeek(Goal:=rMinEqTgt.Value, ChangingCell:=rDSCR)
             If Not bGSok Then WriteHeartbeatHL wsRes, "GS_FAIL_DSCR|" & arrNames(i) & "|iter=" & iIter
             If rDSCR.Value < DSCR_MIN Then rDSCR.Value = DSCR_MIN
@@ -1430,7 +1442,14 @@ Public Sub SolveHeadless()
                 dEquityPct = 0
             End If
 
-            If Abs(dEquityPct - 0.1) <= EQUITY_FINAL_TOL Then
+            ' Derive the equity target % from the workbook (PT F128 = Total
+            ' Uses x target %), not a hardcoded 10% -- models priced at other
+            ' Min Equity levels (e.g. 5%) classify correctly without re-patch.
+            If IsNumeric(rMinEqTgt.Value) And dTotalUses <> 0 Then
+                dEqTarget = rMinEqTgt.Value / dTotalUses
+            End If
+
+            If Abs(dEquityPct - dEqTarget) <= EQUITY_FINAL_TOL Then
                 bConverged = True
                 iActualIters = iIter
                 Exit For
@@ -1440,7 +1459,7 @@ Public Sub SolveHeadless()
             ' outer iterations -- they rarely tighten further. bConverged
             ' stays False so column I keeps strict-only semantics; column T
             ' carries the tier for Python-side policy.
-            If Abs(dEquityPct - 0.1) <= EQUITY_RELAXED_TOL _
+            If Abs(dEquityPct - dEqTarget) <= EQUITY_RELAXED_TOL _
                And dIRRGap  <= IRR_TOLERANCE  * RELAXED_GAP_FACTOR _
                And dApprGap <= APPR_TOLERANCE * RELAXED_GAP_FACTOR Then
                 iActualIters = iIter
@@ -1466,7 +1485,7 @@ Public Sub SolveHeadless()
             ' Residual-gated cold-mode escalation. Iter 1's actual residuals
             ' decide whether iter 2+ needs the heavier retries / calc tier;
             ' a portfolio that's already close to converged stays warm.
-            bNeedCold = (Abs(dEquityPct - 0.1) > 0.02) _
+            bNeedCold = (Abs(dEquityPct - dEqTarget) > 0.02) _
                         Or (dIRRGap > IRR_TOLERANCE * 3) _
                         Or (dApprGap > APPR_TOLERANCE * 3)
 
@@ -1513,7 +1532,7 @@ Public Sub SolveHeadless()
         wsRes.Cells(i + 1, 17).Value = Round(mCalcSecsAppr, 4)
         wsRes.Cells(i + 1, 18).Value = Round(mCalcSecsFull, 4)
         wsRes.Cells(i + 1, 19).Value = iActualIters
-        wsRes.Cells(i + 1, 20).Value = ClassifyConvergenceHL(dEquityPct, dIRRGap, dApprGap)
+        wsRes.Cells(i + 1, 20).Value = ClassifyConvergenceHL(dEquityPct, dIRRGap, dApprGap, dEqTarget)
         WriteHeartbeatHL wsRes, "DONE|" & CStr(Now) & "|Project=" & arrNames(i)
 
     Next i

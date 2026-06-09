@@ -34,6 +34,10 @@ Three categories of checks, each with a stable error code:
      leaving the solve in a half-broken state.
        D15 Embedded macro is missing required functions
        D16 Embedded macro has leftover stale modules
+       D18 Embedded macro signature drift (parameter-count mismatch
+           vs the repo .bas — invisible to D15's name scan and, when
+           the workbook predates the hash stamp, to D17 as well;
+           surfaces at runtime as DISP_E_BADPARAMCOUNT 0x8002000E)
   E. Input-range checks against the macro's hardcoded bounds. The chunked
      entry point (SolveOneProjectByColHL) resets pre-solve Dev Fee / NPP
      to seed values when they fall outside [DEV_FEE_MIN..MAX]/[NPP_MIN..
@@ -53,6 +57,7 @@ in the log but proceed unless --strict-preflight is set.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
 import shutil
@@ -64,6 +69,12 @@ import msgspec
 import openpyxl
 from openpyxl.utils import column_index_from_string
 
+try:
+    import olefile  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - declared dependency; belt-and-braces
+    olefile = None  # type: ignore[assignment]
+
+from dn38_solver.com.vba_contract import ALL_PUBLIC_SUBS
 from dn38_solver.shadow.validation import (
     EXCEL_ERROR_TOKENS,
     WorkbookValidation,
@@ -158,30 +169,56 @@ RC_MASTER_TOGGLE_ROWS = (150, 151, 152, 153, 154, 155)  # RC1..RC6, Equity
 # tokens in vbaProject.bin — VBA's compressed-storage format leaves
 # identifier strings readable. ~10ms on the 215KB binary, no Excel COM
 # needed at preflight time.
-REQUIRED_MACRO_FUNCTIONS = (
-    "SolveHeadless",                # entry point (single-shot)
-    "InitSolveEnvHL",               # entry point (chunked init)
-    "SolveOneProjectByColHL",       # entry point (chunked per-project)
-    "FinalizeSolveEnvHL",           # entry point (chunked finalize)
+# Internal helper Subs/Functions the orchestrator depends on indirectly.
+# These are NOT Application.Run entry points (so they don't live in the
+# vba_contract), but their absence still means the workbook predates the
+# current macro and must be re-imported.
+_REQUIRED_MACRO_HELPERS = (
     "CalcSheetsForAppraisal",       # phase-scoped recalc
     "CalcSheetsForNPP",             # phase-scoped recalc
     "CalcSheetsForDSCR",            # phase-scoped recalc
     "ClassifyConvergenceHL",        # strict/relaxed/none tier classifier
-    "StampActiveProjectColumnHL",   # post-read hard-stamps
     "ProjectElapsedHL",             # timer wraparound-safe elapsed
     "HardStampNumericHL",           # IsError-guarded numeric stamping
-    "SetSkipOutputRecalcHL",        # output-recalc skip flag
+)
+
+# Every Sub Python invokes via Application.Run (the eight boundary entry
+# points, derived from vba_contract.ALL_PUBLIC_SUBS so a new contract Sub
+# can never silently fall out of the D15 presence / D18 signature checks
+# again — C4) UNION the internal helpers above. Deriving rather than
+# re-listing closed the gap where SwitchProjectAndRecalc and the 6-arg
+# StampConvergedValuesHL merge stamp were absent: an arity-drifted merge
+# stamp passed preflight (merge does a name-only Find) and detonated at
+# merge time, after every worker had paid the full solve cost.
+REQUIRED_MACRO_FUNCTIONS = tuple(
+    dict.fromkeys(
+        [_s.name for _s in ALL_PUBLIC_SUBS] + list(_REQUIRED_MACRO_HELPERS)
+    )
 )
 
 # Names of stale module artifacts that linger in workbooks where macros
 # were imported then partially replaced. Each is a hint that the workbook
 # has been through several import cycles without the cleanup pass that
 # removes the prior versions. Not a hard blocker but worth surfacing.
+# Matched against the LIVE module list parsed from the PROJECT stream
+# (exact name or name + numeric suffix, so "Module2_Optimized" also
+# catches the "Module2_Optimized1/2/3" copies Excel mints on re-import).
+# Raw-substring matching against the whole vbaProject.bin is only the
+# fallback when no PROJECT stream is parseable — the binary keeps removed
+# module names in its identifier table / SRP compile cache until a full
+# VBA recompile, so a substring hit alone does NOT mean the module is
+# still present (observed on SolarStone 2026-06-04 after cleanup).
 STALE_MACRO_MODULES = (
     "Module2_Optimized",
     "Module3",
     "Module4",
 )
+
+# "Module=Name" / "Document=Name" lines in the VBA PROJECT stream — the
+# authoritative list of live components. The stream is stored uncompressed,
+# so the same regex works on an olefile-extracted stream or (fallback) on
+# the latin-1-decoded raw bin.
+_PROJECT_MODULE_RE = re.compile(r"^(?:Module|Class|BaseClass)=(\w+)", re.MULTILINE)
 
 # Custom-doc-property name and source .bas path for the D17 hash drift
 # check. import_vba_module.py stamps the SHA256 of SolveHeadless.bas into
@@ -702,7 +739,22 @@ def check_macro_version(workbook_path: Path) -> list[PreflightFinding]:
             auto_fixable=True,
         ))
 
-    stale_present = [m for m in STALE_MACRO_MODULES if m in text]
+    # Prefer the live module list from the PROJECT stream. Removed modules
+    # leave their names behind in the binary's identifier table / SRP
+    # compile cache, so the raw-substring scan false-positives on workbooks
+    # that were already cleaned up. Fall back to the substring scan only
+    # when no PROJECT stream is parseable (malformed or synthetic bins).
+    live_modules = _live_module_names(vba_bin)
+    if live_modules is not None:
+        stale_present = [
+            m for m in STALE_MACRO_MODULES
+            if any(
+                n == m or (n.startswith(m) and n[len(m):].isdigit())
+                for n in live_modules
+            )
+        ]
+    else:
+        stale_present = [m for m in STALE_MACRO_MODULES if m in text]
     if stale_present:
         findings.append(PreflightFinding(
             code="D16",
@@ -830,6 +882,280 @@ def check_macro_hash(workbook_path: Path) -> list[PreflightFinding]:
             # Per Tranche 7.13: --auto-fix re-imports the macro into the
             # _FIXED.xlsm sibling and re-checks D15/D17 post-import.
             # Original workbook is never mutated.
+            auto_fixable=True,
+        ))
+    return findings
+
+
+def _live_module_names(vba_bin: bytes) -> tuple[str, ...] | None:
+    """Component names listed in the VBA PROJECT stream, or None when no
+    PROJECT stream is parseable.
+
+    olefile gives the precise stream; the zip-level regex fallback works
+    because the PROJECT stream is stored uncompressed, so its text appears
+    contiguously in the raw binary.
+    """
+    text: str | None = None
+    if olefile is not None:
+        try:
+            ole = olefile.OleFileIO(io.BytesIO(vba_bin))
+            try:
+                if ole.exists("PROJECT"):
+                    text = (
+                        ole.openstream("PROJECT")
+                        .read()
+                        .decode("latin-1", errors="replace")
+                    )
+            finally:
+                ole.close()
+        except Exception:
+            text = None
+    if text is None:
+        text = vba_bin.decode("latin-1", errors="replace")
+    names = _PROJECT_MODULE_RE.findall(text)
+    return tuple(names) if names else None
+
+
+def _decompress_vba(data: bytes) -> bytes:
+    """Decompress an MS-OVBA 2.4.1 CompressedContainer.
+
+    Used for the `dir` stream and each module stream's source-code region.
+    Raises ValueError when `data` does not start with the 0x01 container
+    signature.
+    """
+    if not data or data[0] != 0x01:
+        raise ValueError("not an MS-OVBA compressed container")
+    out = bytearray()
+    i = 1
+    n = len(data)
+    while i + 2 <= n:
+        header = int.from_bytes(data[i:i + 2], "little")
+        i += 2
+        # CompressedChunkSize field = total chunk size - 3 (header included),
+        # so the data region after the 2-byte header is field + 1 bytes.
+        chunk_data_len = (header & 0x0FFF) + 1
+        compressed = bool(header & 0x8000)
+        chunk_end = min(i + chunk_data_len, n)
+        chunk_out_start = len(out)
+        if not compressed:
+            out += data[i:chunk_end]
+            i = chunk_end
+            continue
+        while i < chunk_end:
+            flags = data[i]
+            i += 1
+            for bit in range(8):
+                if i >= chunk_end:
+                    break
+                if not (flags >> bit) & 1:
+                    out.append(data[i])
+                    i += 1
+                    continue
+                token = int.from_bytes(data[i:i + 2], "little")
+                i += 2
+                # Offset/length bit split widens with position inside the
+                # decompressed chunk: smallest bit_count >= 4 such that
+                # 2^bit_count >= position.
+                pos = len(out) - chunk_out_start
+                bit_count = max(4, (pos - 1).bit_length())
+                length_mask = 0xFFFF >> bit_count
+                length = (token & length_mask) + 3
+                offset = (token >> (16 - bit_count)) + 1
+                for _ in range(length):
+                    out.append(out[-offset])
+    return bytes(out)
+
+
+def _vba_dir_module_offsets(dir_stream: bytes) -> dict[str, int]:
+    """Map module stream name -> compressed-source byte offset, parsed from
+    the decompressed `dir` stream (MS-OVBA 2.3.4.2 record sequence)."""
+    out: dict[str, int] = {}
+    stream_name: str | None = None
+    i = 0
+    n = len(dir_stream)
+    while i + 6 <= n:
+        rec_id = int.from_bytes(dir_stream[i:i + 2], "little")
+        size = int.from_bytes(dir_stream[i + 2:i + 6], "little")
+        # PROJECTVERSION (0x0009) lies: its Size field is fixed at 4 but
+        # the payload is 6 bytes (VersionMajor + VersionMinor).
+        if rec_id == 0x0009:
+            size = 6
+        payload = dir_stream[i + 6:i + 6 + size]
+        if rec_id == 0x001A:  # MODULESTREAMNAME (MBCS variant)
+            stream_name = payload.decode("latin-1", errors="replace")
+        elif rec_id == 0x0031 and stream_name is not None:  # MODULEOFFSET
+            if size >= 4:
+                out[stream_name] = int.from_bytes(payload[:4], "little")
+            stream_name = None
+        i += 6 + size
+    return out
+
+
+def _extract_vba_module_sources(vba_bin: bytes) -> dict[str, str]:
+    """Best-effort extraction of decompressed VBA source per module.
+
+    Returns {} when olefile is unavailable, the binary is not a valid OLE
+    container, or no module offsets can be resolved — callers must treat
+    an empty result as "cannot verify", not "no modules".
+    """
+    if olefile is None:
+        return {}
+    try:
+        ole = olefile.OleFileIO(io.BytesIO(vba_bin))
+    except Exception:
+        return {}
+    try:
+        dir_path = next(
+            (
+                p for p in ole.listdir(streams=True, storages=False)
+                if p[-1].lower() == "dir"
+            ),
+            None,
+        )
+        if dir_path is None:
+            return {}
+        try:
+            dir_stream = _decompress_vba(ole.openstream(dir_path).read())
+        except (ValueError, OSError):
+            return {}
+        prefix = list(dir_path[:-1])  # storage holding module streams ("VBA")
+        sources: dict[str, str] = {}
+        for stream_name, offset in _vba_dir_module_offsets(dir_stream).items():
+            path = "/".join(prefix + [stream_name])
+            if not ole.exists(path):
+                continue
+            raw = ole.openstream(path).read()
+            if offset >= len(raw):
+                continue
+            try:
+                src = _decompress_vba(raw[offset:])
+            except (ValueError, IndexError):
+                continue
+            sources[stream_name] = src.decode("latin-1", errors="replace")
+        return sources
+    finally:
+        ole.close()
+
+
+_VBA_SIG_RE = re.compile(
+    r"^[ \t]*(?:Public[ \t]+|Private[ \t]+|Friend[ \t]+)?(?:Static[ \t]+)?"
+    r"(?:Sub|Function)[ \t]+(\w+)[ \t]*\(",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_param_counts(source: str) -> dict[str, int]:
+    """Parameter count for every Sub/Function defined in VBA source text.
+
+    Folds line continuations (` _` + newline) first so multi-line
+    signatures parse as one. Paren-depth-aware so array parameters like
+    `ByRef arr() As Double` don't truncate the list. First definition of
+    a name wins (duplicate names across modules are a separate D16 smell).
+    """
+    folded = re.sub(r"[ \t]_\r?\n", " ", source)
+    out: dict[str, int] = {}
+    for m in _VBA_SIG_RE.finditer(folded):
+        depth = 1
+        j = m.end()
+        start = j
+        while j < len(folded) and depth:
+            c = folded[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            j += 1
+        params = folded[start:j - 1].strip()
+        if not params:
+            count = 0
+        else:
+            count = 1
+            inner = 0
+            for c in params:
+                if c == "(":
+                    inner += 1
+                elif c == ")":
+                    inner -= 1
+                elif c == "," and inner == 0:
+                    count += 1
+        out.setdefault(m.group(1), count)
+    return out
+
+
+def check_macro_signatures(workbook_path: Path) -> list[PreflightFinding]:
+    """D18: required-function parameter counts in the embedded macro must
+    match the repo's SolveHeadless.bas.
+
+    Catches the drift mode that is invisible to both D15 and (on workbooks
+    predating the hash stamp) D17: every required function NAME is present,
+    but a signature changed between macro versions. The orchestrator calls
+    these functions via Application.Run with the repo .bas's argument list,
+    so an arity mismatch fails at runtime with the cryptic
+    `DISP_E_BADPARAMCOUNT (0x8002000E)` after the full multi-minute solve
+    cost has already been paid — observed on SolarStone 2026-06-04, where
+    a 1-arg embedded StampActiveProjectColumnHL met the current 2-arg call
+    and errored all four parallel workers in the read pass.
+
+    Extraction is best-effort (olefile + MS-OVBA decompression). When the
+    source cannot be extracted the check stays silent — D15/D17 remain the
+    primary guards; D18 is the belt-and-braces signature layer.
+    """
+    findings: list[PreflightFinding] = []
+    if workbook_path.suffix.lower() != ".xlsm":
+        return findings
+    if not _REPO_BAS_PATH.exists():
+        return findings
+    try:
+        with zipfile.ZipFile(workbook_path, "r") as z:
+            try:
+                vba_bin = z.read("xl/vbaProject.bin")
+            except KeyError:
+                return findings  # D15 already reports the missing project
+    except (zipfile.BadZipFile, OSError):
+        return findings
+    sources = _extract_vba_module_sources(vba_bin)
+    if not sources:
+        return findings
+    embedded: dict[str, int] = {}
+    for src in sources.values():
+        for name, count in _parse_param_counts(src).items():
+            embedded.setdefault(name, count)
+    repo_counts = _parse_param_counts(
+        _REPO_BAS_PATH.read_text(encoding="latin-1")
+    )
+    mismatches = [
+        (name, embedded[name], repo_counts[name])
+        for name in REQUIRED_MACRO_FUNCTIONS
+        if name in embedded
+        and name in repo_counts
+        and embedded[name] != repo_counts[name]
+    ]
+    if mismatches:
+        detail = ", ".join(
+            f"{name} (workbook={wb_n} arg(s), repo={repo_n})"
+            for name, wb_n, repo_n in mismatches
+        )
+        findings.append(PreflightFinding(
+            code="D18",
+            severity="error",
+            location="xl/vbaProject.bin",
+            message=(
+                f"embedded macro signature drift on "
+                f"{len(mismatches)} required function(s): {detail}"
+            ),
+            impact=(
+                "The orchestrator calls these functions via Application.Run "
+                "with the current .bas argument list. An arity mismatch "
+                "raises DISP_E_BADPARAMCOUNT (0x8002000E) at runtime — "
+                "after the full solve cost has been paid — and fails the "
+                "run without saving results."
+            ),
+            remediation=(
+                f'Re-import the latest macro: python import_vba_module.py '
+                f'"{workbook_path}"'
+            ),
+            # Same recovery path as D15/D17: --auto-fix re-imports the
+            # macro into the _FIXED.xlsm sibling.
             auto_fixable=True,
         ))
     return findings
@@ -1274,6 +1600,7 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
     # presence) is its fallback for workbooks predating the stamp convention.
     findings.extend(check_macro_version(p))
     findings.extend(check_macro_hash(p))
+    findings.extend(check_macro_signatures(p))
 
     # Open the value-pass workbook ONCE. Shared between scan_workbook_errors
     # (cell-level error scan) and check_critical_path_errors (C-tier).
@@ -1314,8 +1641,13 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
         error_scan = scan_workbook_errors(p, wb_vals=wb_v)
 
         # Formula-pass load (single open, all formula-shape checks).
+        # C26: no keep_vba — this pass is never saved, and the D-tier macro
+        # checks read vbaProject.bin via zipfile (above), not openpyxl's
+        # vba_archive. keep_vba retains an in-memory append-mode ZipFile that
+        # wb.close() never closes (the ZipFile.__del__ "I/O operation on
+        # closed file" leak surfaced by the test suite).
         wb_f = openpyxl.load_workbook(
-            str(p), data_only=False, keep_vba=True, read_only=False,
+            str(p), data_only=False, read_only=False,
         )
         try:
             findings.extend(check_calc_properties(wb_f))

@@ -152,8 +152,10 @@ def verify_merged_file(
     mismatches: list[str] = []
 
     try:
+        # C26: read-only value verify, never saved — no keep_vba (avoids the
+        # leaked in-memory vba_archive ZipFile handle).
         wb = openpyxl.load_workbook(
-            str(final_path), data_only=True, read_only=True, keep_vba=True,
+            str(final_path), data_only=True, read_only=True,
         )
     except Exception as exc:
         return [f"merged file unreadable: {exc}"]

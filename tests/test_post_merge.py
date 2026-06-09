@@ -13,7 +13,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
-import pytest
 
 from dn38_solver.types import CellAddress, SolveTask
 from dn38_solver.validation.post_merge import verify_merged_file
@@ -118,7 +117,7 @@ def test_verifier_passes_skipped_project_without_diffing_stale_cells(
     )
 
     assert mismatches == [], (
-        f"Expected zero mismatches (placeholder is skipped). Got:\n  "
+        "Expected zero mismatches (placeholder is skipped). Got:\n  "
         + "\n  ".join(mismatches)
     )
 
