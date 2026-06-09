@@ -48,11 +48,17 @@ SOLVER_RESULTS_SHEET = "__SolverResults"
 # 60 active projects + slack for header growth; one COM round-trip beats N+1.
 _RESULTS_BULK_ROWS = 200
 
-# Wall-clock cap on a single COM Application.Run call. Typical solve is
-# 2-3 min per project; cold-start solves can reach 5-6 min. 600s gives
-# 2x headroom for the slowest legitimate solve while still surfacing
-# stuck-recalc hangs. Configurable via env override.
-DEFAULT_PER_CALL_TIMEOUT_SEC = int(_os.environ.get("DN38_PER_CALL_TIMEOUT_SEC", "600"))
+# Wall-clock cap on a single COM Application.Run call (one project on the
+# chunked path). Typical solve is 2-3 min per project; cold-start solves can
+# reach 5-6 min. Must sit ABOVE the VBA-side PROJECT_TIMEOUT_SECONDS (1200s
+# in SolveHeadless.bas), so a genuinely slow cold project hits VBA's OWN
+# graceful per-project timeout — which exits the inner loop and still writes
+# a telemetry row — instead of being hard-killed by this watchdog, which
+# destroys the whole COM session and loses the read pass for every project
+# in the run (C8). 1300s = VBA cap + ~100s margin. Configurable via env.
+# (Kept in sync with the VBA constant by tests/test_vba_contract_parity-style
+# guards; if PROJECT_TIMEOUT_SECONDS moves, raise this too.)
+DEFAULT_PER_CALL_TIMEOUT_SEC = int(_os.environ.get("DN38_PER_CALL_TIMEOUT_SEC", "1300"))
 
 
 def _capture_excel_proc(excel=None):
@@ -132,19 +138,30 @@ def _capture_excel_proc(excel=None):
     return None
 
 
-def _kill_excel_after_timeout(done, *, timeout_sec, excel_proc, label):
+def _kill_excel_after_timeout(done, *, timed_out, timeout_sec, excel_proc, label):
     """Watchdog body shared by `_call_with_timeout` and `_run_macro_with_timeout`.
 
-    Waits up to `timeout_sec` for `done` to signal. On timeout, escalates:
-    psutil.kill → 3s poll → taskkill /F via subprocess. The escalation is
-    necessary because psutil.kill silently fails on Excel instances deep
-    in a COM RPC call — taskkill's Win32 TerminateProcess bypasses the
-    COM busy state. Without an `excel_proc` handle (Hwnd lookup failed),
-    the timeout still fires but the kill is a no-op and the COM call may
-    block until the worker is restarted.
+    Waits up to `timeout_sec` for `done` to signal. On timeout, sets the
+    shared `timed_out` event (so `_with_watchdog` can re-raise a real
+    TimeoutError) and escalates the kill: psutil.kill → 3s poll → taskkill
+    /F via subprocess. The escalation is necessary because psutil.kill
+    silently fails on Excel instances deep in a COM RPC call — taskkill's
+    Win32 TerminateProcess bypasses the COM busy state. Without an
+    `excel_proc` handle (Hwnd lookup failed), the timeout still fires but
+    the kill is a no-op and the COM call may block until the worker is
+    restarted.
     """
     if done.wait(timeout=timeout_sec):
         return
+    # C10: close the race where fn() returned successfully right as the
+    # deadline expired. `done.wait` can time out a hair before the main
+    # thread's finally-block sets `done`; without this re-check the
+    # watchdog would kill an Excel that just finished a project cleanly,
+    # poisoning every subsequent call in the session with a spurious RPC
+    # error. Re-check before declaring a timeout or touching the process.
+    if done.is_set():
+        return
+    timed_out.set()
     log.error(
         "  %s exceeded %ds wall-clock -- killing Excel to break the hang",
         label, timeout_sec,
@@ -166,6 +183,10 @@ def _kill_excel_after_timeout(done, *, timeout_sec, excel_proc, label):
         except Exception:
             break  # poll can fail mid-RPC; fall through to taskkill anyway
         time.sleep(0.1)
+    # C10: a slow call may have completed during the 3s psutil poll above.
+    # Don't escalate to taskkill on an Excel whose call already returned.
+    if done.is_set():
+        return
     log.warning(
         "  Excel pid=%s still alive (or unreadable) after psutil.kill "
         "-- escalating to taskkill /F", getattr(excel_proc, "pid", "?"),
@@ -192,9 +213,10 @@ def _with_watchdog(fn, *, timeout_sec, excel_proc, label):
     """
     import threading
     done = threading.Event()
+    timed_out = threading.Event()
     t = threading.Thread(
         target=_kill_excel_after_timeout,
-        kwargs=dict(done=done, timeout_sec=timeout_sec,
+        kwargs=dict(done=done, timed_out=timed_out, timeout_sec=timeout_sec,
                     excel_proc=excel_proc, label=label),
         daemon=True,
         name=f"COM-WD-{label}",
@@ -202,6 +224,19 @@ def _with_watchdog(fn, *, timeout_sec, excel_proc, label):
     t.start()
     try:
         return fn()
+    except Exception as exc:
+        # C9: when the watchdog fired, fn() surfaces a generic COM error
+        # (0x800706BA "RPC server unavailable") from the now-dead Excel.
+        # Re-raise it as a TimeoutError so callers' `except TimeoutError`
+        # branches fire (they build clearly-labeled TIMEOUT errors) and the
+        # diagnostic points at this local watchdog rather than Excel's RPC
+        # layer. Non-timeout exceptions propagate unchanged.
+        if timed_out.is_set():
+            raise TimeoutError(
+                f"{label} exceeded {timeout_sec}s wall-clock; Excel was "
+                f"hard-killed by the watchdog"
+            ) from exc
+        raise
     finally:
         done.set()
 
@@ -329,7 +364,7 @@ def run_direct(
     tasks: list[SolveTask],
     *,
     original_f2: int = 1,
-    timeout_sec: int = 600,
+    timeout_sec: int = 3600,  # C21: align with solve_all / CLI default
     use_chunked: bool = False,
     checkpoint_callback: Callable[[object, dict], None] | None = None,
     save_solved: bool = True,

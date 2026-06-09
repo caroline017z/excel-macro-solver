@@ -8,7 +8,11 @@ if a refactor strips the isolation, which is the regression that matters.
 """
 from __future__ import annotations
 
+import re
+import time
 from pathlib import Path
+
+import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 _SRC = (_REPO / "dn38_solver" / "com" / "direct_runner.py").read_text(encoding="utf-8")
@@ -91,4 +95,81 @@ def test_recovered_run_retains_checkpoints() -> None:
     assert "not run_was_recovered" in _ORCH, (
         "orchestrator clears checkpoints unconditionally on CONVERGED — "
         "recovered-run checkpoints would be lost"
+    )
+
+
+# --- Timeout family (C3, C8, C9, C10) ---------------------------------------
+
+def test_watchdog_raises_real_timeouterror_when_it_fires() -> None:
+    """C9: when the watchdog fires, the wrapped call surfaces a generic COM
+    error from the killed Excel; _with_watchdog must re-raise it as a
+    TimeoutError so the callers' `except TimeoutError` branches (which build
+    labeled TIMEOUT diagnostics) are actually reachable. No Excel needed —
+    excel_proc=None exercises the no-handle path while still setting the
+    timed_out flag.
+    """
+    from dn38_solver.com.direct_runner import _with_watchdog
+
+    def slow_then_com_error():
+        time.sleep(0.25)
+        raise RuntimeError("0x800706BA RPC server unavailable")
+
+    with pytest.raises(TimeoutError):
+        _with_watchdog(
+            slow_then_com_error, timeout_sec=0.05,
+            excel_proc=None, label="unit",
+        )
+
+
+def test_watchdog_passes_fast_success_through() -> None:
+    """C10: a call that completes well within the budget returns normally
+    and is never misclassified as a timeout.
+    """
+    from dn38_solver.com.direct_runner import _with_watchdog
+    out = _with_watchdog(lambda: 42, timeout_sec=5, excel_proc=None, label="unit")
+    assert out == 42
+
+
+def test_watchdog_non_timeout_exception_propagates_unchanged() -> None:
+    """A genuine error before the deadline must propagate as itself, not be
+    masked as a TimeoutError.
+    """
+    from dn38_solver.com.direct_runner import _with_watchdog
+
+    def boom():
+        raise ValueError("genuine failure")
+
+    with pytest.raises(ValueError):
+        _with_watchdog(boom, timeout_sec=5, excel_proc=None, label="unit")
+
+
+def test_per_call_timeout_exceeds_vba_project_budget() -> None:
+    """C8: the Python per-call watchdog must sit ABOVE the VBA-side
+    PROJECT_TIMEOUT_SECONDS so a slow cold project hits VBA's graceful
+    per-project timeout (which still writes a telemetry row) rather than
+    being hard-killed, which loses the whole session's read pass.
+    """
+    from dn38_solver.com.direct_runner import DEFAULT_PER_CALL_TIMEOUT_SEC
+    bas = (_REPO / "SolveHeadless.bas").read_text(encoding="latin-1")
+    m = re.search(r"PROJECT_TIMEOUT_SECONDS\s+As Double\s*=\s*(\d+)", bas)
+    assert m, "PROJECT_TIMEOUT_SECONDS not found in SolveHeadless.bas"
+    vba_cap = int(m.group(1))
+    assert DEFAULT_PER_CALL_TIMEOUT_SEC > vba_cap, (
+        f"per-call watchdog ({DEFAULT_PER_CALL_TIMEOUT_SEC}s) must exceed the "
+        f"VBA project budget ({vba_cap}s) so VBA's graceful timeout wins"
+    )
+
+
+def test_orchestrator_auto_enables_chunked_for_multiproject() -> None:
+    """C3: a multi-project run must auto-upgrade to the chunked path — the
+    single-shot whole-portfolio call would be hard-killed by the per-project
+    watchdog on any portfolio larger than a few projects.
+    """
+    assert "len(projects) > 1" in _ORCH, (
+        "orchestrator no longer auto-enables chunked for multi-project runs"
+    )
+    idx = _ORCH.index("len(projects) > 1")
+    window = _ORCH[idx:idx + 400]
+    assert "use_chunked = True" in window, (
+        "multi-project branch does not set use_chunked = True"
     )
