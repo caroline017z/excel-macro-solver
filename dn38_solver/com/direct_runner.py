@@ -823,6 +823,8 @@ def run_direct(
                 })
                 continue
 
+            stamp_failed = False
+
             # Switch F2 with targeted recalc. The fallback path sets F2
             # directly via Range.Value, which does NOT trigger recalc under
             # xlCalculationManual — reads after that would see the previous
@@ -898,17 +900,36 @@ def run_direct(
             if has_switch and not macro_error:
                 col_idx = nt.offset + BASE_COL
                 dscr_for_stamp = safe_float(meta.get("dscr")) or 0.0
-                _run_macro_with_timeout(
-                    excel,
-                    (
-                        vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
-                        int(col_idx),
-                        float(dscr_for_stamp),
-                    ),
-                    timeout_sec=DEFAULT_PER_CALL_TIMEOUT_SEC,
-                    excel_proc=excel_proc,
-                    label=f"StampActiveProjectColumnHL[{nt.name}]",
-                )
+                try:
+                    _run_macro_with_timeout(
+                        excel,
+                        (
+                            vba_call_str(wb.Name, STAMP_ACTIVE_PROJECT_COLUMN),
+                            int(col_idx),
+                            float(dscr_for_stamp),
+                        ),
+                        timeout_sec=DEFAULT_PER_CALL_TIMEOUT_SEC,
+                        excel_proc=excel_proc,
+                        label=f"StampActiveProjectColumnHL[{nt.name}]",
+                    )
+                except Exception as stamp_exc:
+                    # C2: localize the failure. A stamp error leaves THIS
+                    # project's per-column cells as unresolved circular-IF
+                    # formulas (openpyxl reads them as None). Previously this
+                    # propagated to the function-level catch-all, which
+                    # returned empty project_results and skipped the SaveAs —
+                    # discarding EVERY already-converged project in the open
+                    # workbook (the SolarStone 2026-06-04 incident, and a
+                    # direct contradiction of this module's "always salvage
+                    # partial results" contract). Flag this one project and
+                    # keep going so the rest of the portfolio and the SaveAs
+                    # still land.
+                    log.error(
+                        "  StampActiveProjectColumnHL FAILED for %s: %s — "
+                        "marking project stamp_failed; remaining projects and "
+                        "the SaveAs proceed.", nt.name, stamp_exc,
+                    )
+                    stamp_failed = True
 
             # Read cells
             solved: dict[str, float | str | None] = {}
@@ -955,7 +976,15 @@ def run_direct(
             # and post-merge verifier each render it correctly without
             # re-parsing the mode string.
             mode = meta.get("mode")
-            if isinstance(mode, str) and mode.startswith("skipped:"):
+            if stamp_failed:
+                # C2: the per-column stamp didn't land, so this project's
+                # read-back values are untrusted. Surface a distinct status
+                # and force the tier to "none" — convergence_label keys off
+                # the tier, not converged_flag, so a leftover "strict" tier
+                # would otherwise render this failed project as OK.
+                project_status = "stamp_failed"
+                meta["conv_tier"] = "none"
+            elif isinstance(mode, str) and mode.startswith("skipped:"):
                 project_status = "skipped"
             elif is_converged:
                 project_status = "converged"
