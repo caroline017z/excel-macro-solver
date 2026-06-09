@@ -547,18 +547,13 @@ class TestMacroVersion:
         import zipfile as zf
         path = _baseline_workbook(tmp_path)
         xlsm = path.with_suffix(".xlsm")
-        # Include all required + a stale Module2_Optimized name
+        # Include every currently-required function (derived from the live
+        # REQUIRED_MACRO_FUNCTIONS so this fixture can't go stale when the
+        # contract grows — C4) + a stale Module2_Optimized name.
+        from dn38_solver.shadow.preflight import REQUIRED_MACRO_FUNCTIONS
         full_vba = b"\x00".join(
             name.encode("ascii")
-            for name in (
-                "SolveHeadless", "InitSolveEnvHL", "SolveOneProjectByColHL",
-                "FinalizeSolveEnvHL", "CalcSheetsForAppraisal",
-                "CalcSheetsForNPP", "CalcSheetsForDSCR",
-                "ClassifyConvergenceHL", "StampActiveProjectColumnHL",
-                "ProjectElapsedHL", "HardStampNumericHL",
-                "SetSkipOutputRecalcHL",
-                "Module2_Optimized3",  # stale leftover
-            )
+            for name in (*REQUIRED_MACRO_FUNCTIONS, "Module2_Optimized3")
         )
         with zf.ZipFile(path, "r") as zin, zf.ZipFile(xlsm, "w") as zout:
             for item in zin.infolist():

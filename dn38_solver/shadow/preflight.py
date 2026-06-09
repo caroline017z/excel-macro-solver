@@ -74,6 +74,7 @@ try:
 except ImportError:  # pragma: no cover - declared dependency; belt-and-braces
     olefile = None  # type: ignore[assignment]
 
+from dn38_solver.com.vba_contract import ALL_PUBLIC_SUBS
 from dn38_solver.shadow.validation import (
     EXCEL_ERROR_TOKENS,
     WorkbookValidation,
@@ -168,19 +169,31 @@ RC_MASTER_TOGGLE_ROWS = (150, 151, 152, 153, 154, 155)  # RC1..RC6, Equity
 # tokens in vbaProject.bin — VBA's compressed-storage format leaves
 # identifier strings readable. ~10ms on the 215KB binary, no Excel COM
 # needed at preflight time.
-REQUIRED_MACRO_FUNCTIONS = (
-    "SolveHeadless",                # entry point (single-shot)
-    "InitSolveEnvHL",               # entry point (chunked init)
-    "SolveOneProjectByColHL",       # entry point (chunked per-project)
-    "FinalizeSolveEnvHL",           # entry point (chunked finalize)
+# Internal helper Subs/Functions the orchestrator depends on indirectly.
+# These are NOT Application.Run entry points (so they don't live in the
+# vba_contract), but their absence still means the workbook predates the
+# current macro and must be re-imported.
+_REQUIRED_MACRO_HELPERS = (
     "CalcSheetsForAppraisal",       # phase-scoped recalc
     "CalcSheetsForNPP",             # phase-scoped recalc
     "CalcSheetsForDSCR",            # phase-scoped recalc
     "ClassifyConvergenceHL",        # strict/relaxed/none tier classifier
-    "StampActiveProjectColumnHL",   # post-read hard-stamps
     "ProjectElapsedHL",             # timer wraparound-safe elapsed
     "HardStampNumericHL",           # IsError-guarded numeric stamping
-    "SetSkipOutputRecalcHL",        # output-recalc skip flag
+)
+
+# Every Sub Python invokes via Application.Run (the eight boundary entry
+# points, derived from vba_contract.ALL_PUBLIC_SUBS so a new contract Sub
+# can never silently fall out of the D15 presence / D18 signature checks
+# again — C4) UNION the internal helpers above. Deriving rather than
+# re-listing closed the gap where SwitchProjectAndRecalc and the 6-arg
+# StampConvergedValuesHL merge stamp were absent: an arity-drifted merge
+# stamp passed preflight (merge does a name-only Find) and detonated at
+# merge time, after every worker had paid the full solve cost.
+REQUIRED_MACRO_FUNCTIONS = tuple(
+    dict.fromkeys(
+        [_s.name for _s in ALL_PUBLIC_SUBS] + list(_REQUIRED_MACRO_HELPERS)
+    )
 )
 
 # Names of stale module artifacts that linger in workbooks where macros
