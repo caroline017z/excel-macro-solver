@@ -21,6 +21,10 @@ solver_status_w*.json
 
 # VBA source extracted from workbooks (reference only)
 vba_source/
+vba_source_*/
+
+# Per-run solve logs (scratch; the run record lives in results.db)
+run_*.log
 
 # Temp
 *.tmp

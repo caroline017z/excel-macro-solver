@@ -40,6 +40,43 @@ def _bas_sha256() -> str:
     return hashlib.sha256(BAS_FILE.read_bytes()).hexdigest()
 
 
+def _warn_if_bas_dirty() -> None:
+    """Warn (non-blocking) when SolveHeadless.bas differs from the committed
+    tree before we stamp its hash into a workbook.
+
+    The D17 drift check (preflight.check_macro_hash) judges every workbook
+    against the hash of whatever SolveHeadless.bas is on disk right now. If
+    that .bas carries uncommitted edits, the hash we stamp here is not
+    reproducible from any commit — a `git stash` or a fresh clone silently
+    changes what preflight considers "correct", and a workbook stamped now
+    becomes un-reverifiable later. Committing the .bas first makes the stamp
+    a stable, shareable contract.
+
+    Kept as a warning rather than a hard block on purpose: the --auto-fix
+    recovery path invokes this module as a subprocess and must not be gated
+    on a clean tree. Best-effort — if git is unavailable or this isn't a
+    repo, stay silent.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain", "--", str(BAS_FILE)],
+            cwd=str(BAS_FILE.parent),
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return  # no git / not a repo — nothing to check
+    if out.returncode != 0:
+        return
+    if out.stdout.strip():
+        print(
+            "  WARNING: SolveHeadless.bas has uncommitted changes. The hash "
+            "stamped into this workbook will NOT be reproducible from any "
+            "commit — commit the .bas first so the D17 drift check stays "
+            "verifiable across checkouts."
+        )
+
+
 def _stamp_bas_hash_via_zip(wb_path: Path, hash_value: str) -> None:
     """Write the .bas SHA256 into docProps/custom.xml via zip-level edit.
 
@@ -277,6 +314,7 @@ def main() -> None:
             # final serialized package — bypasses the COM Add() race that
             # left workbooks with stale stamps tripping D17 errors.
             try:
+                _warn_if_bas_dirty()
                 hash_value = _bas_sha256()
                 _stamp_bas_hash_via_zip(wb_path, hash_value)
                 print(f"  Stamped {BAS_HASH_PROP} = {hash_value[:12]}...")
