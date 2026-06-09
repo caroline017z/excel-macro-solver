@@ -1581,7 +1581,7 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
     shared across all checks:
       value-pass (data_only=True, read_only=True): cell-level error
         scan and C-tier critical-path checks
-      formula-pass (data_only=False, keep_vba=True): A/B/E-tier checks
+      formula-pass (data_only=False, read_only=False): A/B/E-tier checks
         needing calc properties, structure, or non-cached formula text
       conditional 0-1x extra formula-pass inside scan_workbook_errors
         only when the value-pass already found errors
