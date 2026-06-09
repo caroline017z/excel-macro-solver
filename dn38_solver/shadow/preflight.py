@@ -1641,8 +1641,13 @@ def run_preflight(workbook_path: Path | str) -> PreflightResult:
         error_scan = scan_workbook_errors(p, wb_vals=wb_v)
 
         # Formula-pass load (single open, all formula-shape checks).
+        # C26: no keep_vba — this pass is never saved, and the D-tier macro
+        # checks read vbaProject.bin via zipfile (above), not openpyxl's
+        # vba_archive. keep_vba retains an in-memory append-mode ZipFile that
+        # wb.close() never closes (the ZipFile.__del__ "I/O operation on
+        # closed file" leak surfaced by the test suite).
         wb_f = openpyxl.load_workbook(
-            str(p), data_only=False, keep_vba=True, read_only=False,
+            str(p), data_only=False, read_only=False,
         )
         try:
             findings.extend(check_calc_properties(wb_f))

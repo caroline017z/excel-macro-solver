@@ -31,3 +31,15 @@ python_version = "3.10"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# C26 fixed the openpyxl keep_vba ZipFile handle leak; lock it shut so a
+# reintroduced unraisable-during-GC warning fails the suite instead of
+# printing and being ignored.
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
+# Excel-integration tier (warm/cold/stress release gates). Skipped unless
+# DN38_EXCEL_TESTS=1 — needs a licensed Excel + real workbook fixtures, so
+# it never runs in the cross-platform CI matrix.
+markers = [
+    "excel_integration: end-to-end solve against a real workbook via Excel COM (opt-in)",
+]

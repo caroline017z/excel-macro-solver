@@ -39,11 +39,11 @@ jobs:
 
       - name: Tests (pytest)
         run: pytest -q
-        # The two real-workbook incident regressions skip when their Desktop
-        # fixtures are absent (every CI runner). Once C26 lands — the openpyxl
-        # keep_vba ZipFile handle leak that emits PytestUnraisableExceptionWarning
-        # is fixed — tighten this to:
-        #   pytest -q -W error::pytest.PytestUnraisableExceptionWarning
+        # PytestUnraisableExceptionWarning is escalated to an error via
+        # filterwarnings in pyproject (C26 fixed the openpyxl keep_vba leak
+        # that emitted it). The two real-workbook incident regressions skip
+        # when their fixtures are absent; the excel_integration tier is
+        # opt-in (DN38_EXCEL_TESTS) and never runs here.
 
   typecheck:
     name: mypy (advisory)
