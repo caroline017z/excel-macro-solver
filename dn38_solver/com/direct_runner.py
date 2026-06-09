@@ -581,6 +581,12 @@ def run_direct(
         # --- Run the VBA macro ---
         macro_used: str | None = None
         macro_error: str | None = None
+        # C1: True once auto-recovery resumed a crashed chunked run. The
+        # orchestrator keeps per-project checkpoints (rather than clearing
+        # them on a clean run) when this is set, so the correct in-flight
+        # telemetry for pre-failure projects survives for forensics even if
+        # the pre-recovery COM save did not.
+        run_recovered = False
 
         log.info(
             "  Running macro (%s)...",
@@ -674,6 +680,38 @@ def run_direct(
             def _close_wb() -> None:
                 nonlocal wb
                 if wb is not None:
+                    # C1: Save the scratch temp copy via Excel COM BEFORE
+                    # closing, so the in-memory converged stamps for every
+                    # project solved BEFORE the failure (Project Inputs
+                    # columns 32/33/38/39/371 and their __SolverResults rows)
+                    # survive into the reopened file. Without this, the
+                    # SaveChanges=False close discarded them; the retry
+                    # resumed from the failed project and never re-stamped the
+                    # earlier ones; and the read pass then stamped PRE-SOLVE
+                    # values into those columns while labeling them converged
+                    # — silent wrong NPP on a green run. COM Save (not
+                    # openpyxl) is the sanctioned write path and the temp file
+                    # is scratch, so the save is safe. Suppressed on failure:
+                    # we fall back to the pre-recovery __SolverResults snapshot
+                    # and the retained in-flight checkpoints.
+                    try:
+                        _call_with_timeout(
+                            wb.Save,
+                            timeout_sec=300,
+                            excel_proc=excel_proc,
+                            label="Save[pre-recovery-preserve]",
+                        )
+                        log.info(
+                            "  Saved pre-failure converged state to temp copy "
+                            "before recovery close."
+                        )
+                    except Exception as save_exc:
+                        log.warning(
+                            "  Pre-recovery save failed (%s) — pre-failure "
+                            "projects recovered from the __SolverResults "
+                            "snapshot + checkpoints, not re-stamped cells.",
+                            save_exc,
+                        )
                     with contextlib.suppress(Exception):
                         wb.Close(SaveChanges=False)
                     wb = None
@@ -744,6 +782,7 @@ def run_direct(
                 macro_used = retry_used[0]
                 has_switch = retry_has_switch[0]
                 macro_error = None
+                run_recovered = True
             else:
                 # Surface the post-recovery error so the operator knows
                 # this wasn't a first-pass failure. Keep the original
@@ -1101,6 +1140,7 @@ def run_direct(
             "read_time_sec": round(read_time, 2),
             "solver_heartbeat": heartbeat,
             "validation": validation,
+            "recovered": run_recovered,
         }
 
         status.update(

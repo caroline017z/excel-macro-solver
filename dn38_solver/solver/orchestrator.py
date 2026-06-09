@@ -771,12 +771,28 @@ def solve_all(
             save_run_metrics(conn, metrics)
         except Exception as metrics_exc:
             log.warning("RunMetrics persistence failed: %s", metrics_exc)
-        if use_chunked and record.status == SolveStatus.CONVERGED.value:
+        # C1: never clear checkpoints on a recovered run. After an auto-
+        # recovery resume, pre-failure projects may carry less-trustworthy
+        # re-stamped cells than their in-flight checkpoint telemetry, so the
+        # checkpoints are the forensic record of what actually converged
+        # before the crash — keep them even though the run rolled up CONVERGED.
+        run_was_recovered = bool(batch_result.get("recovered"))
+        if (
+            use_chunked
+            and record.status == SolveStatus.CONVERGED.value
+            and not run_was_recovered
+        ):
             # Run finished cleanly — drop the per-project checkpoint rows
             # so the audit trail only retains incidents worth keeping.
             cleared = clear_project_checkpoints(conn, batch_id)
             if cleared:
                 log.debug("  Cleared %d per-project checkpoint(s) on clean run", cleared)
+        elif use_chunked and run_was_recovered:
+            log.warning(
+                "  Run completed via auto-recovery — per-project checkpoints "
+                "retained under batch_id=%s for forensics (inspect with "
+                "--show-checkpoints %s).", batch_id, batch_id,
+            )
         # conn.close handled by outer finally below
 
         # Summary
