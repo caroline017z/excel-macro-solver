@@ -15,9 +15,12 @@ This review consolidates recommendations from a virtual cross-functional team (V
 - Python runner ingestion of `__SolverResults`, DSCR override safety, and heartbeat surfacing.
 
 ### In Progress / Outstanding
-- Chunked macro execution in Python runner (not yet implemented).
-- True in-flight timeout cancellation of COM macro call (current timeout is post-run guard only).
-- Regression harness with warm/cold/stress fixtures in a Windows+Excel test environment.
+- ✅ Chunked macro execution in Python runner (implemented; now the default for >1 project).
+- ✅ Regression harness with warm/cold/stress fixtures in a Windows+Excel test environment
+  (`tests/test_excel_regression.py`, gate rules in `dn38_solver/validation/release_gates.py`,
+  runner `run_release_gate.ps1`, docs `docs/RELEASE_GATES.md`).
+- True in-flight timeout cancellation of the COM macro call (the watchdog now hard-kills Excel
+  and raises a real TimeoutError, but it is still a kill rather than a cooperative cancel).
 
 ---
 
@@ -114,7 +117,8 @@ This review consolidates recommendations from a virtual cross-functional team (V
 ### Sprint 1 (Stability)
 1. ✅ Add per-project status heartbeat in VBA and polling metadata in Python.
 2. ✅ Add project result integrity table (including DSCR) and read it from Python.
-3. ⏳ Add cold/warm/stress regression harness and publish baseline metrics.
+3. ✅ Add cold/warm/stress regression harness (`run_release_gate.ps1` / `docs/RELEASE_GATES.md`).
+   Baseline metrics still to be captured on a Windows+Excel box.
 
 ### Sprint 2 (Throughput)
 1. ⏳ Implement chunked macro execution in runner.
